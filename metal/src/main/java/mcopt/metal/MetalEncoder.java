@@ -201,13 +201,13 @@ final class MetalEncoder implements CommandEncoderBackend {
 			GpuTexture depth = game != null ? game.mainRenderTarget().getDepthTexture() : null;
 			if (depth instanceof MetalTexture t) Native.discard(this.enc, t.handle);  // (no-op unless it is the open encoder's depth)
 		}
+		if (mcopt.metal.own.OwnUoccAuto.ON) mcopt.metal.own.OwnUoccAuto.submitted(this.presentedThisSubmit);
 		this.presentedThisSubmit = false;
 		MetalEvents.Operation commitEvent = MetalEvents.begin("commit", this.submitIndex, 0);
 		long cmd;
 		try {
 			if (GPU_TIMES) GpuTimes.submit(this.submitIndex, this.encoderIndex);
 			cmd = Native.encCommit(this.enc);
-			if (mcopt.metal.own.OwnUoccAuto.ON) mcopt.metal.own.OwnUoccAuto.submitted(this.submitIndex);
 		} finally {
 			MetalEvents.end(commitEvent);
 		}
@@ -307,7 +307,6 @@ final class MetalEncoder implements CommandEncoderBackend {
 			Native.cmdWait(frame.cmd);
 			if (WaitStats.ON) WaitStats.wait(site, System.nanoTime() - waitStart, this.submitIndex - frame.index);
 			if (GPU_TIMES) GpuTimes.retire(frame.index, frame.cmd);
-			if (mcopt.metal.own.OwnUoccAuto.ON) mcopt.metal.own.OwnUoccAuto.retired(frame.index, Native.cmdGpuMicros(frame.cmd));
 			if (event != null) event.gpuMicros = Native.cmdGpuMicros(frame.cmd);
 		} finally {
 			MetalEvents.end(event);
