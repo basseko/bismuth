@@ -207,6 +207,7 @@ final class MetalEncoder implements CommandEncoderBackend {
 		try {
 			if (GPU_TIMES) GpuTimes.submit(this.submitIndex, this.encoderIndex);
 			cmd = Native.encCommit(this.enc);
+			if (mcopt.metal.own.OwnUoccAuto.ON) mcopt.metal.own.OwnUoccAuto.submitted(this.submitIndex);
 		} finally {
 			MetalEvents.end(commitEvent);
 		}
@@ -306,6 +307,7 @@ final class MetalEncoder implements CommandEncoderBackend {
 			Native.cmdWait(frame.cmd);
 			if (WaitStats.ON) WaitStats.wait(site, System.nanoTime() - waitStart, this.submitIndex - frame.index);
 			if (GPU_TIMES) GpuTimes.retire(frame.index, frame.cmd);
+			if (mcopt.metal.own.OwnUoccAuto.ON) mcopt.metal.own.OwnUoccAuto.retired(frame.index, Native.cmdGpuMicros(frame.cmd));
 			if (event != null) event.gpuMicros = Native.cmdGpuMicros(frame.cmd);
 		} finally {
 			MetalEvents.end(event);

@@ -481,13 +481,14 @@ final class OwnFrag {
 	 */
 	static final int UOCC_MAX_MP_CORES = Integer.getInteger("mcopt.own.frag.uoccMaxMpCores", 0);
 	private static final boolean SIZE_SWITCH = UOCC_MAX_MP > 0 && (UOCC_MAX_MP_CORES <= 0 || mcopt.metal.Profile.gpuCores() >= UOCC_MAX_MP_CORES);
-	private static final @Nullable Config FLAGS_NO_UOCC = FLAGS != null && FLAGS.uocc() && (SIZE_SWITCH || OwnProbe.ON || TIE_CLOSE)
+	private static final @Nullable Config FLAGS_NO_UOCC = FLAGS != null && FLAGS.uocc() && (SIZE_SWITCH || OwnProbe.ON || TIE_CLOSE || OwnUoccAuto.ON)
 		? Config.parse(flagString().replace("+uocc", "")) : null;
 
 	/** The flags' configuration this frame: without uocc above -Dmcopt.own.frag.uoccMaxMp (or with the in-run probe's frag.uocc=false). */
 	private static @Nullable Config drawFlags() {
 		if (FLAGS_NO_UOCC == null) return FLAGS;
 		if (!OwnProbe.bool("frag.uocc", true)) return FLAGS_NO_UOCC;
+		if (OwnUoccAuto.ON) return OwnUoccAuto.uocc() ? FLAGS : FLAGS_NO_UOCC;  // (measured, instead of the size switch)
 		if (!SIZE_SWITCH) return FLAGS;
 		var w = net.minecraft.client.Minecraft.getInstance().getWindow();
 		return (double) w.getWidth() * w.getHeight() > UOCC_MAX_MP * 1e6 ? FLAGS_NO_UOCC : FLAGS;
