@@ -5,10 +5,11 @@ package mcopt.metal.own;
  * framebuffer size and GPU core count (-Dmcopt.own.frag.uoccMaxMp). Exact either way (a frame drawn without uocc draws every unit
  * the cull passes), so switching is invisible; only speed differs.
  * <p>
- * Exploring: blocks of BLOCK presented frames alternate with and without uocc (interleaved, so a camera moving through the scene loads
+ * Exploring: blocks of BLOCK frames alternate with and without uocc (interleaved, so a camera moving through the scene loads
  * both alike); the first SKIP frames of each block are left out (the switch's transient and the frames still in flight from the other
- * mode). Each measured frame's interval (commit to commit of presenting submits: what the player sees, whatever limits it, the GPU,
- * the render thread or the far LOD) goes to its mode. A frame's GPU time alone misleads: uocc's frames spread their work over command
+ * mode). Each measured frame's interval (commit to commit: how fast frames are made, whatever limits it, the GPU, the render thread
+ * or the far LOD) goes to its mode. Every submit counts, not only presenting ones: the presents are paced to the display, so their
+ * intervals are the refresh period in either mode. A frame's GPU time alone misleads: uocc's frames spread their work over command
  * buffers that wait on each other, and at long render distances the GPU isn't what limits the frame. With SAMPLES of each, the faster
  * median wins if it is MARGIN faster; otherwise uocc stays on (the configured default; under VSync both modes tie). The choice is held
  * -Dmcopt.own.frag.uoccAutoHoldMs (default 20000), then measured again.
@@ -35,9 +36,8 @@ public final class OwnUoccAuto {
 		return uocc;
 	}
 
-	/** A submit was committed (presenting: it ends a frame), drawn in the current mode; the next frame's mode is set here. */
-	public static void submitted(boolean presenting) {
-		if (!presenting) return;
+	/** A submit was committed, drawn in the current mode; the next frame's mode is set here. */
+	public static void submitted() {
 		long now = System.nanoTime(), interval = now - lastPresent;
 		lastPresent = now;
 		if (!exploring) {

@@ -201,7 +201,7 @@ final class MetalEncoder implements CommandEncoderBackend {
 			GpuTexture depth = game != null ? game.mainRenderTarget().getDepthTexture() : null;
 			if (depth instanceof MetalTexture t) Native.discard(this.enc, t.handle);  // (no-op unless it is the open encoder's depth)
 		}
-		if (mcopt.metal.own.OwnUoccAuto.ON) mcopt.metal.own.OwnUoccAuto.submitted(this.presentedThisSubmit);
+		if (mcopt.metal.own.OwnUoccAuto.ON) mcopt.metal.own.OwnUoccAuto.submitted();
 		this.presentedThisSubmit = false;
 		MetalEvents.Operation commitEvent = MetalEvents.begin("commit", this.submitIndex, 0);
 		long cmd;
