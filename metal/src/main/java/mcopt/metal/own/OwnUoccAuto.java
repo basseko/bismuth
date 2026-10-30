@@ -19,6 +19,8 @@ public final class OwnUoccAuto {
 	public static final boolean ON = Boolean.getBoolean("mcopt.own.frag.uoccAuto");
 	private static final int BLOCK = 12, SKIP = 4, SAMPLES = 96;
 	private static final double MARGIN = 0.03;
+	/** -Dmcopt.own.frag.uoccAutoLog: every decision, not only changes. */
+	private static final boolean LOG = Boolean.getBoolean("mcopt.own.frag.uoccAutoLog");
 	private static final long HOLD_NS = Long.getLong("mcopt.own.frag.uoccAutoHoldMs", 20000) * 1_000_000L;
 	private static final double[] withUocc = new double[SAMPLES], withoutUocc = new double[SAMPLES];
 	private static int nWith, nWithout, inBlock;
@@ -67,7 +69,7 @@ public final class OwnUoccAuto {
 	private static void decide(long now) {
 		double on = median(withUocc), off = median(withoutUocc);
 		boolean choice = !(off < on * (1 - MARGIN));
-		if (choice != uoccHeld) {
+		if (choice != uoccHeld || LOG) {
 			System.out.printf("mcopt-own-frag: uoccAuto: uocc %s (median frame %.0f us with, %.0f us without)%n", choice ? "on" : "off", on, off);
 		}
 		uoccHeld = choice;
