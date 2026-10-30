@@ -26,7 +26,7 @@ public final class OwnUoccAuto {
 	private static final double[] withUocc = new double[SAMPLES], withoutUocc = new double[SAMPLES];
 	private static int nWith, nWithout, inBlock;
 	private static boolean exploring = true, uocc = true;
-	private static long holdUntil, lastPresent;
+	private static long holdUntil, lastSubmit;
 
 	private OwnUoccAuto() {
 	}
@@ -38,8 +38,8 @@ public final class OwnUoccAuto {
 
 	/** A submit was committed, drawn in the current mode; the next frame's mode is set here. */
 	public static void submitted() {
-		long now = System.nanoTime(), interval = now - lastPresent;
-		lastPresent = now;
+		long now = System.nanoTime(), interval = now - lastSubmit;
+		lastSubmit = now;
 		if (!exploring) {
 			if (now >= holdUntil) {
 				exploring = true;
