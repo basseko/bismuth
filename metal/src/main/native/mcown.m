@@ -2426,6 +2426,13 @@ static void blChain(Own *w, Enc *enc, id<MTLTexture> prev, id<MTLTexture> glareR
 		[c setBytes:(i == 1 ? &one : &zero) length:4 atIndex:1];
 		[c dispatchThreads:MTLSizeMake(bl.lv[i - 1].width, bl.lv[i - 1].height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
 	}
+	// and the glare texture just read is cleared too: whichever of the two the water writes next starts empty whatever the order of frames and passes
+	// (a missed clear left old glare in it, which the bloom then added every frame: bright trails of the river's glare across the terrain)
+	if (glareRead != glareClear) {
+		[c setComputePipelineState:bl.clear];
+		[c setTexture:glareRead atIndex:0];
+		[c dispatchThreads:MTLSizeMake(glareRead.width, glareRead.height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+	}
 	[c endEncoding];
 }
 
