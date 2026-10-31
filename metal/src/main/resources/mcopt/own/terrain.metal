@@ -1581,7 +1581,7 @@ struct ShadeFrame {
 	// -Dmcopt.shaders.skyfog (OwnFog; bytes 368..431, the same four float4 as SkyFrame's at 384): the analytic height fog
 	float4 fogA;          // x camera height above the Rayleigh layer's base (blocks), y above the Mie layer's, z 1: the analytic fog is on, w the dome's ray length (render distance)
 	float4 fogB;          // rgb Rayleigh extinction (1 / block at the layer's base), w Mie extinction
-	float4 fogC;          // rgb the sun's light colour for the Mie halo (phase x this), w unused
+	float4 fogC;          // rgb the sun's light colour for the Mie halo (phase x this), w rain's fog: extinction per block without height falloff
 	float4 fogD;          // rgb the twilight tint x the display gain (skfTint on the CPU, for the terrain's fog), w the display gain of the linear sky radiance
 	float4 fol0;          // 432 foliage track: x flags (1 foliage transmission, 2 variable penumbra, 4 distant foliage takes the skylight test, 8 leaves take the up ambient, 16 no far cascade (skylight test beyond), 32 distance-scaled bias and leak fix), y distance where distant foliage starts to skip the map, z where it fully does, w the transmission's absorption per block
 	float4 fol1;          // 448 x leaf transmission, y leaf sheen, z plant transmission, w plant sheen
@@ -2646,10 +2646,11 @@ static float skfAirmass(float h, float k, float dy, float len) {
 }
 
 // the transmittance along a ray of `len` blocks in direction y-component dy, and the Mie share of the optical depth
-static float3 skfT(float4 A, float4 B, float dy, float len, thread float &wM) {
+// (uni: an extinction per block without the height falloff, rain's fog, which is as thick at the camera's height as in the valleys)
+static float3 skfT(float4 A, float4 B, float dy, float len, thread float &wM, float uni) {
 	float aR = skfAirmass(A.x, 0.0231049, dy, len), aM = skfAirmass(A.y, 0.0990210, dy, len);
 	float3 tR = B.rgb * aR;
-	float tM = B.w * aM;
+	float tM = B.w * aM + uni * len;
 	wM = tM / max(dot(tR, float3(0.3333333)) + tM, 1e-6);
 	return exp(-(tR + tM));
 }
@@ -3325,7 +3326,7 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 			// the analytic height fog (-Dmcopt.shaders.skyfog): per channel transmittance, the sky's own colour (and the sun's Mie halo) as the in-scatter
 			float3 dir = in.shPos / max(dist, 1e-3);
 			float wM;
-			float3 T = skfT(sf.fogA, sf.fogB, dir.y, dist, wM);
+			float3 T = skfT(sf.fogA, sf.fogB, dir.y, dist, wM, sf.fogC.w);
 			if (any(T < 0.996) || fogValue > 0.004) {
 				float3 hz = skfDisp(skfHazeT(skLut, dir, sf.sunTrue.xyz, sf.haze.z, sf.fogC, sf.fogD.xyz, wM));
 				if (sf.sunTrue.w > 0.0) hz = skOvercast(hz, sf.sunTrue.w);
@@ -5136,7 +5137,7 @@ static float3 skAmbDisp(texture2d<float> lut, float3 V, float3 S, constant SkySh
 		// the skyfog sky (as sky_fs draws it): the table tinted and scaled to linear, fogged along the ray by the analytic fog (as long as the render distance),
 		// the fog's colour with the Mie halo, then the soft display curve; overcast as the dome
 		float wM;
-		float3 T = skfT(P.fogA, P.fogB, e, P.fogA.w, wM);
+		float3 T = skfT(P.fogA, P.fogB, e, P.fogA.w, wM, P.fogC.w);
 		float3 L = skfLin(rad, S.y, P.fogD.w);
 		float3 Lh = skfHaze(lut, V, S, P.misc.x, P.fogC, P.fogD.w, wM);
 		return skOvercast(skfDisp(L * T + Lh * (1.0 - T)), P.misc.y);
@@ -5389,7 +5390,7 @@ static float4 skClouds2(texture2d<float> cov, float3 dir, constant SkyFrame &f, 
 			sunL = mix(sunL, 0.45, 0.5 * lowSun);
 			float3 c3 = sunC * sunL + ambCol * (0.55 + 0.45 * hf) * (0.8 + 0.2 * exp(-od * 0.5));
 			c3 += twVio * (0.4 + 0.6 * hf);
-			c3 += sunC * (0.6 * lowSun * (1.0 - 0.4 * hf));
+			c3 += sunC * (0.25 * lowSun * (1.0 - 0.4 * hf));  // (0.6 washed the cloud bank around a setting sun to white)
 			c3 = mix(c3, float3(0.50, 0.55, 0.58) * (0.8 + 0.2 * hf), rain * 0.9);
 			float al = 1.0 - exp(-d * min(dt, 140.0) * 0.07);
 			float w = T * al;
@@ -5405,7 +5406,12 @@ static float4 skClouds2(texture2d<float> cov, float3 dir, constant SkyFrame &f, 
 	float tHit = tAcc / max(wAcc, 1e-4);
 	float ap = 1.0 - exp(-pow(tHit / mix(6500.0, 3500.0, rain), 1.5));
 	col = mix(col, skyClear * alpha, ap * 0.9);
-	return float4(col * fade, alpha * fade);
+	// night: the sky behind is lit by the moon and the faded twilight, the cloud's own light terms are near zero: without a floor the clouds are black
+	// silhouettes on a lighter sky (BSL's night clouds sit at about the sky's brightness)
+	float nightK = 1.0 - smoothstep(-0.12, 0.02, sunDir.y);
+	col = mix(col, max(col, skyClear * alpha * 1.05), nightK);
+	float thin = 1.0 - 0.6 * nightK;  // (and thinner: the night's clouds barely show)
+	return float4(col * fade * thin, alpha * fade * thin);
 }
 
 struct CloudOut {
@@ -5520,7 +5526,7 @@ fragment float4 sky_fs(SkyV in [[stage_in]], constant SkyFrame &f [[buffer(0)]],
 		// the new sky model: the table (with its multiple scattering) tinted by the twilight constants, fogged by the same analytic fog as the terrain with the ray
 		// as long as the render distance, then one soft curve: none of the compensating patches (skBlue, skLift, the violet of the twilight) is needed
 		float wM;
-		float3 T = skfT(f.fogA, f.fogB, e, f.fogA.w, wM);
+		float3 T = skfT(f.fogA, f.fogB, e, f.fogA.w, wM, f.fogC.w);
 		float3 L = skfLin(rad, S.y, f.fogD.w);
 		float3 Lh = skfHaze(lut, dir, S, exposure, f.fogC, f.fogD.w, wM);
 		L = L * T + Lh * (1.0 - T);

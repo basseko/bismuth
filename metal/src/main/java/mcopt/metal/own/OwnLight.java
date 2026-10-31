@@ -89,7 +89,7 @@ public final class OwnLight {
 			}
 			grade[SAT] *= 1 - 0.55f * r;
 			grade[CONTRAST] *= 1 - 0.1f * r;
-			grade[EXPO] *= 1 - 0.3f * r;  // BSL's rain is darker than the table's (sky 85 vs 111 of 255)
+			grade[EXPO] *= 1 - 0.1f * r;  // BSL's rain sky is darker than the table's (sky 85 vs 111 of 255); more than this darkens the rain's terrain far below BSL's
 			grade[GAIN] += (0.78f - grade[GAIN]) * r * 0.8f;
 			grade[GAIN + 1] += (1.22f - grade[GAIN + 1]) * r * 0.8f;
 			grade[GAIN + 2] += (1.16f - grade[GAIN + 2]) * r * 0.8f;

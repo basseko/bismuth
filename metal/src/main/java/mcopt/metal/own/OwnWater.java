@@ -79,7 +79,7 @@ public final class OwnWater {
 		SHORE_ON = ON && !"false".equals(System.getProperty("mcopt.shaders.water.shore")),
 		UW_SCATTER_ON = ON && !"false".equals(System.getProperty("mcopt.shaders.water.uwscatter")),
 		UW_SHAFTS = ON && !"false".equals(System.getProperty("mcopt.shaders.water.uwshafts"));
-	static final float GLARE_GAIN = prop("mcopt.shaders.water.glare.gain", 10.0f), GLARE_BLOOM = prop("mcopt.shaders.water.glare.bloom", 1.0f),
+	static final float GLARE_GAIN = prop("mcopt.shaders.water.glare.gain", 22.0f), GLARE_BLOOM = prop("mcopt.shaders.water.glare.bloom", 1.0f),
 		GLARE_ROUGH = prop("mcopt.shaders.water.glare.rough", 0.3f), GLARE_SWELL = prop("mcopt.shaders.water.glare.swell", 0.2f),
 		REFRACT_W = prop("mcopt.shaders.water.refract.weight", 0.4f), SHORE_GAIN = prop("mcopt.shaders.water.shore.gain", 0.5f),
 		UW_SCAT_GAIN = prop("mcopt.shaders.water.uwscatter.gain", 1.0f), UW_MS = prop("mcopt.shaders.water.uwscatter.ms", 0.5f),

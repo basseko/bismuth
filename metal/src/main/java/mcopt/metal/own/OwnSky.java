@@ -399,7 +399,7 @@ public final class OwnSky {
 	static final boolean ACCUM = !"false".equals(System.getProperty("mcopt.shaders.clouds.accum"));
 	static final boolean SHADOWS = !"false".equals(System.getProperty("mcopt.shaders.clouds.shadows"));
 	static final float COV_R = Float.parseFloat(System.getProperty("mcopt.shaders.clouds.mapRadius", "9000"));
-	static final float LIGHT_GAIN = Float.parseFloat(System.getProperty("mcopt.shaders.clouds.gain", "0.8"));
+	static final float LIGHT_GAIN = Float.parseFloat(System.getProperty("mcopt.shaders.clouds.gain", "0.65"));
 	static final float SHADOW_STRENGTH = Float.parseFloat(System.getProperty("mcopt.shaders.clouds.shadowStrength", "0.8"));
 	/** The accumulated target is the screen divided by this; one pixel of each N x N block is marched per frame; the history holds up to ACCUM_AGE samples. */
 	static final int ACCUM_DIV = Integer.getInteger("mcopt.shaders.clouds.divAccum", 3);

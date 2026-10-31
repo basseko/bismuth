@@ -25,9 +25,9 @@ public final class OwnVolume {
 	static final float DENSITY = prop("mcopt.shaders.volumetric.density", 0.0012f), SCALE = prop("mcopt.shaders.volumetric.scale", 45f),
 		BASE_Y = prop("mcopt.shaders.volumetric.baseY", 64f), RANGE = prop("mcopt.shaders.volumetric.range", 110f);
 	/** The light's in-scatter intensity and the ambient in-scatter's. */
-	static final float LIGHT = prop("mcopt.shaders.volumetric.light", 0.55f), AMBIENT = prop("mcopt.shaders.volumetric.ambient", 0.08f);
+	static final float LIGHT = prop("mcopt.shaders.volumetric.light", 0.35f), AMBIENT = prop("mcopt.shaders.volumetric.ambient", 0.04f);
 	/** Extra density at a low sun, in forests. */
-	static final float LOW_SUN = prop("mcopt.shaders.volumetric.lowSun", 1.0f), FOREST = prop("mcopt.shaders.volumetric.forest", 0.8f);
+	static final float LOW_SUN = prop("mcopt.shaders.volumetric.lowSun", 0.5f), FOREST = prop("mcopt.shaders.volumetric.forest", 0.8f);
 	/** Also march under a high sun over open land, where it is invisible. */
 	static final boolean NOON = Boolean.getBoolean("mcopt.shaders.volumetric.noon");
 	/** The screen-space shafts (bloom_up) keep this fraction of their strength while the volumetric light is on. */

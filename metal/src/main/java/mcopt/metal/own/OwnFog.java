@@ -20,7 +20,9 @@ final class OwnFog {
 	private static final boolean FOG = !"false".equals(System.getProperty("mcopt.shaders.skyfog.fog"));
 	static final float MIE = Float.parseFloat(System.getProperty("mcopt.shaders.skyfog.mie", "0.45"));
 	static final float RAY = Float.parseFloat(System.getProperty("mcopt.shaders.skyfog.ray", "3.0"));
-	static final float HALO = Float.parseFloat(System.getProperty("mcopt.shaders.skyfog.halo", "0.5"));
+	static final float HALO = Float.parseFloat(System.getProperty("mcopt.shaders.skyfog.halo", "0.25"));
+	/** Extra Mie extinction (1 / block) in full rain (-Dmcopt.shaders.skyfog.rain). */
+	static final float RAIN_FOG = Float.parseFloat(System.getProperty("mcopt.shaders.skyfog.rain", "0.008"));
 	static final float GAIN = Float.parseFloat(System.getProperty("mcopt.shaders.skyfog.gain", "0.4"));
 	static final float SUN_BOOST = Float.parseFloat(System.getProperty("mcopt.shaders.skyfog.sun", "0.5"));
 	static final float SEA = 63.0f;
@@ -51,7 +53,7 @@ final class OwnFog {
 		float y = OwnSky.sinEl, rain = OwnSky.rain;
 		boolean morning = OwnSky.sunDir[0] > 0;
 		float noon = 0.0001f;
-		float d = morning ? noon + (0.0070f - noon) * (1f - smooth(0.05f, 0.5f, y)) : noon + (0.0050f - noon) * (1f - smooth(0.0f, 0.35f, y));
+		float d = morning ? noon + (0.0040f - noon) * (1f - smooth(0.05f, 0.5f, y)) : noon + (0.0050f - noon) * (1f - smooth(0.0f, 0.35f, y));
 		float night = 1f - smooth(-0.3f, -0.1f, y);
 		d += (0.0010f - d) * night;  // (midnight)
 		d += 0.0020f * (float) Math.exp(-190.0 * (y + 0.07283) * (y + 0.07283));  // the blue hour
@@ -85,10 +87,11 @@ final class OwnFog {
 		v[6] = ray;
 		v[7] = mie;
 		// the sun's halo (the Mie phase x this): the sun's colour at the camera, brighter in the evening's glow, gone with the sun and in rain
-		float glow = 1f + 0.75f * (float) Math.exp(-300.0 * (sinEl + 0.02) * (sinEl + 0.02));
+		float glow = 1f + 0.35f * (float) Math.exp(-300.0 * (sinEl + 0.02) * (sinEl + 0.02));
 		float h = HALO * glow * (1f - 0.9f * rain) * smooth(-0.08f, 0.06f, sinEl);
 		for (int i = 0; i < 3; i++) v[8 + i] = h * OwnSky.warmTint[i];
-		v[11] = 0f;
+		// fogC.w: rain's fog, an extinction without the height falloff (BSL's rain hides the far terrain whatever the camera's height)
+		v[11] = RAIN_FOG * rain * k;
 		// fogD.xyz: the frame's twilight tint x gain (terrain.metal skfTint, which depends on the sun alone: the terrain's fog reads it instead of
 		// recomputing it per pixel)
 		float bh = Math.max(0f, Math.min(1f, ((float) Math.exp(-190.0 * (sinEl + 0.09604) * (sinEl + 0.09604)) - 0.05f) / 0.95f));
