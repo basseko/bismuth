@@ -69,7 +69,7 @@ public final class OwnShade {
 	static final float PLANT_SHEEN = Float.parseFloat(System.getProperty("mcopt.shaders.foliage.plantSheen", "1.0"));
 	static final float PENUMBRA = Float.parseFloat(System.getProperty("mcopt.shaders.shadow.penumbra", "0.06"));
 	static final float PENUMBRA_MAX = Float.parseFloat(System.getProperty("mcopt.shaders.shadow.penumbraMax", "0.7"));
-	private static final int FRAME_BYTES = 640, CULL_BYTES = 160, CULLFRAME_BYTES = 144, DRAW_BYTES = OwnTerrain.DRAW_FRAME_BYTES;
+	private static final int FRAME_BYTES = 672, CULL_BYTES = 160, CULLFRAME_BYTES = 144, DRAW_BYTES = OwnTerrain.DRAW_FRAME_BYTES;
 
 	/** This frame draws the shaded terrain variant (set by {@link #frame}; read at the one choke point, OwnNative.draw). */
 	static boolean frameActive;
@@ -424,6 +424,15 @@ public final class OwnShade {
 				MemoryUtil.memPutFloat(fb + 516, AMB_GAIN);
 				MemoryUtil.memPutFloat(fb + 520, AMB_FOLIAGE);
 				MemoryUtil.memPutFloat(fb + 524, AMB_FLOOR);
+			}
+			// the clouds track (640..671): the cloud shadows
+			if (OwnSky.shadowK > 0f && OwnSky.hazeActive()) {
+				MemoryUtil.memPutFloat(fb + 640, OwnSky.cloudMid() - (float) camera.pos.y);
+				MemoryUtil.memPutFloat(fb + 644, OwnSky.shadowK);
+				MemoryUtil.memPutFloat(fb + 648, OwnSky.COV_R);
+				MemoryUtil.memPutFloat(fb + 652, OwnSky.shadowCover);
+				MemoryUtil.memPutFloat(fb + 656, OwnSky.CLOUD_SOFT);
+				MemoryUtil.memPutFloat(fb + 660, OwnSky.shadowDens);
 			}
 			OwnNative.shadeFrame(own, k, fb, FRAME_BYTES, 0f, 0f);
 			// milestone 5: entities and items (vanilla pipelines) take the same block and shadow map; cascade 0 also takes their casters

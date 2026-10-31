@@ -139,7 +139,7 @@ static struct {
 	id<MTLTexture> tex[SHADE_RING];
 	int res, layers, ring;
 	id<MTLTexture> cur;               // this frame's shadow map (bound at fragment texture 24 by shaded draws)
-	uint8_t frame[640];               // this frame's ShadeFrame block (fragment buffer 30)
+	uint8_t frame[768];               // this frame's ShadeFrame block (fragment buffer 30)
 	int frameLen;
 	id<MTLComputePipelineState> cull; // shade_cull
 	id<MTLDepthStencilState> depthLess;
@@ -164,7 +164,11 @@ static struct {
 	id<MTLTexture> cloud[SKY_RING];   // the cloud layer's small target (RGBA16F), one per ring slot
 	int cw, ch;
 	id<MTLTexture> cloudCur;
+	int cloudIdx;
 	id<MTLRenderPipelineState> cloudPso;
+	id<MTLTexture> age[SKY_RING];     // the clouds track: the history's age per pixel (R8), second colour attachment of cloud_fs
+	id<MTLTexture> cov;               // the coverage map (512 x 512 RG16F, cloud_cov), read by cloud_fs (texture 4) and the shaded terrain (texture 29)
+	id<MTLComputePipelineState> covPso;
 } sk;
 void mce_map(id<MTLTexture> map);  // mcentity.m (shaders milestone 5: entities read the same shadow map)
 
@@ -891,6 +895,7 @@ drawCall:
 		[r setFragmentTexture:sh.cur atIndex:24];
 		[r setFragmentTexture:sk.cur atIndex:25];
 		if (sk.shCur) [r setFragmentBuffer:sk.shCur offset:0 atIndex:29];  // (the sky ambient's SH coefficients, mcopt.shaders.ambient.sh)
+		[r setFragmentTexture:sk.cov ? sk.cov : sk.cur atIndex:29];  // (the clouds track: the coverage map for the cloud shadows; any texture when there is none, ShadeFrame.cloudShA.y is 0 then)
 		[r setFragmentTexture:light atIndex:17];
 		[r setFragmentSamplerState:lightSampler atIndex:15];
 	}
@@ -2484,7 +2489,7 @@ int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int le
 
 // ---- shaders: the sky (-Dmcopt.shaders; OwnSky): the sky-view table and the dome ----
 
-// The table ring (lw x lh RGBA16F) and the cloud noise (size x size RGBA8 from `noise`, may be NULL). 1 made, 0 failed.
+// The table ring (lw x lh RGBA16F) and the cloud noise (size x size RGBA16 from `noise`, may be NULL). 1 made, 0 failed.
 int mcs_sky_init(Own *w, int lw, int lh, const uint8_t *noise, int size) {
 	if (sk.lut[0] && sk.lw == lw && sk.lh == lh) return 1;
 	@autoreleasepool {
@@ -2510,13 +2515,13 @@ int mcs_sky_init(Own *w, int lw, int lh, const uint8_t *noise, int size) {
 		sk.lh = lh;
 		sk.cur = sk.lut[0];
 		if (noise && size > 0 && !sk.noise) {
-			MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:(NSUInteger) size height:(NSUInteger) size mipmapped:NO];
+			MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Unorm width:(NSUInteger) size height:(NSUInteger) size mipmapped:NO];
 			d.usage = MTLTextureUsageShaderRead;
 			d.storageMode = MTLStorageModeShared;
 			sk.noise = [w->ctx->device newTextureWithDescriptor:d];
 			if (!sk.noise) return 0;
 			sk.noise.label = @"shade cloud noise";
-			[sk.noise replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger) size, (NSUInteger) size) mipmapLevel:0 withBytes:noise bytesPerRow:(NSUInteger) size * 4];
+			[sk.noise replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger) size, (NSUInteger) size) mipmapLevel:0 withBytes:noise bytesPerRow:(NSUInteger) size * 8];
 		}
 	}
 	return 1;
@@ -2650,6 +2655,33 @@ int mcs_sky_draw(Own *w, Enc *enc, const void *params, int length, char *err, in
 	return 1;
 }
 
+// The coverage map (terrain.metal cloud_cov, the clouds track): 512 x 512 RG16F around the camera, in the pre command buffer before the cloud pass. params: a SkyFrame.
+int mcs_sky_cov(Own *w, Enc *enc, const void *params, int length) {
+	if (!sk.cur || length > 512 || !sk.noise) return 0;
+	id<MTLComputePipelineState> pso = ownLazyKernel(w, &sk.covPso, "cloud_cov");
+	if (!pso) return 0;
+	@autoreleasepool {
+		if (!sk.cov) {
+			MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG16Float width:512 height:512 mipmapped:NO];
+			d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+			d.storageMode = MTLStorageModePrivate;
+			sk.cov = [w->ctx->device newTextureWithDescriptor:d];
+			if (!sk.cov) return 0;
+			sk.cov.label = @"shade cloud coverage";
+		}
+		mc_pre_end_encoders(enc);
+		id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];
+		c.label = @"shade cloud coverage";
+		[c setComputePipelineState:pso];
+		[c setBytes:params length:(NSUInteger) length atIndex:0];
+		[c setTexture:sk.cov atIndex:0];
+		[c setTexture:sk.noise atIndex:1];
+		[c dispatchThreads:MTLSizeMake(512, 512, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+		[c endEncoding];
+	}
+	return 1;
+}
+
 // The cloud layer (terrain.metal cloud_fs) into ring slot k's small target, a render pass of its own on the pre command buffer (no depth, no
 // dependency on the world): the dome samples it. params: a SkyFrame; w x h: the target's size. 1 drawn, 0 nothing, -1 err set.
 int mcs_sky_clouds(Own *w, Enc *enc, int k, const void *params, int length, int tw, int th, char *err, int errCap) {
@@ -2664,6 +2696,13 @@ int mcs_sky_clouds(Own *w, Enc *enc, int k, const void *params, int length, int 
 				sk.cloud[i] = [w->ctx->device newTextureWithDescriptor:d];
 				if (!sk.cloud[i]) return -1;
 				sk.cloud[i].label = [NSString stringWithFormat:@"shade clouds %d", i];
+				[sk.age[i] release];
+				d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:(NSUInteger) tw height:(NSUInteger) th mipmapped:NO];
+				d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+				d.storageMode = MTLStorageModePrivate;
+				sk.age[i] = [w->ctx->device newTextureWithDescriptor:d];
+				if (!sk.age[i]) return -1;
+				sk.age[i].label = [NSString stringWithFormat:@"shade clouds age %d", i];
 			}
 			sk.cw = tw;
 			sk.ch = th;
@@ -2680,6 +2719,7 @@ int mcs_sky_clouds(Own *w, Enc *enc, int k, const void *params, int length, int 
 			pd.vertexFunction = vs;
 			pd.fragmentFunction = fs;
 			pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+			pd.colorAttachments[1].pixelFormat = MTLPixelFormatR8Unorm;
 			NSError *e = nil;
 			sk.cloudPso = [w->ctx->device newRenderPipelineStateWithDescriptor:pd error:&e];
 			if (!sk.cloudPso) {
@@ -2693,6 +2733,9 @@ int mcs_sky_clouds(Own *w, Enc *enc, int k, const void *params, int length, int 
 		rp.colorAttachments[0].texture = t;
 		rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
 		rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+		rp.colorAttachments[1].texture = sk.age[k % SKY_RING];
+		rp.colorAttachments[1].loadAction = MTLLoadActionDontCare;
+		rp.colorAttachments[1].storeAction = MTLStoreActionStore;
 		id<MTLRenderCommandEncoder> r = [mc_pre(enc) renderCommandEncoderWithDescriptor:rp];
 		r.label = @"shade clouds";
 		[r setRenderPipelineState:sk.cloudPso];
@@ -2700,10 +2743,14 @@ int mcs_sky_clouds(Own *w, Enc *enc, int k, const void *params, int length, int 
 		[r setFragmentBytes:params length:(NSUInteger) length atIndex:0];
 		[r setFragmentTexture:sk.cur atIndex:0];
 		if (sk.noise) [r setFragmentTexture:sk.noise atIndex:1];
+		id<MTLTexture> prevAge = sk.cloudCur && sk.cloudCur != t ? sk.age[sk.cloudIdx] : sk.age[k % SKY_RING];
+		[r setFragmentTexture:sk.cov ? sk.cov : sk.noise atIndex:4];  // (the coverage map, SkyFrame.cloudM0.y bit 0 says whether to use it)
+		[r setFragmentTexture:prevAge atIndex:5];
 		[r setFragmentTexture:(sk.cloudCur && sk.cloudCur != t ? sk.cloudCur : t) atIndex:3];  // (the previous frame's target: temporal clouds; SkyFrame.cloudT.y says whether to use it)
 		[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 		[r endEncoding];
 		sk.cloudCur = t;
+		sk.cloudIdx = k % SKY_RING;
 	}
 	return 1;
 }
