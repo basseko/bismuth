@@ -2868,6 +2868,8 @@ int mcs_sky_clouds(Own *w, Enc *enc, int k, const void *params, int length, int 
 			}
 			sk.cw = tw;
 			sk.ch = th;
+			sk.cloudCur = nil;  // (it pointed into the released ring: binding it next frame crashed in objc_retain; the history restarts at the new size)
+			sk.cloudIdx = 0;
 		}
 		if (!sk.cloudPso) {
 			id<MTLFunction> vs = [[w->library newFunctionWithName:@"sky_vs"] autorelease];
