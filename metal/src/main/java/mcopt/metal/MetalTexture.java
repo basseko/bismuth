@@ -17,7 +17,7 @@ class MetalTexture extends BaseGpuTexture {
 	long residentBytes;
 	/** Created with ShaderWrite usage (a compute kernel may write it). */
 	boolean shaderWrite;
-	private final MetalEncoder encoder;
+	final MetalEncoder encoder;
 	private boolean closed;
 
 	/**

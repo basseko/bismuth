@@ -1,0 +1,8 @@
+{
+	"required": true,
+	"package": "mcopt.metal.mixin.metalfx",
+	"plugin": "mcopt.metal.mixin.metalfx.MetalFxMixinPlugin",
+	"compatibilityLevel": "JAVA_25",
+	"client": ["MetalFxTargetAccess", "MetalFxGameRendererMixin"],
+	"injectors": { "defaultRequire": 1 }
+}
