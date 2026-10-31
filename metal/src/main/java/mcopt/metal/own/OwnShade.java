@@ -37,11 +37,11 @@ public final class OwnShade {
 	/** Soft edge radius (blocks) and the ambient light the sun replaces at full sun and sky light. */
 	static final int TAPS = Integer.getInteger("mcopt.shaders.shadow.taps", 12);
 	static final float SOFT = Float.parseFloat(System.getProperty("mcopt.shaders.shadow.soft", "0.10"));
-	static final float AMBIENT_CUT = Float.parseFloat(System.getProperty("mcopt.shaders.ambientCut", "0.20"));
+	static final float AMBIENT_CUT = Float.parseFloat(System.getProperty("mcopt.shaders.ambientCut", "0.25"));
 	static final float FILL = Float.parseFloat(System.getProperty("mcopt.shaders.fill", "0.09"));
 	/** 1: the baked vanilla face shade is replaced by a hemisphere ambient (up 1, side 0.6, down 0.4) wherever the sun applies; 0: kept. */
 	static final float HEMI = Float.parseFloat(System.getProperty("mcopt.shaders.hemi", "1.0"));
-	static final float SUN_AMP = Float.parseFloat(System.getProperty("mcopt.shaders.sunAmp", "0.68"));
+	static final float SUN_AMP = Float.parseFloat(System.getProperty("mcopt.shaders.sunAmp", "0.72"));
 	/** The light-space depth range: blocks toward the light that still cast, and beyond the box's centre plane. */
 	private static final double CASTER = 320.0, BEYOND = 192.0;
 	private static final int FRAME_BYTES = 320, CULL_BYTES = 160, CULLFRAME_BYTES = 144, DRAW_BYTES = OwnTerrain.DRAW_FRAME_BYTES;
@@ -165,8 +165,8 @@ public final class OwnShade {
 			cg = OwnLight.sun[1];
 			cb = OwnLight.sun[2];
 		} else {
-			cr = 0.55f;
-			cg = 0.68f;
+			cr = 0.45f;
+			cg = 0.60f;
 			cb = 1.0f;
 		}
 		float amp = useSun ? SUN_AMP : 0.45f;
@@ -349,6 +349,7 @@ public final class OwnShade {
 			MemoryUtil.memPutFloat(fb + 276, SOFT);
 			MemoryUtil.memPutFloat(fb + 280, HEMI);
 			MemoryUtil.memPutFloat(fb + 284, FILL);
+			MemoryUtil.memPutFloat(fb + 300, OwnLight.waterDim());
 			// shade tint (what the sun does not reach) and the sky fill's colour
 			for (int c = 0; c < 3; c++) {
 				MemoryUtil.memPutFloat(fb + 288 + c * 4L, useSun ? OwnLight.shade[c] : 0.84f + 0.08f * c);

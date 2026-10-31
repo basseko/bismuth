@@ -2368,6 +2368,8 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 		const float3 cool = sf.shade.rgb;
 		float fill = sf.amb.w * S * (0.5 + 0.5 * n.y);
 		color.rgb *= lm.rgb * mix(float3(1.0), cool, S * (1.0 - dir * lit) * 0.7) * (1.0 - sf.amb.x * S) + sf.sunColor.rgb * (dir * lit) + fill * sf.fillc.rgb;
+		// water at night keeps a part of its colour (sf.shade.w, 1 by day): vanilla's water texture is much brighter than the land it lies in
+		if (CUTOUT && CUTOUT_LIMIT < 0.2 && sf.shade.w < 0.999) color.rgb = mix(float3(dot(color.rgb, float3(0.3, 0.5, 0.2))) * float3(0.7, 0.85, 1.0), color.rgb, 0.5) * sf.shade.w;
 	}
 #endif
 	// F_LEAN: the chunk visibility is 1 (mix(x, y, 1) is y), the render-distance fog value 0 (max(e, 0) is e for e >= 0)

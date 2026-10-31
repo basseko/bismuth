@@ -28,14 +28,26 @@ public final class OwnLight {
 	 */
 	private static final float[][] TABLE = {
 		// el     ambient               sun                   shade tint            expo  contr sat   gain                 lift                    split              tone  sky
-		{-0.3f, 0.5f, 0.64f, 1f, 0.55f, 0.68f, 1f, 0.55f, 0.7f, 1f, 0.75f, 0.92f, 0.95f, 0.95f, 1.2f, 0.8f, 0, 0.05f, 0.07f, 0, 0, 0, 0.75f, 0.06f, 0.09f, 0.15f},
+		{-0.3f, 0.42f, 0.62f, 1f, 0.45f, 0.60f, 1f, 0.45f, 0.6f, 1f, 0.70f, 1.0f, 1.1f, 0.43f, 1.06f, 0.78f, 0.02f, 0.04f, 0.06f, 0, 0, 0, 0.75f, 0.165f, 0.159f, 0.209f},
 		{-0.1f, 0.62f, 0.62f, 1f, 0.8f, 0.6f, 0.45f, 0.7f, 0.7f, 1f, 0.85f, 0.94f, 1f, 0.95f, 1.12f, 0.85f, 0.005f, 0.035f, 0.06f, 0, 0, 0, 0.75f, 0.1f, 0.11f, 0.2f},
 		{-0.02f, 0.85f, 0.65f, 0.85f, 1f, 0.42f, 0.18f, 0.9f, 0.72f, 0.82f, 1f, 0.95f, 1.12f, 1.25f, 1f, 0.75f, 0.02f, 0.01f, 0.04f, 0, 0, 0, 0.75f, 0.35f, 0.28f, 0.38f},
-		{0.05f, 1f, 0.7f, 0.46f, 1f, 0.5f, 0.2f, 1f, 0.8f, 0.62f, 1.05f, 0.9f, 1.2f, 1.4f, 1.1f, 0.62f, 0.035f, 0.01f, 0.04f, 0, 0, 0, 0.75f, 0.5f, 0.38f, 0.36f},
-		{0.14f, 1f, 0.72f, 0.5f, 1f, 0.56f, 0.26f, 1f, 0.82f, 0.66f, 1f, 0.9f, 1.15f, 1.4f, 1.08f, 0.62f, 0.04f, 0.02f, 0.035f, 0, 0, 0, 0.75f, 0.46f, 0.4f, 0.41f},
-		{0.3f, 1f, 0.85f, 0.68f, 1f, 0.75f, 0.52f, 0.96f, 0.88f, 0.82f, 0.92f, 0.93f, 1f, 1.28f, 0.98f, 0.68f, 0.035f, 0.03f, 0.05f, 0, 0, 0, 0.75f, 0.45f, 0.43f, 0.47f},
-		{0.47f, 0.95f, 0.93f, 1f, 1f, 0.88f, 0.74f, 0.92f, 0.94f, 1f, 0.8f, 0.96f, 0.78f, 1.2f, 0.92f, 0.72f, 0.03f, 0.03f, 0.05f, 0, 0, 0, 0.75f, 0.42f, 0.42f, 0.5f},
-		{0.85f, 0.86f, 0.93f, 1f, 1f, 0.95f, 0.88f, 0.88f, 0.94f, 1f, 0.82f, 0.92f, 0.95f, 0.78f, 1.04f, 1.1f, 0, 0.015f, 0.06f, 0, 0, 0, 0.75f, 0.4f, 0.54f, 0.84f},
+		{0.05f, 1f, 0.7f, 0.46f, 1f, 0.5f, 0.2f, 1f, 0.8f, 0.62f, 1.05f, 0.9f, 1.2f, 1.4f, 1.1f, 0.62f, 0.02f, 0.008f, 0.025f, 0, 0, 0, 0.75f, 0.5f, 0.38f, 0.36f},
+		{0.14f, 1f, 0.72f, 0.5f, 1f, 0.56f, 0.26f, 1f, 0.82f, 0.66f, 1f, 0.9f, 1.15f, 1.4f, 1.08f, 0.62f, 0.02f, 0.012f, 0.025f, 0, 0, 0, 0.75f, 0.46f, 0.4f, 0.41f},
+		{0.3f, 1f, 0.85f, 0.68f, 1f, 0.75f, 0.52f, 0.96f, 0.88f, 0.82f, 0.92f, 0.98f, 1f, 1.28f, 0.98f, 0.68f, 0.015f, 0.015f, 0.03f, 0, 0, 0, 0.75f, 0.45f, 0.43f, 0.47f},
+		{0.47f, 0.95f, 0.93f, 1f, 1f, 0.88f, 0.74f, 0.92f, 0.94f, 1f, 0.8f, 1.0f, 0.85f, 1.2f, 0.92f, 0.72f, 0.012f, 0.012f, 0.025f, 0, 0, 0, 0.75f, 0.257f, 0.393f, 0.712f},
+		{0.85f, 0.86f, 0.93f, 1f, 1f, 0.95f, 0.88f, 0.88f, 0.94f, 1f, 0.82f, 0.96f, 1.05f, 0.78f, 1.04f, 1.1f, 0, 0.005f, 0.03f, 0, 0, 0, 0.75f, 0.386f, 0.5f, 0.754f},
+	};
+
+	/** The horizon / fog colour's tint per row (multiplies vanilla's fog colour, which is also the sky disc's horizon): warm at low sun, lighter at noon, bluer at night. */
+	private static final float[][] FOGT = {
+		{4.5f, 4.3f, 3.1f},  // night: the horizon haze is lifted (vanilla's night fog colour is near black)
+		{1.0f, 1.0f, 1.0f},
+		{1.0f, 1.0f, 1.0f},
+		{1.0f, 1.0f, 1.0f},
+		{1.0f, 1.0f, 1.0f},
+		{1.03f, 0.995f, 0.95f},
+		{1.07f, 0.99f, 0.89f},
+		{1.1f, 1.08f, 1.04f},
 	};
 
 	static {
@@ -64,6 +76,7 @@ public final class OwnLight {
 		float[] a = TABLE[i], b = TABLE[i + 1];
 		float t = (x - a[EL]) / (b[EL] - a[EL]);
 		for (int k = 1; k < N; k++) grade[k] = a[k] + (b[k] - a[k]) * t;
+		for (int k = 0; k < 3; k++) fogTint[k] = 1 + (FOGT[i][k] + (FOGT[i + 1][k] - FOGT[i][k]) * t - 1) * (inWater ? 0 : 1 - Math.min(1, rainLevel));
 		System.arraycopy(grade, AMB, ambient, 0, 3);
 		System.arraycopy(grade, SUN, sun, 0, 3);
 		System.arraycopy(grade, SHADE, shade, 0, 3);
@@ -93,9 +106,23 @@ public final class OwnLight {
 		}
 	}
 
+	/** The horizon tint of this frame (FOGT by the same interpolation; faded out in rain and under water). */
+	static final float[] fogTint = {1, 1, 1};
+
 	/** The sky disc's (zenith) colour for this frame's sun elevation, before the grade. */
 	public static float[] skyColor() {
 		return new float[] {grade[SKY], grade[SKY + 1], grade[SKY + 2]};
+	}
+
+	/** Vanilla's fog colour (the horizon of the sky disc and the haze of the terrain) tinted by the time of day. */
+	public static org.joml.Vector3fc tintFog(org.joml.Vector3fc c) {
+		return new org.joml.Vector3f(Math.min(1, c.x() * fogTint[0]), Math.min(1, c.y() * fogTint[1]), Math.min(1, c.z() * fogTint[2]));
+	}
+
+	/** How much of its colour water keeps at night (the moon's light is faint; vanilla's water texture is brighter than the land). */
+	static float waterDim() {
+		float night = 1.0f - Math.max(0.0f, Math.min(1.0f, (el + 0.12f) / 0.2f));
+		return 1.0f - 0.6f * night;
 	}
 
 	/** The sky light colour the lightmap gets (relative, the brightest component 1). */
