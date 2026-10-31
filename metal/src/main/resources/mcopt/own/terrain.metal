@@ -2799,9 +2799,12 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 		// aerial perspective (milestone 3): in air the fog's colour is the sky's own colour toward the pixel (the table, the same the dome draws), and an
 		// exponential extinction thickens the haze with distance (the stronger of it and vanilla's linear fog, which still fades the render distance's edge)
 		float dist = length(in.shPos);
-		float3 hz = skHaze(skLut, in.shPos / max(dist, 1e-3), sf.sunTrue.xyz, sf.haze.z, sf.sunTrue.w, sf.skyWarm);
-		fogRgb = mix(fogRgb, hz, sf.haze.y);
-		fogValue = max(fogValue, (1.0 - exp(-dist * sf.haze.x)) * sf.haze.y);
+		float hv = (1.0 - exp(-dist * sf.haze.x)) * sf.haze.y;
+		if (hv > 0.004 || fogValue > 0.004) {  // (near the camera the haze is nothing: skip the table lookup and the colour maths)
+			float3 hz = skHaze(skLut, in.shPos / max(dist, 1e-3), sf.sunTrue.xyz, sf.haze.z, sf.sunTrue.w, sf.skyWarm);
+			fogRgb = mix(fogRgb, hz, sf.haze.y);
+		}
+		fogValue = max(fogValue, hv);
 	}
 #endif
 	return float4(mix(color.rgb, fogRgb, fogValue * fog.FogColor.a), color.a);
@@ -4064,6 +4067,10 @@ struct PostFrame {
 	float4 la;      // rgb shadow lift as a scale (1 - lift): g' = g * la + lb, w dither amplitude in 8-bit steps
 	float4 lb;      // rgb shadow lift (display space), w 1: the pass without its maths (a measurement)
 	float4 m0, m1, m2;  // saturation and contrast as one matrix on the display colour (rows, bias in w)
+	float4 bl;      // x bloom strength, y light shaft strength, z bloom threshold (display luma), w 1: bloom/shafts on (the textures are bound)
+	float4 shc;     // rgb light shaft colour (linear), w shaft falloff (1 / screen distance)
+	float4 sz;      // x 1/width, y 1/height of the main target, z aspect (w / h), w 0
+	float4 sun;     // xy sun position in uv (v down), z in front of the camera (0..1 fade), w 0
 };
 
 struct PostV {
@@ -4077,7 +4084,11 @@ vertex PostV post_vs(uint vid [[vertex_id]]) {
 }
 
 // The tone curve is Narkowicz's fit of the ACES filmic curve (public; 2015). Half precision: the target is 8 bits.
-fragment half4 post_fs(PostV in [[stage_in]], half4 dst [[color(0)]], constant PostFrame &f [[buffer(0)]]) {
+// Bloom and light shafts (milestone 6): this pass also WRITES a half-resolution source texture (bright-pass colour + sky mask; a 2x2 quad average,
+// one write per quad) that compute kernels blur and march in the next frame's pre command buffer (bloom_down / bloom_up); this pass ADDS the
+// result of the previous frame (bloomTex, a quarter-resolution RGBA16F: bloom in rgb, shaft strength in a). One frame of lag, no pass split.
+fragment half4 post_fs(PostV in [[stage_in]], half4 dst [[color(0)]], constant PostFrame &f [[buffer(0)]], texture2d<half> bloomTex [[texture(0)]],
+	texture2d<half, access::write> bloomSrc [[texture(1)]], uint lane [[thread_index_in_quadgroup]]) {
 	if (f.lb.w > 0.5) return dst;  // (probe shaders.postnop: the pass without its maths, to measure the pass's own cost)
 	// display -> linear with gamma 2 (a multiply instead of a pow), expose and balance, tone curve, back with a square root
 	half3 lin = dst.rgb * dst.rgb * half3(f.gk.rgb);
@@ -4085,12 +4096,103 @@ fragment half4 post_fs(PostV in [[stage_in]], half4 dst [[color(0)]], constant P
 	half3 g = sqrt(mix(min(lin, 1.0h), saturate(mapped), half(f.gk.w)));
 	g = g * half3(f.la.rgb) + half3(f.lb.rgb);
 	half3 o = half3(dot(half3(f.m0.xyz), g) + half(f.m0.w), dot(half3(f.m1.xyz), g) + half(f.m1.w), dot(half3(f.m2.xyz), g) + half(f.m2.w));
+	float2 pp = in.pos.xy;
+	if (f.bl.w > 0.5) {
+		// the source for the next frame: the bright part of THIS picture before the bloom is added (else it feeds on itself) and the sky mask, averaged over the quad
+		half sky = saturate(1.0h - dst.a);  // the dome writes alpha 0, everything else 1
+		half l = dot(max(o, 0.0h), half3(0.2126h, 0.7152h, 0.0722h));
+		half k = saturate((l - half(f.bl.z)) * (1.0h / (1.0h - half(f.bl.z))));
+		half4 v = half4(min(o, 1.0h) * k * k, sky);
+		v += quad_shuffle_xor(v, 1);
+		v += quad_shuffle_xor(v, 2);
+		if (lane == 0) bloomSrc.write(v * 0.25h, uint2(pp) >> 1);
+		// the previous frame's bloom and shafts (bilinear), added in linear light
+		constexpr sampler bs(filter::linear, address::clamp_to_edge);
+		half4 bt = bloomTex.sample(bs, pp * f.sz.xy);
+		half3 add = bt.rgb * half(f.bl.x) + half3(f.shc.rgb) * (bt.a * half(f.bl.y));
+		o = sqrt(max(o * o + add, 0.0h));
+		if (f.sun.w > 0.5) return half4(f.sun.w < 1.5 ? saturate(bt.rgb) : (f.sun.w < 2.5 ? half3(bt.a) : saturate(bt.rgb * 0.1h)), 1.0h);
+	}
 	// interleaved-gradient noise as a dither, so the stretched dark steps do not band
 	// (two of them: a triangular noise of +-1 step, which also hides the steps of the 8-bit sky once the grade has stretched them)
-	float2 pp = in.pos.xy;
 	float n = fract(52.9829189 * fract(dot(pp, float2(0.06711056, 0.00583715)))) + fract(52.9829189 * fract(dot(pp.yx + 19.0, float2(0.06711056, 0.00583715)))) - 1.0;
 	o += half(n * (f.la.w * (1.0 / 255.0)));
-	return half4(saturate(o), dst.a);
+	return half4(saturate(o), 1.0h);
+}
+
+// ---- bloom and light shafts, the compute half (bloom_down / bloom_up; mcown.m mcs_post) ----
+// Level 0 is the half-resolution source (RGBA8: display-space bright-pass colour, sky mask); the chain halves to 1/32 with the 13-tap filter of
+// Jimenez 2014 (public: "Next generation post processing in Call of Duty: Advanced Warfare"), the first level with a Karis-style weight against fireflies;
+// the way up adds a 3x3 tent of the smaller level to the bigger one (into a second set of textures: in-place read_write was garbage here). The last level (1/4 of the screen) also gets the light shafts in its alpha:
+// a radial march from the pixel toward the sun through the sky mask (Mitchell 2007, "Light shaft rendering", GPU Gems 3 ch. 13 in the idea), weighted
+// toward the sun so what stands between the pixel and the sun (leaves, trunks, hills) blocks the light.
+constexpr sampler blS(filter::linear, address::clamp_to_edge);
+
+kernel void bloom_down(texture2d<float> src [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]], constant uint &first [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
+	uint W = dst.get_width(), H = dst.get_height();
+	if (gid.x >= W || gid.y >= H) return;
+	float2 uv = (float2(gid) + 0.5) / float2(W, H), t = 1.0 / float2(src.get_width(), src.get_height());
+	float3 a = src.sample(blS, uv + t * float2(-2, -2)).rgb, b = src.sample(blS, uv + t * float2(0, -2)).rgb, c = src.sample(blS, uv + t * float2(2, -2)).rgb;
+	float3 d = src.sample(blS, uv + t * float2(-1, -1)).rgb, e = src.sample(blS, uv + t * float2(1, -1)).rgb;
+	float3 g = src.sample(blS, uv + t * float2(-2, 0)).rgb, h = src.sample(blS, uv).rgb, i = src.sample(blS, uv + t * float2(2, 0)).rgb;
+	float3 j = src.sample(blS, uv + t * float2(-1, 1)).rgb, k = src.sample(blS, uv + t * float2(1, 1)).rgb;
+	float3 l = src.sample(blS, uv + t * float2(-2, 2)).rgb, m = src.sample(blS, uv + t * float2(0, 2)).rgb, n = src.sample(blS, uv + t * float2(2, 2)).rgb;
+	float3 r;
+	if (first != 0) {
+		// display colour -> linear, then the five overlapping boxes weighted by 1 / (1 + luma)
+		a *= a; b *= b; c *= c; d *= d; e *= e; g *= g; h *= h; i *= i; j *= j; k *= k; l *= l; m *= m; n *= n;
+		float3 b0 = (d + e + j + k) * 0.25, b1 = (a + b + g + h) * 0.25, b2 = (b + c + h + i) * 0.25, b3 = (g + h + l + m) * 0.25, b4 = (h + i + m + n) * 0.25;
+		const float3 lw = float3(0.2126, 0.7152, 0.0722);
+		float w0 = 1.0 / (1.0 + dot(b0, lw)), w1 = 1.0 / (1.0 + dot(b1, lw)), w2 = 1.0 / (1.0 + dot(b2, lw)), w3 = 1.0 / (1.0 + dot(b3, lw)), w4 = 1.0 / (1.0 + dot(b4, lw));
+		r = (b0 * w0 * 0.5 + (b1 * w1 + b2 * w2 + b3 * w3 + b4 * w4) * 0.125) / (w0 * 0.5 + (w1 + w2 + w3 + w4) * 0.125);
+	} else {
+		r = (d + e + j + k) * 0.125 + (a + b + g + h) * 0.03125 + (b + c + h + i) * 0.03125 + (g + h + l + m) * 0.03125 + (h + i + m + n) * 0.03125;
+	}
+	dst.write(float4(r, 1.0), gid);
+}
+
+// big += weight * tent(small); mode 1: the shafts too (big is the last level, `srcTex` the half-resolution source whose alpha is the sky mask)
+kernel void bloom_up(texture2d<float> lowT [[texture(0)]], texture2d<float> highT [[texture(1)]], texture2d<float> srcTex [[texture(2)]], texture2d<float, access::write> outT [[texture(3)]],
+	constant PostFrame &f [[buffer(0)]], constant uint &mode [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
+	uint W = highT.get_width(), H = highT.get_height();
+	if (gid.x >= W || gid.y >= H) return;
+	float2 uv = (float2(gid) + 0.5) / float2(W, H), t = 1.0 / float2(lowT.get_width(), lowT.get_height());
+	float3 s = lowT.sample(blS, uv).rgb * 0.25;
+	s += (lowT.sample(blS, uv + t * float2(-1, 0)).rgb + lowT.sample(blS, uv + t * float2(1, 0)).rgb + lowT.sample(blS, uv + t * float2(0, -1)).rgb + lowT.sample(blS, uv + t * float2(0, 1)).rgb) * 0.125;
+	s += (lowT.sample(blS, uv + t * float2(-1, -1)).rgb + lowT.sample(blS, uv + t * float2(1, -1)).rgb + lowT.sample(blS, uv + t * float2(-1, 1)).rgb + lowT.sample(blS, uv + t * float2(1, 1)).rgb) * 0.0625;
+	float4 b = highT.sample(blS, uv);
+	b.rgb += s * 0.72;
+	if (mode != 0) {
+		float shaft = 0.0;
+		float2 d = f.sun.xy - uv;
+		float2 da = float2(d.x * f.sz.z, d.y);
+		float dist = length(da);
+		if (f.sun.z > 0.0 && f.bl.y > 0.0) {
+			const int N = 20;
+			float acc = 0.0, wsum = 0.0;
+			// march from the pixel to the sun (at most 0.55 of the screen), samples nearer the sun count more
+			float2 stepv = d * min(1.0, 0.55 / max(dist, 1e-3)) / float(N);
+			float2 p = uv + stepv * (0.5 + 0.5 * fract(52.9829189 * fract(dot(float2(gid), float2(0.06711056, 0.00583715)))));
+			for (int i = 0; i < N; i++) {
+				float w = float(i + 1);
+				w *= w;
+				acc += srcTex.sample(blS, p).a * w;
+				wsum += w;
+				p += stepv;
+			}
+			float fall = saturate(1.0 - dist * f.shc.w);
+			shaft = acc / wsum * fall * fall * f.sun.z;
+			// the pixel's own sky: the haze matters where the light has something to fall on, the sky is bright already
+			shaft *= 0.35 + 0.65 * (1.0 - srcTex.sample(blS, uv).a);
+		}
+		b.a = shaft;
+	}
+	outT.write(b, gid);
+}
+
+kernel void bloom_clear(texture2d<float, access::write> dst [[texture(0)]], uint2 gid [[thread_position_in_grid]]) {
+	if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
+	dst.write(float4(0.0), gid);
 }
 
 // ---- sky (milestone 3): the single-scattering sky-view table (compute) and the sky dome ----
@@ -4245,7 +4347,8 @@ static float4 skClouds(texture2d<float> nz, float3 dir, constant SkyFrame &f, fl
 			// the sunlight that reaches the point: two samples toward the sun
 			float l1 = skCloudDensity(nz, p + sunDir * 70.0, f, saturate(hf + sunDir.y * 0.5), lod);
 			float l2 = skCloudDensity(nz, p + sunDir * 210.0, f, saturate(hf + sunDir.y * 1.2), lod);
-			float lightT = exp(-(l1 * 70.0 + l2 * 140.0) * 0.032);
+			float od = (l1 * 70.0 + l2 * 140.0) * 0.032;
+			float lightT = 0.7 * exp(-od) + 0.3 * exp(-od * 0.2);  // (two octaves: the second is the multiply scattered light that fills a thick cloud's shadowed side; Hillaire 2016)
 			float3 c = sunC * (lightT * (0.62 + 2.2 * hgF)) + ambCol * (0.38 + 0.62 * hf);
 			c = mix(c, float3(0.50, 0.55, 0.58) * (0.8 + 0.2 * hf), f.sunCol.w * 0.9);  // overcast: even grey light
 			float a = 1.0 - exp(-d * min(dt, 140.0) * 0.05);  // (a long slanted path is not more cloud: the slab's horizontal variation is already in d)
@@ -4309,6 +4412,6 @@ fragment float4 sky_fs(SkyV in [[stage_in]], constant SkyFrame &f [[buffer(0)]],
 	float2 pp = in.pos.xy;
 	float n = fract(52.9829189 * fract(dot(pp, float2(0.06711056, 0.00583715)))) + fract(52.9829189 * fract(dot(pp.yx + 19.0, float2(0.06711056, 0.00583715)))) - 1.0;
 	sky += n * (1.0 / 255.0);
-	return float4(sky, 1.0);
+	return float4(sky, 0.0);  // (alpha 0: the sky mask the post pass reads for the light shafts; it writes 1 back)
 }
 #endif

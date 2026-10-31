@@ -98,7 +98,8 @@ public final class OwnLight {
 			grade[LIFT + 2] = Math.max(grade[LIFT + 2], 0.06f * r);
 		}
 		if (inWater) {
-			grade[EXPO] *= 0.9f;
+			grade[EXPO] *= 0.76f;
+			grade[CONTRAST] *= 1.08f;
 			grade[SAT] *= 0.85f;
 			grade[GAIN] *= 0.9f;
 			grade[GAIN + 1] *= 0.95f;
@@ -139,8 +140,13 @@ public final class OwnLight {
 		return ambient;
 	}
 
-	/** Writes the PostFrame (terrain.metal) of this frame: 7 float4 (112 bytes). */
-	static void postFrame(java.nio.FloatBuffer b, boolean nop) {
+	/** Bloom (-Dmcopt.shaders.bloom=0 off; 1 is the default strength) and light shafts (-Dmcopt.shaders.shafts, the same). */
+	static final float BLOOM = Float.parseFloat(System.getProperty("mcopt.shaders.bloom", "1"));
+	static final float SHAFTS = Float.parseFloat(System.getProperty("mcopt.shaders.shafts", "1.7"));
+	static final float BLOOM_THR = Float.parseFloat(System.getProperty("mcopt.shaders.bloom.threshold", "0.84"));
+
+	/** Writes the PostFrame (terrain.metal) of this frame: 10 float4 (160 bytes). */
+	static void postFrame(java.nio.FloatBuffer b, boolean nop, int w, int h, boolean bloomOn) {
 		float e = grade[EXPO], sat = grade[SAT], ct = grade[CONTRAST];
 		b.put(grade[GAIN] * e).put(grade[GAIN + 1] * e).put(grade[GAIN + 2] * e).put(grade[TONE]);
 		b.put(1 - grade[LIFT]).put(1 - grade[LIFT + 1]).put(1 - grade[LIFT + 2]).put(1.0f);
@@ -151,5 +157,15 @@ public final class OwnLight {
 			for (int j = 0; j < 3; j++) b.put(ct * ((i == j ? sat : 0) + (1 - sat) * luma[j]));
 			b.put(0.5f * (1 - ct));
 		}
+		// bloom: a little more in the dark of dusk and night (the glow of the sun and the moon), none of the shafts in rain or under water
+		float lowSun = 1.0f - Math.max(0f, Math.min(1f, (el - 0.05f) / 0.55f));  // 1 at the horizon, 0 high
+		float up = Math.max(0f, Math.min(1f, (el + 0.05f) / 0.12f));             // 0 with the sun well below the horizon
+		float shaft = SHAFTS * up * (0.35f + 0.65f * lowSun) * (1 - Math.min(1, rain) * 0.9f) * (water ? 0f : 1f);
+		float[] sc = OwnSky.sunTrans;
+		float m = Math.max(1e-3f, Math.max(sc[0], Math.max(sc[1], sc[2])));
+		b.put(BLOOM * (1.0f - 0.45f * Math.min(1, rain))).put(shaft).put(BLOOM_THR).put(bloomOn ? 1f : 0f);
+		b.put(sc[0] / m).put(sc[1] / m).put(sc[2] / m).put(1.0f);
+		b.put(1.0f / w).put(1.0f / h).put((float) w / h).put(OwnProbe.bool("shaders.bloom.chain", true) ? 0f : 1f);
+		b.put(OwnSky.sunScreen[0]).put(OwnSky.sunScreen[1]).put(OwnSky.sunScreen[2]).put(Float.parseFloat(System.getProperty("mcopt.shaders.bloom.debug", "0")));
 	}
 }

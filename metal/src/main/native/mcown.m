@@ -2291,9 +2291,112 @@ static struct {
 	id<MTLDepthStencilState> always;
 } post;
 
+// Bloom and light shafts (milestone 6): textures and kernels. src[2] is the half-resolution source the post pass writes (a ring: the pass writes
+// one while the compute reads the other), lv[0..3] the chain 1/4 .. 1/32 of the screen (lv[0] is also what the post pass samples next frame).
+static struct {
+	id<MTLTexture> src[2], lv[4], ut[3];
+	NSUInteger w, h;
+	unsigned frame;
+	id<MTLComputePipelineState> down, up, clear;
+	int failed;
+} bl;
+
+static void blFree(void) {
+	for (int i = 0; i < 2; i++) { [bl.src[i] release]; bl.src[i] = nil; }
+	for (int i = 0; i < 4; i++) { [bl.lv[i] release]; bl.lv[i] = nil; }
+	for (int i = 0; i < 3; i++) { [bl.ut[i] release]; bl.ut[i] = nil; }
+}
+
+static id<MTLTexture> blTex(Own *w, MTLPixelFormat pf, NSUInteger tw, NSUInteger th, NSString *label) {
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:tw height:th mipmapped:NO];
+	d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+	d.storageMode = MTLStorageModePrivate;
+	id<MTLTexture> t = [w->ctx->device newTextureWithDescriptor:d];
+	t.label = label;
+	return t;
+}
+
+// Allocate (cleared) when the screen size changes. 1 ready.
+static int blEnsure(Own *w, Enc *enc) {
+	NSUInteger W = (NSUInteger) enc->width, H = (NSUInteger) enc->height;
+	if (bl.failed) return 0;
+	if (bl.src[0] && bl.w == W && bl.h == H) return 1;
+	blFree();
+	bl.w = W;
+	bl.h = H;
+	bl.frame = 0;
+	if (!ownLazyKernel(w, &bl.down, "bloom_down") || !ownLazyKernel(w, &bl.up, "bloom_up") || !ownLazyKernel(w, &bl.clear, "bloom_clear")) {
+		bl.failed = 1;
+		return 0;
+	}
+	NSUInteger sw = (W + 1) / 2, sh = (H + 1) / 2;
+	bl.src[0] = blTex(w, MTLPixelFormatRGBA8Unorm, sw, sh, @"shade bloom src 0");
+	bl.src[1] = blTex(w, MTLPixelFormatRGBA8Unorm, sw, sh, @"shade bloom src 1");
+	NSUInteger lw = sw, lh = sh;
+	for (int i = 0; i < 4; i++) {
+		lw = (lw + 1) / 2;
+		lh = (lh + 1) / 2;
+		bl.lv[i] = blTex(w, MTLPixelFormatRGBA16Float, lw, lh, [NSString stringWithFormat:@"shade bloom lv %d", i]);
+		if (i < 3) bl.ut[i] = blTex(w, MTLPixelFormatRGBA16Float, lw, lh, [NSString stringWithFormat:@"shade bloom up %d", i]);
+	}
+	for (int i = 0; i < 2; i++) if (!bl.src[i]) { blFree(); bl.failed = 1; return 0; }
+	for (int i = 0; i < 4; i++) if (!bl.lv[i]) { blFree(); bl.failed = 1; return 0; }
+	for (int i = 0; i < 3; i++) if (!bl.ut[i]) { blFree(); bl.failed = 1; return 0; }
+	mc_pre_end_encoders(enc);
+	id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];
+	c.label = @"shade bloom clear";
+	[c setComputePipelineState:bl.clear];
+	id<MTLTexture> all[9] = {bl.src[0], bl.src[1], bl.lv[0], bl.lv[1], bl.lv[2], bl.lv[3], bl.ut[0], bl.ut[1], bl.ut[2]};
+	for (int i = 0; i < 9; i++) {
+		[c setTexture:all[i] atIndex:0];
+		[c dispatchThreads:MTLSizeMake(all[i].width, all[i].height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+	}
+	[c endEncoding];
+	return 1;
+}
+
+// The chain over the previous frame's source (pre command buffer): down 1/4 .. 1/32, up in place, the shafts into the last level's alpha.
+static void blChain(Own *w, Enc *enc, id<MTLTexture> prev, const void *params, int length) {
+	mc_pre_end_encoders(enc);
+	id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];
+	c.label = @"shade bloom";
+	id<MTLTexture> in = prev;
+	uint32_t one = 1, zero = 0;
+	[c setComputePipelineState:bl.down];
+	for (int i = 0; i < 4; i++) {
+		[c setTexture:in atIndex:0];
+		[c setTexture:bl.lv[i] atIndex:1];
+		[c setBytes:(i == 0 ? &one : &zero) length:4 atIndex:1];
+		[c dispatchThreads:MTLSizeMake(bl.lv[i].width, bl.lv[i].height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+		in = bl.lv[i];
+	}
+	[c setComputePipelineState:bl.up];
+	[c setBytes:params length:(NSUInteger) length atIndex:0];
+	[c setTexture:prev atIndex:2];
+	for (int i = 3; i > 0; i--) {
+		[c setTexture:(i == 3 ? bl.lv[3] : bl.ut[i]) atIndex:0];
+		[c setTexture:bl.lv[i - 1] atIndex:1];
+		[c setTexture:bl.ut[i - 1] atIndex:3];
+		[c setBytes:(i == 1 ? &one : &zero) length:4 atIndex:1];
+		[c dispatchThreads:MTLSizeMake(bl.lv[i - 1].width, bl.lv[i - 1].height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+	}
+	[c endEncoding];
+}
+
 int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int length, char *err, int errCap) {
 	id<MTLRenderCommandEncoder> r = enc->render;
 	if (!r || enc->colorCount != 1 || !enc->colors[0] || enc->colors[0] != target || length > 256) return 0;
+	float pbuf[64];
+	memcpy(pbuf, params, (size_t) length);
+	int bloom = length >= 160 && pbuf[27] > 0.5f && blEnsure(w, enc);
+	if (length >= 160 && !bloom) pbuf[27] = 0.0f;  // (the shader must not touch textures that are not bound)
+	params = pbuf;
+	if (bloom) {
+		unsigned f = bl.frame++;
+		if (pbuf[35] < 0.5f) blChain(w, enc, bl.src[(f + 1) & 1], params, length);  // (pbuf[35]: probe shaders.bloom.chain off, a measurement)
+		[r setFragmentTexture:bl.ut[0] atIndex:0];
+		[r setFragmentTexture:bl.src[f & 1] atIndex:1];
+	}
 	MTLPixelFormat cf = enc->colors[0].pixelFormat, df = enc->depth ? enc->depth.pixelFormat : MTLPixelFormatInvalid;
 	id<MTLRenderPipelineState> pso = nil;
 	for (int i = 0; i < post.n; i++)

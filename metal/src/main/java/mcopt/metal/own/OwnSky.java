@@ -37,6 +37,8 @@ public final class OwnSky {
 
 	// the frame's sky state
 	static float sinEl, rain;
+	/** The sun's screen position (uv, v down) and how much of it counts (0 behind the camera or far off screen). */
+	static final float[] sunScreen = new float[3];
 	static final float[] sunDir = {0, 1, 0}, sunTrans = {1, 1, 1}, horizon = {0.5f, 0.6f, 0.8f};
 	/** The old (table) horizon colour of the fog at night, remembered by the fog mixin: the night sky's horizon. */
 	static final float[] nightFog = {0.05f, 0.05f, 0.07f};
@@ -195,6 +197,20 @@ public final class OwnSky {
 			put3(p, 16, view.m00() * tx, view.m10() * tx, view.m20() * tx);
 			put3(p, 32, view.m01() * ty, view.m11() * ty, view.m21() * ty);
 			if (LOG && (frameNo++ % 600) == 0) System.out.println("mcopt-shaders: sky fwd " + (-view.m02()) + " " + (-view.m12()) + " " + (-view.m22()) + " tan " + tx + " " + ty + " proj " + proj + " view " + view + " sun " + sunDir[1]);
+			// the sun's place on the screen (uv, v down) for the light shafts: the sky shader's own mapping, inverted (dir = F + R tx x - D ty y, D the view's second row)
+			{
+				float sf = sunDir[0] * -view.m02() + sunDir[1] * -view.m12() + sunDir[2] * -view.m22();
+				float sr = sunDir[0] * view.m00() + sunDir[1] * view.m10() + sunDir[2] * view.m20();
+				float sd = sunDir[0] * view.m01() + sunDir[1] * view.m11() + sunDir[2] * view.m21();
+				if (sf > 0.02f) {
+					sunScreen[0] = 0.5f + 0.5f * sr / (sf * tx);
+					sunScreen[1] = 0.5f + 0.5f * sd / (sf * ty);
+					float off = Math.max(Math.abs(sunScreen[0] - 0.5f), Math.abs(sunScreen[1] - 0.5f)) * 2.0f;  // 1 at the screen's edge
+					sunScreen[2] = Math.min(1.0f, sf * 4.0f) * (1.0f - smooth(1.2f, 3.2f, off));
+				} else {
+					sunScreen[2] = 0;
+				}
+			}
 			float night = 1.0f - smooth(-0.32f, -0.05f, sinEl);
 			// clouds
 			boolean clouds = cloudsWanted();
