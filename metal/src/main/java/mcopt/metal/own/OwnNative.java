@@ -68,7 +68,25 @@ final class OwnNative {
 	private static final MethodHandle SHADE_PASS = OwnShade.ON ? fn("mcs_shadow_pass", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_INT,
 		JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT) : null;
 
+	private static final MethodHandle POST = OwnShade.ON ? fn("mcs_post", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT) : null;
+
 	private OwnNative() {
+	}
+
+	/** The colour response pass into the open render encoder (mcs_post); throws with the native error. */
+	static boolean post(long own, long enc, long target, long params, int length) {
+		try (MemoryStack stack = MemoryStack.stackPush()) {
+			long err = stack.nmalloc(1, 1024);
+			MemoryUtil.memPutByte(err, (byte) 0);
+			int r;
+			try {
+				r = (int) POST.invokeExact(own, enc, target, params, length, err, 1024);
+			} catch (Throwable t) {
+				throw rethrow(t);
+			}
+			if (r < 0) throw new IllegalStateException(MemoryUtil.memUTF8(err));
+			return r > 0;
+		}
 	}
 
 	/** The shadow map ring (mcs_init). */

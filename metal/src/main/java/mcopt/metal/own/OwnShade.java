@@ -4,6 +4,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.SkyRenderState;
 import net.minecraft.world.level.dimension.DimensionType;
+import net.minecraft.world.level.material.FogType;
 import org.joml.Matrix4f;
 import org.joml.Vector3d;
 import org.lwjgl.system.MemoryStack;
@@ -43,11 +44,13 @@ public final class OwnShade {
 	static final float SUN_AMP = Float.parseFloat(System.getProperty("mcopt.shaders.sunAmp", "0.68"));
 	/** The light-space depth range: blocks toward the light that still cast, and beyond the box's centre plane. */
 	private static final double CASTER = 320.0, BEYOND = 192.0;
-	private static final int FRAME_BYTES = 288, CULL_BYTES = 160, CULLFRAME_BYTES = 144, DRAW_BYTES = OwnTerrain.DRAW_FRAME_BYTES;
+	private static final int FRAME_BYTES = 320, CULL_BYTES = 160, CULLFRAME_BYTES = 144, DRAW_BYTES = OwnTerrain.DRAW_FRAME_BYTES;
 
 	/** This frame draws the shaded terrain variant (set by {@link #frame}; read at the one choke point, OwnNative.draw). */
 	static boolean frameActive;
 	private static boolean said;
+	/** The terrain renderer of the last frame (OwnPost needs its native handles). */
+	static OwnTerrain postOwner;
 
 	// kind bits (mcown.m)
 	static final int K_SHADE = 1 << 8;
@@ -87,6 +90,8 @@ public final class OwnShade {
 		Minecraft mc = Minecraft.getInstance();
 		SkyRenderState sky = mc.gameRenderer.gameRenderState().levelRenderState.skyRenderState;
 		if (sky.skybox != DimensionType.Skybox.OVERWORLD || !OwnProbe.bool("shaders", true)) return;
+		postOwner = t;
+		OwnLight.update(sky.sunAngle, 1.0f - sky.rainBrightness, camera.fogType == FogType.WATER);
 		if (fat) {
 			if (!said) System.out.println("mcopt-shaders: not with -Dmcopt.own.fat (lists of instances), off");
 			said = true;
@@ -156,10 +161,9 @@ public final class OwnShade {
 		float el = (float) L.y;
 		float cr, cg, cb;
 		if (useSun) {
-			float w = smooth(0.04f, 0.45f, el);
-			cr = 1.0f;
-			cg = 0.46f + (0.95f - 0.46f) * w;
-			cb = 0.20f + (0.88f - 0.20f) * w;
+			cr = OwnLight.sun[0];
+			cg = OwnLight.sun[1];
+			cb = OwnLight.sun[2];
 		} else {
 			cr = 0.55f;
 			cg = 0.68f;
@@ -345,6 +349,11 @@ public final class OwnShade {
 			MemoryUtil.memPutFloat(fb + 276, SOFT);
 			MemoryUtil.memPutFloat(fb + 280, HEMI);
 			MemoryUtil.memPutFloat(fb + 284, FILL);
+			// shade tint (what the sun does not reach) and the sky fill's colour
+			for (int c = 0; c < 3; c++) {
+				MemoryUtil.memPutFloat(fb + 288 + c * 4L, useSun ? OwnLight.shade[c] : 0.84f + 0.08f * c);
+				MemoryUtil.memPutFloat(fb + 304 + c * 4L, useSun ? OwnLight.ambient[c] : 0.84f + 0.08f * c);
+			}
 			OwnNative.shadeFrame(own, k, fb, FRAME_BYTES, 0f, 0f);
 		}
 		frameActive = true;

@@ -2229,3 +2229,71 @@ int mcs_shadow_pass(Own *w, Enc *enc, int k, int slice, const void *frame, int f
 	}
 	return result;
 }
+
+// ---- shaders: the colour response pass (-Dmcopt.shaders; OwnPost) ----
+// One full-screen triangle into the open render encoder (the world's, still open before the GUI: the same attachments), reading the pixel
+// being replaced through programmable blending ([[color(0)]]): no copy, no split, no load or store beyond what the pass costs anyway.
+// target: the main colour texture, which must be the open encoder's only colour attachment. params: a PostFrame (terrain.metal).
+// 1 drawn, 0 nothing to do (no encoder open on the target), -1 err set.
+static struct {
+	id<MTLRenderPipelineState> pso[4];
+	MTLPixelFormat color[4], depth[4];
+	int n;
+	id<MTLDepthStencilState> always;
+} post;
+
+int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int length, char *err, int errCap) {
+	id<MTLRenderCommandEncoder> r = enc->render;
+	if (!r || enc->colorCount != 1 || !enc->colors[0] || enc->colors[0] != target || length > 256) return 0;
+	MTLPixelFormat cf = enc->colors[0].pixelFormat, df = enc->depth ? enc->depth.pixelFormat : MTLPixelFormatInvalid;
+	id<MTLRenderPipelineState> pso = nil;
+	for (int i = 0; i < post.n; i++)
+		if (post.color[i] == cf && post.depth[i] == df) pso = post.pso[i];
+	@autoreleasepool {
+		if (!pso) {
+			id<MTLFunction> vs = [[w->library newFunctionWithName:@"post_vs"] autorelease];
+			id<MTLFunction> fs = [[w->library newFunctionWithName:@"post_fs"] autorelease];
+			if (!vs || !fs) {
+				if (err && errCap > 0) snprintf(err, errCap, "post_vs / post_fs missing from the library");
+				return -1;
+			}
+			MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor new] autorelease];
+			pd.label = @"shade post";
+			pd.vertexFunction = vs;
+			pd.fragmentFunction = fs;
+			pd.colorAttachments[0].pixelFormat = cf;
+			pd.depthAttachmentPixelFormat = df;
+			pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+			NSError *e = nil;
+			pso = [w->ctx->device newRenderPipelineStateWithDescriptor:pd error:&e];
+			if (!pso) {
+				ownErr(e, "shade post pipeline", err, errCap);
+				return -1;
+			}
+			if (post.n < 4) {
+				post.color[post.n] = cf;
+				post.depth[post.n] = df;
+				post.pso[post.n++] = pso;
+			}
+		}
+		if (!post.always) {
+			MTLDepthStencilDescriptor *dd = [[MTLDepthStencilDescriptor new] autorelease];
+			dd.depthCompareFunction = MTLCompareFunctionAlways;
+			dd.depthWriteEnabled = NO;
+			post.always = [w->ctx->device newDepthStencilStateWithDescriptor:dd];
+		}
+		[r pushDebugGroup:@"shade post"];
+		[r setRenderPipelineState:pso];
+		[r setDepthStencilState:post.always];
+		[r setCullMode:MTLCullModeNone];
+		[r setTriangleFillMode:MTLTriangleFillModeFill];
+		[r setDepthBias:0 slopeScale:0 clamp:0];
+		[r setViewport:(MTLViewport) {0, 0, (double) enc->width, (double) enc->height, 0, 1}];
+		[r setScissorRect:(MTLScissorRect) {0, 0, (NSUInteger) enc->width, (NSUInteger) enc->height}];
+		[r setFragmentBytes:params length:(NSUInteger) length atIndex:0];
+		[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		[r popDebugGroup];
+		w->lastPso = nil;
+	}
+	return 1;
+}

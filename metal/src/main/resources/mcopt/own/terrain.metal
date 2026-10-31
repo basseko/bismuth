@@ -1562,6 +1562,8 @@ struct ShadeFrame {
 	float4 sunDir;        // xyz unit vector to the light that casts shadows, w its strength 0..1 (0: no shadows this frame)
 	float4 sunColor;      // rgb direct light colour x amplitude, w cascade count
 	float4 amb;           // x ambient attenuation at full sun and sky light, y filter radius (blocks), z hemisphere ambient strength (0: the vanilla face shade stays), w sky fill
+	float4 shade;         // rgb: the tint of surfaces the sun does not reach (the sky's colour, normalised), w unused
+	float4 fillc;         // rgb: the colour of the sky fill light, w unused
 };
 #endif
 
@@ -2363,9 +2365,9 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 		if (foliage) hemi = mix(hemi, 1.0, 0.45);
 		color.rgb *= mix(1.0, hemi / vs, S * sf.amb.z);
 		// ambient (the vanilla lightmap, partly replaced by the sun, cooler where the sun does not reach) + sun x shadow + a sky fill
-		const float3 cool = float3(0.84, 0.92, 1.0);
+		const float3 cool = sf.shade.rgb;
 		float fill = sf.amb.w * S * (0.5 + 0.5 * n.y);
-		color.rgb *= lm.rgb * mix(float3(1.0), cool, S * (1.0 - dir * lit) * 0.7) * (1.0 - sf.amb.x * S) + sf.sunColor.rgb * (dir * lit) + fill * cool;
+		color.rgb *= lm.rgb * mix(float3(1.0), cool, S * (1.0 - dir * lit) * 0.7) * (1.0 - sf.amb.x * S) + sf.sunColor.rgb * (dir * lit) + fill * sf.fillc.rgb;
 	}
 #endif
 	// F_LEAN: the chunk visibility is 1 (mix(x, y, 1) is y), the render-distance fog value 0 (max(e, 0) is e for e >= 0)
@@ -3625,5 +3627,43 @@ kernel void shade_cull(constant ShadowCull &f [[buffer(0)]], device const Sectio
 	}
 	cullAppend(&args[0 * 5 + 1], lists, f.listCap, want && layer == 0, r);
 	cullAppend(&args[1 * 5 + 1], lists + f.listCap, f.listCap, want && layer == 1, r);
+}
+#endif
+
+#ifdef OWN_SHADE
+// ---- colour response (-Dmcopt.shaders; OwnPost, mcown.m mcs_post): exposure, tone curve, colour balance and grading of the finished 3D picture ----
+// One full-screen triangle drawn into the open world encoder before the GUI. The pixel it replaces is read through programmable blending
+// ([[color(0)]]), so the pass costs ALU only: no copy, no pass split. The main target is plain RGBA8, so this works on display values:
+// decode (gamma 2), expose and balance in linear light, tone curve, encode, then lift / saturation / contrast in display space.
+struct PostFrame {
+	float4 gk;      // rgb exposure x colour balance in linear light, w tone curve strength (0 identity .. 1 full)
+	float4 la;      // rgb shadow lift as a scale (1 - lift): g' = g * la + lb, w dither amplitude in 8-bit steps
+	float4 lb;      // rgb shadow lift (display space), w 1: the pass without its maths (a measurement)
+	float4 m0, m1, m2;  // saturation and contrast as one matrix on the display colour (rows, bias in w)
+};
+
+struct PostV {
+	float4 pos [[position]];
+};
+
+vertex PostV post_vs(uint vid [[vertex_id]]) {
+	PostV o;
+	o.pos = float4(float((vid << 1) & 2) * 2.0 - 1.0, float(vid & 2) * 2.0 - 1.0, 0.0, 1.0);
+	return o;
+}
+
+// The tone curve is Narkowicz's fit of the ACES filmic curve (public; 2015). Half precision: the target is 8 bits.
+fragment half4 post_fs(PostV in [[stage_in]], half4 dst [[color(0)]], constant PostFrame &f [[buffer(0)]]) {
+	if (f.lb.w > 0.5) return dst;  // (probe shaders.postnop: the pass without its maths, to measure the pass's own cost)
+	// display -> linear with gamma 2 (a multiply instead of a pow), expose and balance, tone curve, back with a square root
+	half3 lin = dst.rgb * dst.rgb * half3(f.gk.rgb);
+	half3 mapped = (lin * (2.51h * lin + 0.03h)) / (lin * (2.43h * lin + 0.59h) + 0.14h);
+	half3 g = sqrt(mix(min(lin, 1.0h), saturate(mapped), half(f.gk.w)));
+	g = g * half3(f.la.rgb) + half3(f.lb.rgb);
+	half3 o = half3(dot(half3(f.m0.xyz), g) + half(f.m0.w), dot(half3(f.m1.xyz), g) + half(f.m1.w), dot(half3(f.m2.xyz), g) + half(f.m2.w));
+	// one interleaved-gradient noise as a dither, so the stretched dark steps do not band
+	float n = fract(52.9829189 * fract(dot(in.pos.xy, float2(0.06711056, 0.00583715)))) - 0.5;
+	o += half(n * (f.la.w * (1.0 / 255.0)));
+	return half4(saturate(o), dst.a);
 }
 #endif

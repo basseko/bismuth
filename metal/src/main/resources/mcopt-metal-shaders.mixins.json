@@ -1,0 +1,8 @@
+{
+	"required": true,
+	"package": "mcopt.metal.mixin.shaders",
+	"plugin": "mcopt.metal.mixin.shaders.ShadeMixinPlugin",
+	"compatibilityLevel": "JAVA_25",
+	"client": ["ShadePostMixin", "ShadeLightmapMixin", "ShadeSkyMixin"],
+	"injectors": { "defaultRequire": 1 }
+}
