@@ -130,6 +130,22 @@ typedef struct {
 	id<MTLBuffer> a1sGBufs[4];
 } Own;
 
+// ---- shaders (-Dmcopt.shaders; OwnShade): the sun shadow map and the per-frame block the shaded terrain variant reads ----
+// kind bit 8 (K_SHADE): the shaded variant (function constant 30); kind bit 9 (K_SHADOW): the shadow caster draw (depth only, standard Z,
+// no culling, slope-scaled bias). The shadow map is a Depth32Float 2D array, one texture per ring slot (written in the frame's pre command
+// buffer, sampled by the world encoder after it).
+#define SHADE_RING 4
+static struct {
+	id<MTLTexture> tex[SHADE_RING];
+	int res, layers, ring;
+	id<MTLTexture> cur;               // this frame's shadow map (bound at fragment texture 24 by shaded draws)
+	uint8_t frame[512];               // this frame's ShadeFrame block (fragment buffer 30)
+	int frameLen;
+	id<MTLComputePipelineState> cull; // shade_cull
+	id<MTLDepthStencilState> depthLess;
+	float biasC, biasS;               // the shadow draws' depth bias (constant units, slope scale)
+} sh;
+
 static void ownErr(NSError *e, const char *what, char *err, int cap) {
 	if (err && cap > 0) snprintf(err, cap, "%s: %s", what, e ? e.description.UTF8String : "unknown error");
 }
@@ -505,7 +521,8 @@ static id<MTLFunction> ownStage(Own *w, int kind, int vertex, char *err, int err
 		tight = (kind >> 25) & 1, posonly = (kind >> 26) & 1, occA = (kind >> 27) & 1, occB = (kind >> 28) & 1, oracle = (kind >> 30) & 1,
 		fogvert = (kind >> 14) & 1, fogvertAll = (kind >> 15) & 1, fogvertT = (kind >> 13) & 1,  // (bits 14, 15, 13: F_FOGVERT, F_FOGVERT_ALL, F_FOGVERT_T)
 		qflat = (kind >> 12) & 1,  // (bit 12, a1Exact: F_QFLAT, the vertex stage reads its unit and quad from the per-quad table)
-		group = vertex == 1 && ((kind >> 11) & 1);  // (bit 11, -Dmcopt.own.frag.vGroup: F_GROUP, instances of several units)
+		group = vertex == 1 && ((kind >> 11) & 1),  // (bit 11, -Dmcopt.own.frag.vGroup: F_GROUP, instances of several units)
+		shade = (kind >> 8) & 1;  // (bit 8, -Dmcopt.shaders: F_SHADE, constant 30)
 	NSString *name = vertex == 2 ? ((kind >> 29) & 1 ? @"own_mesh_q" : (kind >> 23) & 1 ? @"own_mesh4" : @"own_mesh") : vertex ? @"own_vs" : oracle ? @"own_fs_oracle"
 		: frag == 10 ? @"own_fs_nofog"
 		: frag == 9 ? @"own_fs_nofade"
@@ -514,7 +531,7 @@ static id<MTLFunction> ownStage(Own *w, int kind, int vertex, char *err, int err
 		: frag == 6 ? @"own_fs_alpha"
 		: frag == 2 ? @"own_fs_flat" : @"own_fs";
 	NSString *key = [NSString stringWithFormat:@"%@ %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d%@", name, vertex ? vsMode | translucent << 2 | quads << 3 : frag, half, lean, nonidx,
-		rev, tight, posonly, occA, occB, (kind >> 29) & 1, oracle, fogvert, fogvertAll, fogvertT, qflat, group ? @" g" : @""];
+		rev, tight, posonly, occA, occB, (kind >> 29) & 1, oracle, fogvert, fogvertAll, fogvertT, qflat, group ? (shade ? @" g s" : @" g") : shade ? @" s" : @""];
 	id<MTLFunction> fn = w->functions[key];
 	if (fn) return fn;
 	MTLFunctionConstantValues *cv = [[MTLFunctionConstantValues new] autorelease];
@@ -533,6 +550,7 @@ static id<MTLFunction> ownStage(Own *w, int kind, int vertex, char *err, int err
 	[cv setConstantValue:&qflat type:MTLDataTypeBool atIndex:21];
 	[cv setConstantValue:&fogvertT type:MTLDataTypeBool atIndex:20];
 	if (group) [cv setConstantValue:&group type:MTLDataTypeBool atIndex:25];
+	if (shade) [cv setConstantValue:&shade type:MTLDataTypeBool atIndex:30];
 	if (vertex) {
 		bool cmp = w->compact != 0, fatv = w->fat != 0, clipv = w->cpuClip != 0, tr = translucent != 0;
 		[cv setConstantValue:&cmp type:MTLDataTypeBool atIndex:1];
@@ -588,11 +606,13 @@ static id<MTLRenderPipelineState> ownPipeline(Own *w, Enc *enc, int cutout, char
 		pd.fragmentFunction = frag == 6 ? w->fsAlpha : frag == 5 ? w->fsCutoutLevel : frag == 4 ? w->fsSolidLevel : frag == 3 ? w->fsTranslucent : frag == 2 ? w->fsFlat
 			: frag ? w->fsCutout : w->fsSolid;
 		// (bit 12, a1Exact / a2Exact's table draw: its vertex stage must be the F_QFLAT variant; a plain one would read the table as a list)
-		if ((cutout & ((0x1f << 18) | (0x3f << 25) | (7 << 13) | (1 << 12) | (1 << 11))) || frag >= 8) {  // (kinds 8-10: own_fs_tex / _nofade / _nofog, made only as variants)
+		if ((cutout & ((0x1f << 18) | (0x3f << 25) | (7 << 13) | (1 << 12) | (1 << 11) | (3 << 8))) || frag >= 8) {  // (kinds 8-10: own_fs_tex / _nofade / _nofog, made only as variants)
 			// frag variants: both stages specialized alike (the vertex outputs and fragment inputs must match)
 			pd.vertexFunction = ownStage(w, cutout, 1, err, errCap);
-			pd.fragmentFunction = ownStage(w, cutout, 0, err, errCap);
-			if (!pd.vertexFunction || !pd.fragmentFunction) return nil;
+			// (K_SHADOW: the solid caster has no fragment stage at all, the cutout one is own_fs_alpha's alpha test)
+			if ((cutout & (1 << 9)) && frag != 6) pd.fragmentFunction = nil;
+			else pd.fragmentFunction = ownStage(w, cutout, 0, err, errCap);
+			if (!pd.vertexFunction || (!pd.fragmentFunction && !(cutout & (1 << 9)))) return nil;
 		}
 		MTLMeshRenderPipelineDescriptor *md = nil;
 		if (cutout & (1 << 21)) {
@@ -733,6 +753,7 @@ int mco_draw(Own *w, Enc *enc, int cutout, const void *frame, int frameLength, i
 			}
 		}
 	}
+	int shadow = (cutout & (1 << 9)) != 0;
 	id<MTLRenderPipelineState> pso = ownPipeline(w, enc, cutout, err, errCap);
 	if (!pso && vgArgs && vgGrp[0]) {
 		// (no grouped pipeline: the list's plain class draw)
@@ -767,11 +788,12 @@ int mco_draw(Own *w, Enc *enc, int cutout, const void *frame, int frameLength, i
 	}
 	w->lastPso = pso;
 	[r setRenderPipelineState:pso];
-	[r setDepthStencilState:equal ? w->depthEqual : greater ? w->depthGreater : w->depth];
-	[r setCullMode:MTLCullModeBack];
+	[r setDepthStencilState:shadow ? sh.depthLess : equal ? w->depthEqual : greater ? w->depthGreater : w->depth];
+	[r setCullMode:shadow ? MTLCullModeNone : MTLCullModeBack];
 	[r setFrontFacingWinding:MTLWindingClockwise];
 	[r setTriangleFillMode:MTLTriangleFillModeFill];
-	[r setDepthBias:bias ? 1.0f : 0 slopeScale:0 clamp:0];
+	if (shadow) [r setDepthBias:sh.biasC slopeScale:sh.biasS clamp:0];
+	else [r setDepthBias:bias ? 1.0f : 0 slopeScale:0 clamp:0];
 	if (mesh) {
 		[r setMeshBytes:frame length:frameLength atIndex:20];
 		[r setMeshBuffer:arena offset:0 atIndex:16];
@@ -807,6 +829,13 @@ int mco_draw(Own *w, Enc *enc, int cutout, const void *frame, int frameLength, i
 	[r setFragmentTexture:atlas atIndex:16];
 	[r setFragmentSamplerState:atlasSampler atIndex:14];
 drawCall:
+	if (cutout & (1 << 8)) {
+		// the shaded variant: the frame block, this frame's shadow map, and the lightmap (the fragment stage applies it)
+		[r setFragmentBytes:sh.frame length:(NSUInteger) sh.frameLen atIndex:30];
+		[r setFragmentTexture:sh.cur atIndex:24];
+		[r setFragmentTexture:light atIndex:17];
+		[r setFragmentSamplerState:lightSampler atIndex:15];
+	}
 	if (w->vcount && !mesh) [r setVertexBuffer:w->vcount offset:0 atIndex:28];
 	if (cutout & (1 << 30)) {
 		// the visibility oracle: the drawn units (vertex stage) and the units with a visible pixel (fragment stage), this sample's number
@@ -2083,4 +2112,120 @@ int mco_tl_a1split_req(Own *w, id<MTLBuffer> out, int list, int num, int den) {
 // tl.a1Split halves drawn grouped, class draws drawn ungrouped while requested (totals since start)
 void mco_vgroup_stats(Own *w, uint64_t *out) {
 	for (int i = 0; i < 6; i++) out[i] = w->vgStat[i];
+}
+
+// ---- shaders (-Dmcopt.shaders; mcopt.metal.own.OwnShade): the shadow map, its cull and its draws ----
+
+// The shadow map ring: ring depth textures, each a res x res Depth32Float array of layers cascades. 1 made (or already there), 0 failed.
+int mcs_init(Own *w, int res, int layers, int ring) {
+	if (ring > SHADE_RING) ring = SHADE_RING;
+	if (sh.tex[0] && sh.res == res && sh.layers == layers && sh.ring == ring) return 1;
+	@autoreleasepool {
+		for (int i = 0; i < SHADE_RING; i++) {
+			[sh.tex[i] release];
+			sh.tex[i] = nil;
+		}
+		sh.cur = nil;
+		for (int i = 0; i < ring; i++) {
+			MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:(NSUInteger) res height:(NSUInteger) res
+				mipmapped:NO];
+			d.textureType = MTLTextureType2DArray;
+			d.arrayLength = (NSUInteger) layers;
+			d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+			d.storageMode = MTLStorageModePrivate;
+			sh.tex[i] = [w->ctx->device newTextureWithDescriptor:d];
+			if (!sh.tex[i]) return 0;
+			sh.tex[i].label = [NSString stringWithFormat:@"shade shadow map %d", i];
+		}
+		sh.res = res;
+		sh.layers = layers;
+		sh.ring = ring;
+		if (!sh.depthLess) {
+			MTLDepthStencilDescriptor *dd = [[MTLDepthStencilDescriptor new] autorelease];
+			dd.depthCompareFunction = MTLCompareFunctionLess;
+			dd.depthWriteEnabled = YES;
+			sh.depthLess = [w->ctx->device newDepthStencilStateWithDescriptor:dd];
+		}
+	}
+	return 1;
+}
+
+// This frame's block (fragment buffer 30 of shaded draws) and shadow map (ring slot k); the shadow draws' depth bias.
+void mcs_frame(Own *w, int k, const void *bytes, int length, float biasC, float biasS) {
+	if (length > (int) sizeof sh.frame) length = (int) sizeof sh.frame;
+	memcpy(sh.frame, bytes, (size_t) length);
+	sh.frameLen = length;
+	sh.cur = sh.tex[k % (sh.ring ? sh.ring : 1)];
+	sh.biasC = biasC;
+	sh.biasS = biasS;
+}
+
+// The light-space cull of one cascade (terrain.metal shade_cull) in the pre command buffer: own_reset, the cull over `recCap` records,
+// own_finish. cullFrame: a CullFrame (run, listCap are read); cull: a ShadowCull. 1 encoded, 0 not (pipeline missing).
+int mcs_shadow_cull(Own *w, Enc *enc, const void *cullFrame, int cullLength, const void *cull, int cullBytes, id<MTLBuffer> sections, id<MTLBuffer> recs,
+	id<MTLBuffer> args, id<MTLBuffer> lists, int recCap) {
+	id<MTLComputePipelineState> pso = ownLazyKernel(w, &sh.cull, "shade_cull");
+	if (!pso) return 0;
+	mc_pre_end_encoders(enc);
+	@autoreleasepool {
+		id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];
+		c.label = @"shade shadow cull";
+		[c setBytes:cullFrame length:(NSUInteger) cullLength atIndex:0];
+		[c setBuffer:sections offset:0 atIndex:1];
+		[c setBuffer:recs offset:0 atIndex:2];
+		[c setBuffer:args offset:0 atIndex:3];
+		[c setBuffer:lists offset:0 atIndex:4];
+		[c setComputePipelineState:w->reset];
+		[c dispatchThreads:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(4, 1, 1)];
+		[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
+		[c setBytes:cull length:(NSUInteger) cullBytes atIndex:0];
+		[c setComputePipelineState:pso];
+		[c dispatchThreads:MTLSizeMake((NSUInteger) recCap, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+		[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
+		[c setBytes:cullFrame length:(NSUInteger) cullLength atIndex:0];
+		[c setComputePipelineState:w->finish];
+		[c dispatchThreads:MTLSizeMake(2, 1, 1) threadsPerThreadgroup:MTLSizeMake(2, 1, 1)];
+		[c endEncoding];
+	}
+	return 1;
+}
+
+// One cascade's depth-only render in the pre command buffer: slice of ring slot k, the solid list then the cutout list (mco_draw with
+// K_SHADOW kinds). frame: a DrawFrame whose listBase this sets per list; u: the uniforms as mco_draw takes them (u[0..1] the cascade's
+// Projection, u[4..5] its Terrain). 1 drawn, 0 nothing to do, -1 err set.
+int mcs_shadow_pass(Own *w, Enc *enc, int k, int slice, const void *frame, int frameLength, id<MTLBuffer> arena, id<MTLBuffer> sections, id<MTLBuffer> recs,
+	id<MTLBuffer> lists, id<MTLBuffer> args, int listCap, const int64_t *u, id<MTLTexture> atlas, id<MTLSamplerState> atlasSampler, id<MTLTexture> light,
+	id<MTLSamplerState> lightSampler, char *err, int errCap) {
+	id<MTLTexture> tex = sh.tex[k % (sh.ring ? sh.ring : 1)];
+	if (!tex || frameLength > 256) return 0;
+	int result = 1;
+	mc_pre_end_encoders(enc);
+	@autoreleasepool {
+		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+		rp.depthAttachment.texture = tex;
+		rp.depthAttachment.slice = (NSUInteger) slice;
+		rp.depthAttachment.loadAction = MTLLoadActionClear;
+		rp.depthAttachment.clearDepth = 1.0;
+		rp.depthAttachment.storeAction = MTLStoreActionStore;
+		id<MTLRenderCommandEncoder> r = [mc_pre(enc) renderCommandEncoderWithDescriptor:rp];
+		r.label = [NSString stringWithFormat:@"shade shadow c%d", slice];
+		[r setViewport:(MTLViewport) {0, 0, (double) sh.res, (double) sh.res, 0, 1}];
+		[r setDepthClipMode:MTLDepthClipModeClamp];
+		Enc fake;
+		memset(&fake, 0, sizeof fake);
+		fake.ctx = enc->ctx;
+		fake.render = r;
+		fake.depth = tex;
+		fake.colorCount = 0;
+		uint8_t d[256];
+		memcpy(d, frame, (size_t) frameLength);
+		static const int kinds[2] = {(1 << 26) | (1 << 9), 6 | (1 << 18) | (1 << 19) | (1 << 9)};  // solid: position only, no fragment stage; cutout: alpha test
+		for (int layer = 0; layer < 2 && result > 0; layer++) {
+			*(uint32_t *) d = (uint32_t) layer * (uint32_t) listCap;
+			int rc = mco_draw(w, &fake, kinds[layer], d, frameLength, arena, sections, recs, lists, args, layer * 20, u, atlas, atlasSampler, light, lightSampler, nil, err, errCap);
+			if (rc < 0) result = -1;
+		}
+		[r endEncoding];
+	}
+	return result;
 }

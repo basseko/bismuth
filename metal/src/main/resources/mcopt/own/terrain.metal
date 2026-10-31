@@ -1547,6 +1547,24 @@ static float linearFogV(float vertexDistance, float fogStart, float fogEnd) {
 constant bool F_ORACLE_SET [[function_constant(17)]];
 constant bool F_ORACLE = is_function_constant_defined(F_ORACLE_SET) && F_ORACLE_SET;
 
+#ifdef OWN_SHADE
+// ---- shaders (-Dmcopt.shaders=true): sun shadows + directional light on terrain (OwnShade, mcown.m "shade") ----
+// F_SHADE (kind bit 8): the shaded variant. The vertex stage then leaves the lightmap out of the colour (tint x AO only) and adds the
+// camera-relative position, the light coordinates and the unit's facing bucket; the fragment stage samples the lightmap itself, adds
+// the sun (N.L x shadow) and attenuates the ambient part by the sun's share.
+constant bool F_SHADE_SET [[function_constant(30)]];
+constant bool F_SHADE = is_function_constant_defined(F_SHADE_SET) && F_SHADE_SET;
+
+// the per-frame block at fragment buffer 30 (OwnShade.writeFrame mirrors this layout, 288 bytes)
+struct ShadeFrame {
+	float4x4 clip[3];     // camera-relative world -> cascade clip (orthographic, standard Z; y as drawn is the negative of what is sampled)
+	float4 info[3];       // x blocks per texel, y 1 / depth range (blocks), z uv margin where the next cascade takes over, w normal offset (blocks)
+	float4 sunDir;        // xyz unit vector to the light that casts shadows, w its strength 0..1 (0: no shadows this frame)
+	float4 sunColor;      // rgb direct light colour x amplitude, w cascade count
+	float4 amb;           // x ambient attenuation at full sun and sky light, y filter radius (blocks), z filter taps
+};
+#endif
+
 struct VOut {
 	float4 pos [[position]];
 	float sphericalVertexDistance [[function_constant(F_VARY)]];
@@ -1558,6 +1576,11 @@ struct VOut {
 	uint oracleUnit [[flat]] [[function_constant(F_ORACLE)]];
 	float fogF [[function_constant(F_FVT)]];
 	uint fogIn [[flat]] [[function_constant(F_FVT)]];
+#ifdef OWN_SHADE
+	float3 shPos [[function_constant(F_SHADE)]];
+	half2 shLight [[function_constant(F_SHADE)]];
+	uint shFace [[flat]] [[function_constant(F_SHADE)]];
+#endif
 };
 
 static void putColor(thread VOut &o, float4 c) {
@@ -1798,6 +1821,9 @@ vertex VOut own_vs(uint vid [[vertex_id]], uint iid [[instance_id]], constant Dr
 		return ov;
 	}
 	VOut ov = ownVertex(vi, origin, uploadMs, df, arenaRaw, proj, g, t, lightmap, lightSampler, rel);
+#ifdef OWN_SHADE
+	if (F_SHADE) ov.shFace = QUADS ? 6u : (meta >> 6) & 7u;
+#endif
 	if (F_FV) {
 		// (F_FV: the fog value itself per vertex, in the spherical distance's place; with F_FOGVERT_ALL in rich pipelines also the
 		// render-distance term's max, as the fragment stage would take it)
@@ -1880,6 +1906,13 @@ static VOut ownShade(Vtx v, int3 origin, int uploadMs, constant DrawFrame &df, c
 	}
 	o.sphericalVertexDistance = length(pos);
 	float2 luv = clamp(float2(int2(v.uv2)) / 256.0 + 0.5 / 16.0, float2(0.5 / 16.0), float2(15.5 / 16.0));
+#ifdef OWN_SHADE
+	if (F_SHADE) {
+		putColor(o, float4(v.color) / 255.0);
+		o.shPos = pos;
+		o.shLight = half2(luv);
+	} else
+#endif
 	putColor(o, VS_MODE == 1 ? float4(v.color) / 255.0 : float4(v.color) / 255.0 * lightmap.sample(lightSampler, luv, level(0.0)));
 	o.texCoord0 = float2(v.uv0);
 #ifdef OWN_TPROBE
@@ -2205,8 +2238,90 @@ static float linear_fog_value(float vertexDistance, float fogStart, float fogEnd
 constant bool CUTOUT [[function_constant(0)]];
 constant float CUTOUT_LIMIT [[function_constant(5)]];  // vanilla's ALPHA_CUTOUT: 0.5 cutout, 0.1 translucent
 
+#ifdef OWN_SHADE
+// ---- shaded variant (F_SHADE): normal, shadow lookup ----
+#ifndef OWN_SHADE_TAPS
+#define OWN_SHADE_TAPS 12
+#endif
+constexpr sampler shCmp(coord::normalized, filter::linear, address::clamp_to_edge, compare_func::less_equal);
+
+// interleaved gradient noise (Jimenez 2014): a per-pixel rotation for the filter disc
+static float shIgn(float2 p) {
+	return fract(52.9829189 * fract(dot(p, float2(0.06711056, 0.00583715))));
+}
+
+// the face normal: the unit's facing bucket for axis-aligned quads, else the screen-space derivative of the position oriented to the camera
+static float3 shNormal(uint face, float3 p, bool foliage) {
+	switch (face) {
+		case 0: return float3(1, 0, 0);
+		case 1: return float3(-1, 0, 0);
+		case 2: return float3(0, 1, 0);
+		case 3: return float3(0, -1, 0);
+		case 4: return float3(0, 0, 1);
+		case 5: return float3(0, 0, -1);
+		default: break;
+	}
+	float3 n = cross(dfdx(p), dfdy(p));
+	float l = length(n);
+	n = l > 1e-8 ? n / l : float3(0, 1, 0);
+	if (dot(n, p) > 0.0) n = -n;
+	if (foliage) n = normalize(n * 0.4 + float3(0, 0.8, 0));
+	return n;
+}
+
+// the lit fraction of cascade c at p (camera-relative), geometric normal n with n.l = ndl; edge: the distance to the cascade's border in uv
+static float shCascade(constant ShadeFrame &sf, depth2d_array<float> sm, uint c, float3 p, float3 n, float ndl, float rot, thread float &edge) {
+	float4 info = sf.info[c];
+	float slope = min(sqrt(max(1.0 - ndl * ndl, 0.0)) / max(ndl, 0.15), 4.0);
+	float4 q = sf.clip[c] * float4(p + n * (info.w * (1.0 + 0.35 * slope)), 1.0);
+	float2 uv = q.xy * 0.5 + 0.5;
+	float2 e = min(uv, 1.0 - uv);
+	edge = min(e.x, e.y);
+	float z = q.z - info.x * (1.25 + 0.75 * slope) * info.y;
+	float radius = max(sf.amb.y * info.z / info.x, 1.2 * info.z);
+	// a disc of TAPS Vogel points (each a hardware 2x2 compare), the first quarter spread over it: when those agree (fully lit or fully
+	// shadowed, nearly every pixel) the rest is skipped
+	const int TAPS = OWN_SHADE_TAPS, STEP = 3;
+	float lit = 0.0;
+	for (int i = 0; i < TAPS; i += STEP) {
+		float r = sqrt((float(i) + 0.5) / float(TAPS));
+		float a = float(i) * 2.399963 + rot * 6.2831853;
+		lit += sm.sample_compare(shCmp, uv + float2(cos(a), sin(a)) * (r * radius), c, z);
+	}
+	const float FIRST = float((TAPS + STEP - 1) / STEP);
+	if (lit < 0.001 || lit > FIRST - 0.001) return lit / FIRST;
+	for (int i = 0; i < TAPS; i++) {
+		if (i % STEP == 0) continue;
+		float r = sqrt((float(i) + 0.5) / float(TAPS));
+		float a = float(i) * 2.399963 + rot * 6.2831853;
+		lit += sm.sample_compare(shCmp, uv + float2(cos(a), sin(a)) * (r * radius), c, z);
+	}
+	return lit / float(TAPS);
+}
+
+static float shShadow(constant ShadeFrame &sf, depth2d_array<float> sm, float3 p, float3 n, float ndl, float2 pix) {
+	float rot = shIgn(pix);
+	uint count = uint(sf.sunColor.w);
+	float acc = 0.0, remaining = 1.0;
+	for (uint c = 0; c < count; c++) {
+		float edge;
+		float s = shCascade(sf, sm, c, p, n, ndl, rot, edge);
+		float t = saturate(edge / 0.08);
+		acc += remaining * t * s;
+		remaining *= 1.0 - t;
+		if (remaining < 0.002) break;
+	}
+	return acc + remaining;  // (outside every cascade: lit)
+}
+#endif
+
 fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]], constant Terrain &t [[buffer(23)]], constant Fog &fog [[buffer(24)]],
-	texture2d<float> atlas [[texture(16)]], sampler atlasSampler [[sampler(14)]]) {
+	texture2d<float> atlas [[texture(16)]], sampler atlasSampler [[sampler(14)]]
+#ifdef OWN_SHADE
+	, constant ShadeFrame &sf [[buffer(30), function_constant(F_SHADE)]], depth2d_array<float> shadowMap [[texture(24), function_constant(F_SHADE)]],
+	texture2d<float> shLightmap [[texture(17), function_constant(F_SHADE)]], sampler shLmSmp [[sampler(15), function_constant(F_SHADE)]]
+#endif
+	) {
 #ifdef OWN_TPROBE
 	// (probes 1 and 3: the translucent fragment stage returns a constant, blending kept; translucent = cutout at limit 0.1)
 	if ((OWN_TPROBE == 1 || OWN_TPROBE == 3) && CUTOUT && CUTOUT_LIMIT < 0.2) return float4(0.2, 0.3, 0.8, 0.5);
@@ -2219,6 +2334,18 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 	float2 pixelSize = 1.0f / float2(t.TextureSize);
 	float4 color = (g.UseRgss == 1 ? sampleRGSS(atlas, atlasSampler, in.texCoord0, pixelSize) : sampleNearest(atlas, atlasSampler, in.texCoord0, pixelSize))
 		* getColor(in);
+#ifdef OWN_SHADE
+	if (F_SHADE) {
+		float3 n = shNormal(in.shFace, in.shPos, CUTOUT && in.shFace == 6);
+		float4 lm = shLightmap.sample(shLmSmp, float2(in.shLight), level(0.0));
+		float sky = saturate((float(in.shLight.y) - 0.03125) / 0.9375);
+		float access = saturate((sky - 0.35) / 0.55);
+		float ndl = saturate(dot(n, sf.sunDir.xyz));
+		float dir = sf.sunDir.w * access * ndl;
+		float lit = dir > 0.002 ? shShadow(sf, shadowMap, in.shPos, n, ndl, in.pos.xy) : 1.0;
+		color.rgb *= lm.rgb * (1.0 - sf.amb.x * sf.sunDir.w * access) + sf.sunColor.rgb * (dir * lit);
+	}
+#endif
 	// F_LEAN: the chunk visibility is 1 (mix(x, y, 1) is y), the render-distance fog value 0 (max(e, 0) is e for e >= 0)
 	if (F_RICH) color = mix(fog.FogColor * float4(1, 1, 1, color.a), color, in.chunkVisibility);
 	if (CUTOUT && color.a < CUTOUT_LIMIT) discard_fragment();
@@ -3425,3 +3552,56 @@ kernel void own_tl_a1split(device const uint *args [[buffer(3)]], device uint *o
 	out[0] = a[0]; out[1] = k; out[2] = a[2]; out[3] = a[3]; out[4] = a[4];
 	out[5] = a[0]; out[6] = n - k; out[7] = a[2]; out[8] = a[3]; out[9] = a[4] + k;
 }
+
+#ifdef OWN_SHADE
+// ---- shadow pass: the light-space cull (-Dmcopt.shaders; OwnShade, mcown.m mcs_shadow_cull) ----
+// A thread per record: the unit's box against the cascade's volume (six planes, camera-relative world) and its facing bucket against
+// the light direction (only faces turned toward the light cast; non-axis-aligned units always). Solid and cutout only. The output is
+// own_cull_r's: lists[layer * listCap + n] of record indices, the draws' instance counts in args[layer * 5 + 1] (own_reset / own_finish).
+struct ShadowCull {
+	float4 planes[6];     // inside when dot(xyz, p) + w >= 0
+	int4 camBlock;
+	float4 camOffset;     // block position - camera position
+	float4 light;         // xyz unit vector to the light
+	uint sectionCount, listCap, recCap, pad;
+};
+
+kernel void shade_cull(constant ShadowCull &f [[buffer(0)]], device const Section *sections [[buffer(1)]], device const Rec *recs [[buffer(2)]],
+	device atomic_uint *args [[buffer(3)]], device uint *lists [[buffer(4)]], uint r [[thread_position_in_grid]]) {
+	bool want = false;
+	uint layer = 0;
+	if (r < f.recCap) {
+		Rec rec = recs[r];
+		uint slot = rec.slot;
+		layer = (rec.meta >> 9) & 3;
+		if (slot < f.sectionCount && layer <= 1) {
+			Section s = sections[slot];
+			if (s.recCount != 0 && r >= s.recStart && r < s.recStart + s.recCount) {
+				uint bucket = (rec.meta >> 6) & 7;
+				float3 nrm = float3(0);
+				switch (bucket) {
+					case 0: nrm = float3(1, 0, 0); break;
+					case 1: nrm = float3(-1, 0, 0); break;
+					case 2: nrm = float3(0, 1, 0); break;
+					case 3: nrm = float3(0, -1, 0); break;
+					case 4: nrm = float3(0, 0, 1); break;
+					case 5: nrm = float3(0, 0, -1); break;
+					default: break;
+				}
+				if (bucket >= 6 || dot(nrm, f.light.xyz) > 0.001) {
+					float3 o = float3(int3(s.x, s.y, s.z) - f.camBlock.xyz) + f.camOffset.xyz;
+					float3 lo = o + float3(int3(rec.lo & 255, (rec.lo >> 8) & 255, (rec.lo >> 16) & 255) - 16);
+					float3 hi = o + float3(int3(rec.hi & 255, (rec.hi >> 8) & 255, (rec.hi >> 16) & 255) - 16);
+					want = true;
+					for (int p = 0; p < 6; p++) {
+						float4 pl = f.planes[p];
+						if (dot(pl.xyz, select(lo, hi, pl.xyz > 0)) + pl.w < 0) want = false;
+					}
+				}
+			}
+		}
+	}
+	cullAppend(&args[0 * 5 + 1], lists, f.listCap, want && layer == 0, r);
+	cullAppend(&args[1 * 5 + 1], lists + f.listCap, f.listCap, want && layer == 1, r);
+}
+#endif

@@ -449,7 +449,7 @@ public final class OwnTerrain {
 		this.encoder = encoder;
 		this.ctx = MetalBridge.ctx(encoder);
 		this.enc = MetalBridge.enc(encoder);
-		this.own = OwnNative.create(this.ctx, (OwnPosTable.ON ? "#define OWN_EXACT_POS 1\n" : "") + (OwnQrec.ON ? "#define OWN_QREC 1\n" : "") + (VCOUNT ? "#define OWN_VCOUNT 1\n" : "") + (TFLAT ? "#define OWN_TFLAT 1\n" : "") + (TPROBE > 0 ? "#define OWN_TPROBE " + TPROBE + "\n" : "") + (OwnFrag.EXACT_SHIFT != 2 ? "#define A1_SH " + OwnFrag.EXACT_SHIFT + "\n" : "") + resource("/mcopt/own/terrain.metal"), COMPACT, FAT, CPU_CLIP);
+		this.own = OwnNative.create(this.ctx, (OwnShade.ON ? "#define OWN_SHADE 1\n#define OWN_SHADE_TAPS " + OwnShade.TAPS + "\n" : "") + (OwnPosTable.ON ? "#define OWN_EXACT_POS 1\n" : "") + (OwnQrec.ON ? "#define OWN_QREC 1\n" : "") + (VCOUNT ? "#define OWN_VCOUNT 1\n" : "") + (TFLAT ? "#define OWN_TFLAT 1\n" : "") + (TPROBE > 0 ? "#define OWN_TPROBE " + TPROBE + "\n" : "") + (OwnFrag.EXACT_SHIFT != 2 ? "#define A1_SH " + OwnFrag.EXACT_SHIFT + "\n" : "") + resource("/mcopt/own/terrain.metal"), COMPACT, FAT, CPU_CLIP);
 		// -Dmcopt.own.hizTile=true: the per-quad path's pyramid in one tiled pass for its first five levels (padded to 32 texels)
 		applyNativeFlags();
 		// -Dmcopt.own.gputime=true: GPU timestamps of our compute encoders (cull, list build, pyramid + test), logged per 500 frames
@@ -1209,6 +1209,43 @@ public final class OwnTerrain {
 
 	void later(Runnable r) {
 		this.deferred.addLast(new Object[] {this.frame, r});
+	}
+
+	// ---- shaders (OwnShade): what the shadow pass reads of this renderer ----
+	long shadeOwn() {
+		return this.own;
+	}
+
+	long shadeEnc() {
+		return this.enc;
+	}
+
+	long shadeCtx() {
+		return this.ctx;
+	}
+
+	long shadeSections(int k) {
+		return this.tables[k];
+	}
+
+	long shadeRecs() {
+		return this.recBuffer;
+	}
+
+	long shadeArena() {
+		return this.arenaBuffer;
+	}
+
+	int shadeSectionCount() {
+		return this.maxSlot + 1;
+	}
+
+	int shadeRecCapacity() {
+		return this.recAlloc.capacity();
+	}
+
+	int shadeListCap() {
+		return this.listCap;
 	}
 
 	private void publish(Publish p) {
@@ -2178,6 +2215,9 @@ public final class OwnTerrain {
 				clip.getToAddress(d + 16);
 			}
 			long arena = this.arenaBuffer;
+			// -Dmcopt.shaders: the shadow cascades (the pre command buffer) and the frame block; the draws below take the shaded variant
+			if (OwnShade.ON) OwnShade.frame(this, camera, u, d, MetalBridge.viewHandle(atlas), MetalBridge.samplerHandle(sampler), MetalBridge.viewHandle(light),
+				MetalBridge.samplerHandle(lightSampler), k, atlas.getWidth(0), atlas.getHeight(0), CPU_CLIP, FAT);
 			boolean draw = !mode.equals("skip") && !mode.equals("skipall"), fragSplit = false;
 			if (prefilter) {
 				this.drawPrefiltered(f, clip, d, arena, k, u, atlas, sampler, light, lightSampler, draw);

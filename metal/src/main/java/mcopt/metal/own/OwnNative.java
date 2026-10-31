@@ -8,6 +8,7 @@ import mcopt.metal.MetalBridge;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 
+import static java.lang.foreign.ValueLayout.JAVA_FLOAT;
 import static java.lang.foreign.ValueLayout.JAVA_INT;
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
 
@@ -59,7 +60,60 @@ final class OwnNative {
 	private static final MethodHandle FRAG_CULL = fn("mco_frag_cull", false, null, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_LONG,
 		JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT);
 
+	// shaders (-Dmcopt.shaders): mcown.m mcs_*
+	private static final MethodHandle SHADE_INIT = OwnShade.ON ? fn("mcs_init", false, JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT) : null;
+	private static final MethodHandle SHADE_FRAME = OwnShade.ON ? fn("mcs_frame", false, null, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_FLOAT, JAVA_FLOAT) : null;
+	private static final MethodHandle SHADE_CULL = OwnShade.ON ? fn("mcs_shadow_cull", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT,
+		JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT) : null;
+	private static final MethodHandle SHADE_PASS = OwnShade.ON ? fn("mcs_shadow_pass", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_INT,
+		JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT) : null;
+
 	private OwnNative() {
+	}
+
+	/** The shadow map ring (mcs_init). */
+	static boolean shadeInit(long own, int res, int layers, int ring) {
+		try {
+			return (int) SHADE_INIT.invokeExact(own, res, layers, ring) == 1;
+		} catch (Throwable t) {
+			throw rethrow(t);
+		}
+	}
+
+	/** This frame's ShadeFrame block and shadow map (ring slot k). */
+	static void shadeFrame(long own, int k, long bytes, int length, float biasC, float biasS) {
+		try {
+			SHADE_FRAME.invokeExact(own, k, bytes, length, biasC, biasS);
+		} catch (Throwable t) {
+			throw rethrow(t);
+		}
+	}
+
+	/** One cascade's light-space cull (mcs_shadow_cull). */
+	static boolean shadeCull(long own, long enc, long cullFrame, int cullLength, long cull, int cullBytes, long sections, long recs, long args, long lists, int recCap) {
+		try {
+			return (int) SHADE_CULL.invokeExact(own, enc, cullFrame, cullLength, cull, cullBytes, sections, recs, args, lists, recCap) == 1;
+		} catch (Throwable t) {
+			throw rethrow(t);
+		}
+	}
+
+	/** One cascade's depth render (mcs_shadow_pass); throws with the native error. */
+	static boolean shadePass(long own, long enc, int k, int slice, long frame, int frameLength, long arena, long sections, long recs, long lists, long args, int listCap,
+		long uniforms, long atlas, long atlasSampler, long light, long lightSampler) {
+		try (MemoryStack stack = MemoryStack.stackPush()) {
+			long err = stack.nmalloc(1, 2048);
+			MemoryUtil.memPutByte(err, (byte) 0);
+			int r;
+			try {
+				r = (int) SHADE_PASS.invokeExact(own, enc, k, slice, frame, frameLength, arena, sections, recs, lists, args, listCap, uniforms, atlas, atlasSampler, light,
+					lightSampler, err, 2048);
+			} catch (Throwable t) {
+				throw rethrow(t);
+			}
+			if (r < 0) throw new IllegalStateException(MemoryUtil.memUTF8(err));
+			return r > 0;
+		}
 	}
 
 	private static MethodHandle fn(String name, boolean critical, MemoryLayout result, MemoryLayout... args) {
@@ -595,6 +649,7 @@ final class OwnNative {
 	/** indices != 0: the per-quad path's GPU-built index list (u32 arena vertex indices). */
 	static int draw(long own, long enc, int kind, long frame, int frameLength, long arena, long sections, long recs, long lists, long args, long argsOffset,
 		long uniforms, long atlas, long atlasSampler, long light, long lightSampler, long indices) {
+		if (OwnShade.ON) kind = OwnShade.kind(kind);
 		try (MemoryStack stack = MemoryStack.stackPush()) {
 			long err = stack.nmalloc(1, 2048);
 			MemoryUtil.memPutByte(err, (byte) 0);
