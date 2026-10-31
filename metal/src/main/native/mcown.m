@@ -2321,6 +2321,18 @@ static struct {
 	int failed;
 } bl;
 
+// Volumetric light (-Dmcopt.shaders.volumetric; OwnVolume, terrain.metal vol_march): the kernel runs in the pre command buffer at a quarter of the screen over the
+// PREVIOUS frame's half-size scene copy (post_fs writes it whenever this or tile water wants it), the shadow map and block of the frame. out: RGBA16F in-scatter +
+// transmittance, dist: R16F the distance it marched (the composite's depth-aware upsample).
+static struct {
+	uint8_t frame[128];
+	int want, hist;                    // this frame's request (mcs_vol_frame), and whether `prev` is the previous frame's scene
+	id<MTLTexture> prev;               // the scene copy the previous frame's colour pass wrote
+	id<MTLTexture> out, dist;
+	NSUInteger w, h;
+	id<MTLComputePipelineState> pso;
+} vol;
+
 static void blFree(void) {
 	for (int i = 0; i < 2; i++) { [bl.src[i] release]; bl.src[i] = nil; }
 	for (int i = 0; i < 4; i++) { [bl.lv[i] release]; bl.lv[i] = nil; }
@@ -2417,6 +2429,47 @@ static void blChain(Own *w, Enc *enc, id<MTLTexture> prev, id<MTLTexture> glareR
 	[c endEncoding];
 }
 
+// This frame's volumetric request: a VolFrame (terrain.metal; length 0: none this frame), hist 1: the previous frame also asked (its scene copy is this frame's source).
+void mcs_vol_frame(Own *w, const void *bytes, int length, int hist) {
+	if (length <= 0 || length > (int) sizeof vol.frame) {
+		vol.want = 0;
+		return;
+	}
+	memcpy(vol.frame, bytes, (size_t) length);
+	vol.want = 1;
+	vol.hist = hist;
+}
+
+// The volumetric march over `src` (the previous frame's scene copy) into vol.out / vol.dist; 1 ran (the post pass binds the result).
+static int volMarch(Own *w, Enc *enc, id<MTLTexture> src) {
+	if (!src || !sh.cur || !sh.frameLen) return 0;
+	id<MTLComputePipelineState> pso = ownLazyKernel(w, &vol.pso, "vol_march");
+	if (!pso) return 0;
+	NSUInteger qw = ((NSUInteger) enc->width + 3) / 4, qh = ((NSUInteger) enc->height + 3) / 4;
+	if (!vol.out || vol.w != qw || vol.h != qh) {
+		[vol.out release];
+		[vol.dist release];
+		vol.out = blTex(w, MTLPixelFormatRGBA16Float, qw, qh, @"shade volumetric light");
+		vol.dist = blTex(w, MTLPixelFormatR16Float, qw, qh, @"shade volumetric distance");
+		vol.w = qw;
+		vol.h = qh;
+		if (!vol.out || !vol.dist) return 0;
+	}
+	mc_pre_end_encoders(enc);
+	id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];
+	c.label = @"shade volumetric";
+	[c setComputePipelineState:pso];
+	[c setTexture:src atIndex:0];
+	[c setTexture:sh.cur atIndex:1];
+	[c setTexture:vol.out atIndex:2];
+	[c setTexture:vol.dist atIndex:3];
+	[c setBytes:vol.frame length:128 atIndex:0];
+	[c setBytes:sh.frame length:(NSUInteger) sh.frameLen atIndex:1];
+	[c dispatchThreads:MTLSizeMake(qw, qh, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+	[c endEncoding];
+	return 1;
+}
+
 int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int length, char *err, int errCap) {
 	id<MTLRenderCommandEncoder> r = enc->render;
 	if (!r || enc->colorCount != 1 || !enc->colors[0] || enc->colors[0] != target || length > 256) return 0;
@@ -2425,11 +2478,13 @@ int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int le
 	memcpy(pbuf, params, (size_t) length);
 	int bloom = length >= 160 && pbuf[27] > 0.5f && blEnsure(w, enc);
 	if (length >= 160 && !bloom) pbuf[27] = 0.0f;  // (the shader must not touch textures that are not bound)
-	if (length < 192) length = 192;  // (PostFrame.ws is set here; .uw is the track water's)
+	if (length < 224) length = 224;  // (PostFrame.ws is set here; uw 176 the water track's, vol0 / vol1 192 the volumetric light's; zeros up to 223)
 	params = pbuf;
 	// tile water: the scene copy for the next frame's water (half size; a new size starts without one)
 	id<MTLTexture> sceneOut = nil;
-	if (wat.tileWant) {
+	int volWant = vol.want;
+	vol.want = 0;
+	if (wat.tileWant || volWant) {
 		NSUInteger tw = ((NSUInteger) enc->width + 1) / 2, th = ((NSUInteger) enc->height + 1) / 2;
 		if (!wat.tile[0] || wat.tile[0].width != tw || wat.tile[0].height != th) {
 			for (int i = 0; i < 2; i++) {
@@ -2442,6 +2497,21 @@ int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int le
 	}
 	pbuf[40] = sceneOut ? 1.0f : 0.0f;
 	if (sceneOut) [r setFragmentTexture:sceneOut atIndex:2];
+	if (volWant && sceneOut && vol.hist && vol.prev && vol.prev.width == sceneOut.width && vol.prev.height == sceneOut.height && volMarch(w, enc, vol.prev)) {
+		pbuf[48] = 1.0f;
+		pbuf[49] = 1.0f / (float) vol.w;
+		pbuf[50] = 1.0f / (float) vol.h;
+		pbuf[52] = 1.0f;
+		pbuf[53] = ((const float *) vol.frame)[15];  // (VolFrame.p0.w: the march's maximum distance)
+		pbuf[54] = ((const float *) vol.frame)[18];  // (VolFrame.p1.z: the strength over the sky)
+		[r setFragmentTexture:vol.out atIndex:3];
+		[r setFragmentTexture:vol.dist atIndex:4];
+	}
+	{
+		id<MTLTexture> np = volWant ? [sceneOut retain] : nil;  // (retained: the tile ring may be reallocated)
+		[vol.prev release];
+		vol.prev = np;
+	}
 	if (bloom) {
 		unsigned f = bl.frame++;
 		if (pbuf[35] < 0.5f) blChain(w, enc, bl.src[(f + 1) & 1], bl.gl[(f + 1) & 1], bl.gl[f & 1], pbuf[46], params, length);  // (pbuf[35]: probe shaders.bloom.chain off, a measurement)

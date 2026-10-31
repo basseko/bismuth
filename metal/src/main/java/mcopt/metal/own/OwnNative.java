@@ -80,6 +80,7 @@ final class OwnNative {
 	private static final MethodHandle WATER_TILE = OwnWater.ON ? fn("mcs_water_tile", false, null, JAVA_LONG, JAVA_INT, JAVA_INT) : null;
 	private static final MethodHandle WATER_TILE_SCENE = OwnWater.ON ? fn("mcs_water_tile_scene", false, JAVA_INT, JAVA_LONG) : null;
 
+	private static final MethodHandle VOL_FRAME = OwnVolume.ON ? fn("mcs_vol_frame", false, null, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT) : null;
 	private static final MethodHandle POST = OwnShade.ON ? fn("mcs_post", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT) : null;
 
 	private OwnNative() {
@@ -116,6 +117,15 @@ final class OwnNative {
 	static int waterSplit(long own, long enc, long target, int copy) {
 		try {
 			return (int) WATER_SPLIT.invokeExact(own, enc, target, copy);
+		} catch (Throwable t) {
+			throw rethrow(t);
+		}
+	}
+
+	/** This frame's volumetric light request (mcs_vol_frame): a VolFrame of length bytes (0: none), hist 1 when the previous frame asked too. */
+	static void volFrame(long own, long bytes, int length, int hist) {
+		try {
+			VOL_FRAME.invokeExact(own, bytes, length, hist);
 		} catch (Throwable t) {
 			throw rethrow(t);
 		}

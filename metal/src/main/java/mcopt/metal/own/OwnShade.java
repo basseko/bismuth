@@ -73,6 +73,9 @@ public final class OwnShade {
 
 	/** This frame draws the shaded terrain variant (set by {@link #frame}; read at the one choke point, OwnNative.draw). */
 	static boolean frameActive;
+	/** The shadow-casting light's strength this frame (0: none published; the sun's up to 1, the moon's up to 0.22) and whether it is the sun (OwnVolume). */
+	static float lightStrength;
+	static boolean lightIsSun;
 	private static boolean said;
 	/** The terrain renderer of the last frame (OwnPost needs its native handles). */
 	static OwnTerrain postOwner;
@@ -112,6 +115,7 @@ public final class OwnShade {
 	static void frame(OwnTerrain t, CameraRenderState camera, long u, long d, long atlas, long atlasSampler, long light, long lightSampler, int k, int atlasW, int atlasH,
 		boolean cpuClip, boolean fat) {
 		frameActive = false;
+		lightStrength = 0f;
 		if (OwnWater.ON) OwnWater.off();
 		if (EntityShade.ON) EntityShade.begin();  // (milestone 5: entities are re-lit only in the frames where the block below is published)
 		if (t.changedCount() > 0) geomDirty = true;
@@ -373,6 +377,8 @@ public final class OwnShade {
 			MemoryUtil.memPutFloat(fb + 244, (float) L.y);
 			MemoryUtil.memPutFloat(fb + 248, (float) L.z);
 			MemoryUtil.memPutFloat(fb + 252, sunOn ? strength : 0f);
+			lightStrength = sunOn ? strength : 0f;
+			lightIsSun = useSun;
 			MemoryUtil.memPutFloat(fb + 256, cr * amp);
 			MemoryUtil.memPutFloat(fb + 260, cg * amp);
 			MemoryUtil.memPutFloat(fb + 264, cb * amp);
