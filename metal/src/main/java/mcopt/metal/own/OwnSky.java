@@ -28,7 +28,7 @@ public final class OwnSky {
 	static final float HAZE_CLEAR = Float.parseFloat(System.getProperty("mcopt.shaders.haze", "700"));
 	static final float HAZE_RAIN = Float.parseFloat(System.getProperty("mcopt.shaders.hazeRain", "170"));
 	static final float HAZE_STRENGTH = Float.parseFloat(System.getProperty("mcopt.shaders.hazeStrength", "1.0"));
-	private static final int PARAM_BYTES = 256, LUT_BYTES = 32;
+	private static final int PARAM_BYTES = 512, LUT_BYTES = 32;
 
 	/** The dome drew this frame (the shaded terrain may read the table, vanilla's sun and sunrise fan are skipped). */
 	static boolean active;
@@ -130,6 +130,7 @@ public final class OwnSky {
 	private static float modelSin = -9f;
 	private static int version;
 	private static final int[] slotVersion = new int[4];
+	private static final boolean[] slotMs = new boolean[4];
 	private static final float[] hAcc = new float[3];
 	static float exposure = EXPOSURE, warm;
 	static final float[] warmTint = {1, 1, 1};
@@ -187,10 +188,14 @@ public final class OwnSky {
 			MemoryUtil.memPutFloat(lp + 4, (float) Math.sqrt(Math.max(0, 1 - sinEl * sinEl)));
 			MemoryUtil.memPutFloat(lp + 8, OwnAtmo.CAM_KM);
 			MemoryUtil.memPutFloat(lp + 12, OwnAtmo.SUN_I);
-			MemoryUtil.memPutFloat(lp + 16, OwnAtmo.MS);
+			boolean fog = OwnFog.ON && OwnProbe.bool("shaders.skyfog", true);
+			boolean ms = fog && OwnFog.ms();
+			MemoryUtil.memPutFloat(lp + 16, ms ? 1.0f : OwnAtmo.MS);
+			MemoryUtil.memPutFloat(lp + 20, ms ? 1.0f : 0.0f);
 			int k = ring++ & 3;
-			boolean compute = slotVersion[k] != version || !OwnProbe.bool("shaders.lutCache", true);
+			boolean compute = slotVersion[k] != version || slotMs[k] != ms || !OwnProbe.bool("shaders.lutCache", true);
 			slotVersion[k] = version;
+			slotMs[k] = ms;
 			if (!OwnNative.skyLut(own, enc, k, lp, LUT_BYTES, compute)) throw new IllegalStateException("sky_lut missing");
 			long p = stack.ncalloc(16, 1, PARAM_BYTES);
 			Matrix4f proj = cam.projectionMatrix, view = cam.viewRotationMatrix;
@@ -264,6 +269,12 @@ public final class OwnSky {
 				cloudPos[2] = cam.pos.z;
 			}
 			cloudPrev = clouds;
+			if (fog) {
+				// the new sky and fog (OwnFog; SkyFrame bytes 384..447; the sun disc's boost at sunrise and sunset 448)
+				OwnFog.update();
+				OwnFog.put(p + 384);
+				MemoryUtil.memPutFloat(p + 448, OwnFog.SUN_BOOST);
+			}
 			if (!OwnNative.skyDraw(own, enc, p, PARAM_BYTES)) return why("no open render encoder for the dome");
 		} catch (RuntimeException e) {
 			System.out.println("mcopt-shaders: sky disabled: " + e);

@@ -397,7 +397,12 @@ public final class OwnShade {
 			MemoryUtil.memPutFloat(fb + 348, OwnSky.rain);
 			for (int c = 0; c < 3; c++) MemoryUtil.memPutFloat(fb + 352 + c * 4L, OwnSky.warmTint[c]);
 			MemoryUtil.memPutFloat(fb + 364, OwnSky.warm);
-			// bytes 368 .. 431 belong to other tracks (zero here); 432 .. 511: the foliage track's block (terrain.metal ShadeFrame fol0 .. fol4)
+			// the sky model and fog (OwnFog): bytes 368..431
+			if (haze && OwnFog.active()) {
+				OwnFog.update();
+				OwnFog.put(fb + 368);
+			}
+			// 432 .. 511: the foliage track's block (terrain.metal ShadeFrame fol0 .. fol4)
 			int flags = (F_SSS && OwnProbe.bool("shaders.foliage.sss", true) ? 1 : 0) | (F_PCSS && OwnProbe.bool("shaders.pcss", true) ? 2 : 0)
 				| (F_CUT && OwnProbe.bool("shaders.foliage.cut", true) ? 4 : 0) | (F_AO ? 8 : 0) | (FAR_SKY ? 16 : 0) | (F_BIAS && OwnProbe.bool("shaders.bias", true) ? 32 : 0);
 			MemoryUtil.memPutFloat(fb + 432, flags);

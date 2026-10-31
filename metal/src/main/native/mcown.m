@@ -153,7 +153,8 @@ static struct {
 	int lw, lh;
 	id<MTLTexture> cur;               // this frame's table
 	id<MTLTexture> noise;             // the cloud noise (RGBA8, tileable, bound at the dome's fragment texture 1)
-	id<MTLComputePipelineState> lutPso;
+	id<MTLComputePipelineState> lutPso, msPso;
+	id<MTLTexture> ms;                // the multiple scattering table (32 x 32 RGBA16F, once; sky_lut's texture 1)
 	id<MTLRenderPipelineState> dome[4];
 	MTLPixelFormat color[4], depth[4];
 	int n;
@@ -2515,6 +2516,26 @@ int mcs_sky_lut(Own *w, Enc *enc, int k, const void *p, int length, int compute)
 	id<MTLComputePipelineState> pso = ownLazyKernel(w, &sk.lutPso, "sky_lut");
 	id<MTLTexture> t = sk.lut[k % SKY_RING];
 	if (!pso || !t || length > 64) return 0;
+	if (!sk.ms) {
+		// the multiple scattering table, computed once (it does not depend on the sun or the camera)
+		id<MTLComputePipelineState> mp = ownLazyKernel(w, &sk.msPso, "sky_ms");
+		if (!mp) return 0;
+		@autoreleasepool {
+			MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:32 height:32 mipmapped:NO];
+			d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+			d.storageMode = MTLStorageModePrivate;
+			sk.ms = [w->ctx->device newTextureWithDescriptor:d];
+			if (!sk.ms) return 0;
+			sk.ms.label = @"shade sky multiple scattering table";
+			mc_pre_end_encoders(enc);
+			id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];
+			c.label = @"shade sky ms table";
+			[c setComputePipelineState:mp];
+			[c setTexture:sk.ms atIndex:0];
+			[c dispatchThreads:MTLSizeMake(32, 32, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+			[c endEncoding];
+		}
+	}
 	if (!compute) {
 		sk.cur = t;  // (this slot already holds the table of the current sun)
 		return 1;
@@ -2526,6 +2547,7 @@ int mcs_sky_lut(Own *w, Enc *enc, int k, const void *p, int length, int compute)
 		[c setComputePipelineState:pso];
 		[c setBytes:p length:(NSUInteger) length atIndex:0];
 		[c setTexture:t atIndex:0];
+		[c setTexture:sk.ms atIndex:1];
 		[c dispatchThreads:MTLSizeMake((NSUInteger) sk.lw, (NSUInteger) sk.lh, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
 		[c endEncoding];
 	}
