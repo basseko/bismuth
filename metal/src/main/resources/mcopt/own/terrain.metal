@@ -3350,7 +3350,15 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 		float3 ex = wHdr * (1.0 - saturate(fogValue * fog.FogColor.a));
 		float3 sx = ex + quad_shuffle_xor(ex, 1);
 		sx += quad_shuffle_xor(sx, 2);
-		if (dot(sx, float3(1.0)) > 1e-4) wGlare.write(float4(sx * 0.25, 1.0), uint2(in.pos.xy) >> 1);
+		// (a fragment shader that writes a texture runs before the depth test rejects it: water hidden behind or under terrain would write its glare too, and
+		// the bloom lit it up on the grass in front. The pixel's distance code says what is already there: only water in front of it writes.)
+		float dPix = shDDecode(dstC.a);
+		bool front = dPix < 0.0 || dPix > length(in.shPos) - 0.75;
+		bool anyFront = quad_any(front);
+		float3 ex2 = front ? ex : float3(0.0);
+		sx = ex2 + quad_shuffle_xor(ex2, 1);
+		sx += quad_shuffle_xor(sx, 2);
+		if (anyFront && dot(sx, float3(1.0)) > 1e-4) wGlare.write(float4(sx * 0.25, 1.0), uint2(in.pos.xy) >> 1);
 	}
 	return shOut(float4(mix(color.rgb, fogRgb, fogValue * fog.FogColor.a), color.a), dstC, in.shPos, in.pos.xy);
 #else
