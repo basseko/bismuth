@@ -703,11 +703,11 @@ static id<MTLRenderPipelineState> ownPipeline(Own *w, Enc *enc, int cutout, char
 // (the opaque pass's colour and depth, stored by the split mcs_water_split) at fragment textures 27 and 28, the lightmap at 17 as in the shaded variant.
 // Without a scene (no split this frame) 1 x 1 dummies are bound and the block's flags say so.
 static struct {
-	uint8_t frame[384];
+	uint8_t frame[512];
 	int frameLen;
 	id<MTLTexture> scene, depth;        // this frame's scene (nil: none): the copies below, set by mcs_water_split, cleared by every mcs_water_frame without a scene
 	id<MTLTexture> copyCol, copyDepth;  // the split's copies of the pass's colour (RGBA8 / RGBA16F) and depth (R32Float), half or full size
-	id<MTLTexture> dummyCol, dummyDepth;
+	id<MTLTexture> dummyCol, dummyDepth, dummyGlare;
 	id<MTLComputePipelineState> copyPso;
 	// tile water: the colour pass's half-size scene copies (RGBA16F: colour, distance), written alternately; last: the one the previous frame wrote (nil: none)
 	id<MTLTexture> tile[2], tileLast;
@@ -718,12 +718,16 @@ static struct {
 extern int mc_tl_restart_ok(Enc *enc);
 
 // scene: the draw is a translucent one (the only kind that reads the scene); the opaque draws under water get the dummies
+static id<MTLTexture> blGlareTex(void);
 static void ownBindWater(id<MTLRenderCommandEncoder> r, id<MTLTexture> light, id<MTLSamplerState> lightSampler, bool scene) {
 	[r setFragmentBytes:wat.frame length:(NSUInteger) wat.frameLen atIndex:12];
 	[r setFragmentTexture:scene && wat.scene && (wat.depth || wat.tileOn) ? wat.scene : wat.dummyCol atIndex:27];
 	[r setFragmentTexture:scene && wat.scene && wat.depth ? wat.depth : wat.dummyDepth atIndex:28];
 	[r setFragmentTexture:light atIndex:17];
 	[r setFragmentSamplerState:lightSampler atIndex:15];
+	// the HDR side channel (track water): this frame's glare texture, written by the tile water fragments (fragment texture 26)
+	id<MTLTexture> gt = blGlareTex();
+	[r setFragmentTexture:gt ? gt : wat.dummyGlare atIndex:26];
 }
 
 // The frag occlusion's mesh-stage resources for a draw of kind (bit 27 phase A, 28 phase B; bit 0 the layer): terrain.metal FragOcc.
@@ -2301,7 +2305,7 @@ static struct {
 // Bloom and light shafts (milestone 6): textures and kernels. src[2] is the half-resolution source the post pass writes (a ring: the pass writes
 // one while the compute reads the other), lv[0..3] the chain 1/4 .. 1/32 of the screen (lv[0] is also what the post pass samples next frame).
 static struct {
-	id<MTLTexture> src[2], lv[4], ut[3];
+	id<MTLTexture> src[2], lv[4], ut[3], gl[2];  // gl: the water's HDR glare (half size RGBA16F, a ring like src), cleared each frame
 	NSUInteger w, h;
 	unsigned frame;
 	id<MTLComputePipelineState> down, up, clear;
@@ -2312,6 +2316,12 @@ static void blFree(void) {
 	for (int i = 0; i < 2; i++) { [bl.src[i] release]; bl.src[i] = nil; }
 	for (int i = 0; i < 4; i++) { [bl.lv[i] release]; bl.lv[i] = nil; }
 	for (int i = 0; i < 3; i++) { [bl.ut[i] release]; bl.ut[i] = nil; }
+	for (int i = 0; i < 2; i++) { [bl.gl[i] release]; bl.gl[i] = nil; }
+}
+
+// the glare texture this frame's water draws write (the post pass of this frame, which advances bl.frame, comes after them)
+static id<MTLTexture> blGlareTex(void) {
+	return bl.gl[0] ? bl.gl[bl.frame & 1] : nil;
 }
 
 static id<MTLTexture> blTex(Own *w, MTLPixelFormat pf, NSUInteger tw, NSUInteger th, NSString *label) {
@@ -2346,15 +2356,16 @@ static int blEnsure(Own *w, Enc *enc) {
 		bl.lv[i] = blTex(w, MTLPixelFormatRGBA16Float, lw, lh, [NSString stringWithFormat:@"shade bloom lv %d", i]);
 		if (i < 3) bl.ut[i] = blTex(w, MTLPixelFormatRGBA16Float, lw, lh, [NSString stringWithFormat:@"shade bloom up %d", i]);
 	}
-	for (int i = 0; i < 2; i++) if (!bl.src[i]) { blFree(); bl.failed = 1; return 0; }
+	for (int i = 0; i < 2; i++) bl.gl[i] = blTex(w, MTLPixelFormatRGBA16Float, sw, sh, [NSString stringWithFormat:@"shade bloom glare %d", i]);
+	for (int i = 0; i < 2; i++) if (!bl.src[i] || !bl.gl[i]) { blFree(); bl.failed = 1; return 0; }
 	for (int i = 0; i < 4; i++) if (!bl.lv[i]) { blFree(); bl.failed = 1; return 0; }
 	for (int i = 0; i < 3; i++) if (!bl.ut[i]) { blFree(); bl.failed = 1; return 0; }
 	mc_pre_end_encoders(enc);
 	id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];
 	c.label = @"shade bloom clear";
 	[c setComputePipelineState:bl.clear];
-	id<MTLTexture> all[9] = {bl.src[0], bl.src[1], bl.lv[0], bl.lv[1], bl.lv[2], bl.lv[3], bl.ut[0], bl.ut[1], bl.ut[2]};
-	for (int i = 0; i < 9; i++) {
+	id<MTLTexture> all[11] = {bl.src[0], bl.src[1], bl.lv[0], bl.lv[1], bl.lv[2], bl.lv[3], bl.ut[0], bl.ut[1], bl.ut[2], bl.gl[0], bl.gl[1]};
+	for (int i = 0; i < 11; i++) {
 		[c setTexture:all[i] atIndex:0];
 		[c dispatchThreads:MTLSizeMake(all[i].width, all[i].height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
 	}
@@ -2363,17 +2374,24 @@ static int blEnsure(Own *w, Enc *enc) {
 }
 
 // The chain over the previous frame's source (pre command buffer): down 1/4 .. 1/32, up in place, the shafts into the last level's alpha.
-static void blChain(Own *w, Enc *enc, id<MTLTexture> prev, const void *params, int length) {
+static void blChain(Own *w, Enc *enc, id<MTLTexture> prev, id<MTLTexture> glareRead, id<MTLTexture> glareClear, float glareGain, const void *params, int length) {
 	mc_pre_end_encoders(enc);
 	id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];
 	c.label = @"shade bloom";
 	id<MTLTexture> in = prev;
 	uint32_t one = 1, zero = 0;
+	// the glare texture this frame's water will write is cleared first (this runs in the pre buffer, before the world pass)
+	[c setComputePipelineState:bl.clear];
+	[c setTexture:glareClear atIndex:0];
+	[c dispatchThreads:MTLSizeMake(glareClear.width, glareClear.height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
 	[c setComputePipelineState:bl.down];
+	[c setTexture:glareRead atIndex:2];
 	for (int i = 0; i < 4; i++) {
 		[c setTexture:in atIndex:0];
 		[c setTexture:bl.lv[i] atIndex:1];
 		[c setBytes:(i == 0 ? &one : &zero) length:4 atIndex:1];
+		float gg = i == 0 ? glareGain : 0.0f;
+		[c setBytes:&gg length:4 atIndex:2];
 		[c dispatchThreads:MTLSizeMake(bl.lv[i].width, bl.lv[i].height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
 		in = bl.lv[i];
 	}
@@ -2398,7 +2416,7 @@ int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int le
 	memcpy(pbuf, params, (size_t) length);
 	int bloom = length >= 160 && pbuf[27] > 0.5f && blEnsure(w, enc);
 	if (length >= 160 && !bloom) pbuf[27] = 0.0f;  // (the shader must not touch textures that are not bound)
-	if (length < 176) length = 176;  // (PostFrame.ws, set here)
+	if (length < 192) length = 192;  // (PostFrame.ws is set here; .uw is the track water's)
 	params = pbuf;
 	// tile water: the scene copy for the next frame's water (half size; a new size starts without one)
 	id<MTLTexture> sceneOut = nil;
@@ -2417,7 +2435,7 @@ int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int le
 	if (sceneOut) [r setFragmentTexture:sceneOut atIndex:2];
 	if (bloom) {
 		unsigned f = bl.frame++;
-		if (pbuf[35] < 0.5f) blChain(w, enc, bl.src[(f + 1) & 1], params, length);  // (pbuf[35]: probe shaders.bloom.chain off, a measurement)
+		if (pbuf[35] < 0.5f) blChain(w, enc, bl.src[(f + 1) & 1], bl.gl[(f + 1) & 1], bl.gl[f & 1], pbuf[46], params, length);  // (pbuf[35]: probe shaders.bloom.chain off, a measurement)
 		[r setFragmentTexture:bl.ut[0] atIndex:0];
 		[r setFragmentTexture:bl.src[f & 1] atIndex:1];
 	}
@@ -2676,6 +2694,11 @@ void mcs_water_frame(Own *w, const void *bytes, int length) {
 			d.storageMode = MTLStorageModePrivate;
 			wat.dummyDepth = [w->ctx->device newTextureWithDescriptor:d];
 			wat.dummyDepth.label = @"shade water dummy depth";
+			d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:1 height:1 mipmapped:NO];
+			d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+			d.storageMode = MTLStorageModePrivate;
+			wat.dummyGlare = [w->ctx->device newTextureWithDescriptor:d];
+			wat.dummyGlare.label = @"shade water dummy glare";
 		}
 	}
 }

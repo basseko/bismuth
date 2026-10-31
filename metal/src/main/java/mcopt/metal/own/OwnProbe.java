@@ -61,7 +61,7 @@ public final class OwnProbe {
 					case "frag.splitNear" -> { if (OwnFrag.SPLIT_NEAR <= 0) throw new IllegalArgumentException("splitNear needs positive startup split/banks"); int n = Integer.parseInt(kv[1]); if (n < 1 || n > 4096) throw new IllegalArgumentException("splitNear 1..4096"); }
 					case "frag.pyrSkip" -> { int n = Integer.parseInt(kv[1]); if (n < 0 || n > 2) throw new IllegalArgumentException("pyrSkip 0..2"); }
 					case "frag.fine" -> { if (!java.util.Set.of("1", "2", "4").contains(kv[1])) throw new IllegalArgumentException("fine 1/2/4"); }
-					case "frag.testLate", "frag.msub", "frag.testFast", "frag.testGather", "hizTop", "hizGather", "frag.uocc", "frag.fogVert", "shaders", "shaders.render", "shaders.far", "shaders.sun", "shaders.grade", "shaders.sky", "shaders.clouds", "shaders.clouds.temporal", "shaders.haze", "shaders.lutCache", "shaders.water", "shaders.water.ssr", "shaders.water.split" -> {
+					case "frag.testLate", "frag.msub", "frag.testFast", "frag.testGather", "hizTop", "hizGather", "frag.uocc", "frag.fogVert", "shaders", "shaders.render", "shaders.far", "shaders.sun", "shaders.grade", "shaders.sky", "shaders.clouds", "shaders.clouds.temporal", "shaders.haze", "shaders.lutCache", "shaders.water", "shaders.water.ssr", "shaders.water.split", "shaders.water.glare", "shaders.water.refract", "shaders.water.shore", "shaders.water.uwscatter", "shaders.water.uwshafts" -> {
 						if (!kv[1].equals("true") && !kv[1].equals("false")) throw new IllegalArgumentException("boolean required");
 					}
 					default -> throw new IllegalArgumentException("not a warm-safe probe key: " + kv[0]);

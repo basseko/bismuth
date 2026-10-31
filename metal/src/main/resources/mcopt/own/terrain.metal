@@ -2455,7 +2455,12 @@ struct WaterFrame {
 	float4 flow;          // 288 water_flow's
 	float4 med;           // 304 rgb the underwater medium's absorption per block, w the scene copy's pixels per screen pixel (0.5 half size, 1 full)
 	float4 prevOff;       // 320 tile water: xyz this frame's camera minus the previous frame's (blocks; viewProj is then the previous frame's), w 0
+	// track water (bytes 336-447; the native copy buffer is 512)
+	float4 uw;            // 336 x the camera's depth below the water surface (blocks), y the glare's gain, z flag bits (WF_*), w refraction weight
+	float4 uw2;           // 352 x underwater in-scatter gain, y shore highlight gain, z glare roughness, w glare swell (the share of the ripples' tilt it keeps)
+	float4 uw3;           // 368 x multiple scattering octaves' weight, y sky light absorption scale, zw spare
 };
+constant uint WF_GLARE = 1u, WF_HDR = 2u, WF_REFRACT = 4u, WF_SHORE = 8u, WF_UWSCAT = 16u;
 
 constexpr sampler wLin(coord::normalized, filter::linear, address::clamp_to_edge);
 
@@ -2533,6 +2538,40 @@ static float3 skyRadiance(float3 dir, float3 horizon, constant WaterFrame &wf) {
 static float3 waterMedium(float3 c, float dist, constant WaterFrame &wf, constant Fog &fog) {
 	float3 T = exp(-wf.med.rgb * dist);
 	return c * (T * 1.25) + fog.FogColor.rgb * (1.0 - T);  // (the 1.25: the light that reaches down is brighter than the lightmap says)
+}
+
+// The underwater medium with light (WF_UWSCAT): the in-scattered sunlight along the ray, analytic, with the light attenuated by the depth below the surface
+// (the camera's depth wf.uw.x, the ray rising or sinking with dir.y), the phase 0.7 HG(0.5) + 0.3 isotropic and multiple-scattering octaves (each half the
+// weight, half the extinction), and the sky light that reaches down darkening and blueing the ambient fog colour with depth. Coefficients after the published
+// ones of Photon (fog/water_fog_vl.glsl: absorption ~(0.20, 0.08, 0.04), scattering 0.03; adapted from Photon Shaders (c) Benjamin Stott, Photon licence).
+static float3 waterMediumLit(float3 c, float dist, float3 dir, constant WaterFrame &wf, constant Fog &fog) {
+	const float3 sa = wf.med.rgb * (0.20 / 0.11);   // (the medium's absorption in this block is the track's tuning: scaled to Photon's order)
+	const float ss = 0.03;
+	float3 T = exp(-wf.med.rgb * dist);
+	float d0 = wf.uw.x;
+	float Ly = max(wf.sunDir.y, 0.25);
+	float3 mu = sa / Ly;                       // sun light's absorption per block of depth
+	// the ray stays under the surface: a rising ray ends where it leaves the water
+	float de = dir.y > 1e-3 ? min(dist, d0 / dir.y) : dist;
+	float cosT = dot(dir, wf.sunDir.xyz);
+	const float g = 0.5;
+	float hg = (1.0 - g * g) / (12.566371 * pow(1.0 + g * g - 2.0 * g * cosT, 1.5));
+	float phase = 0.7 * hg + 0.3 * 0.0795775;
+	float3 scat = float3(0.0);
+	float w = 1.0, e = 1.0;
+	for (int i = 0; i < 3; i++) {   // (octaves: half the weight and half the extinction each)
+		float3 k = wf.med.rgb * e;
+		float3 a = k - mu * e * dir.y;          // the exponent's slope along the ray: extinction minus the light's gain as the ray rises
+		a = max(a, float3(1e-3));
+		scat += w * exp(-mu * e * max(d0, 0.0)) * (1.0 - exp(-a * de)) / a;
+		w *= wf.uw3.x;
+		e *= 0.5;
+	}
+	float3 sun = wf.sunColor.rgb * (wf.sunDir.w * phase * ss * 1.9) * scat;
+	// the sky's light from above: less of it with depth, and only the blue is left
+	float3 Tsky = exp(-sa * wf.uw3.y * max(d0 - dir.y * dist * 0.5, 0.0) * 0.5);
+	float3 amb = fog.FogColor.rgb * mix(float3(1.0), Tsky, 0.8);
+	return c * (T * 1.25) + amb * (1.0 - T) + sun * wf.uw2.x;
 }
 
 // the camera-relative position of the scene point whose depth is z at the pixel (pix as the position builtin reports it: the centre of the pixel)
@@ -2662,12 +2701,31 @@ static float3 wSkyAt(float3 d, float3 horizon, constant WaterFrame &wf, constant
 	return skyRadiance(d, horizon, wf);
 }
 
+// The sun's reflection as a sphere light (WF_GLARE): GGX of the swell's normal with the roughness widened by the sun's angular radius and the peak brought
+// back by the energy ratio (Karis 2013, "Real shading in Unreal Engine 4", the sphere-light normalisation; the Horizon Zero Dawn NoH^2 form of Photon's
+// lighting/specular_lighting.glsl, adapted from Photon Shaders (c) Benjamin Stott, Photon licence), faded at grazing views and capped: the cap is above
+// white, which the colour pass cannot show but the HDR side channel carries into the bloom.
+static float wSunGlare(float3 Ns, float3 v, float3 L, float cv, constant WaterFrame &wf) {
+	const float sunRad = 0.0047;  // the sun's angular radius (rad)
+	float a = wf.uw2.z * wf.uw2.z;  // alpha = roughness^2
+	float aw = saturate(a + sunRad * 0.5);
+	float3 H = normalize(L - v);
+	float NH = saturate(dot(Ns, H)), NL = saturate(dot(Ns, L));
+	float d = NH * NH * (aw * aw - 1.0) + 1.0;
+	float D = aw * aw / (3.14159265 * d * d) * ((a / aw) * (a / aw));
+	float m = 1.0 - saturate(dot(-v, H));
+	float F = 0.02 + 0.98 * m * m * m * m * m;
+	float g = 1.0 / (4.0 * max(cv, 0.08));  // (the visibility term, Schlick-Smith folded: bounded)
+	return min(D * F * g * NL, 4.0) * smoothstep(0.0, 0.15, cv) * step(0.001, NL);
+}
+
 // The water surface: tint = the vertex colour (the biome's water colour, no light in it), lm the lightmap at the quad, access its sky exposure 0..1, gnRaw the
 // derivative normal of the position (taken by the caller in uniform control flow). rgb and the alpha the blend applies (1 with a scene to refract).
 // dstC: tile water's colour behind the pixel (alpha: its distance code), alpha < 0 for the split's scene copy instead.
 static float4 waterSurface(VOut in, float3 gnRaw, float3 tint, float3 lm, float access, constant WaterFrame &wf, constant Fog &fog,
 	texture2d<float> scene, texture2d<float, access::read> sdepth, constant ShadeFrame &sf, texture2d<float> lut, float4 dstC) {
 	const uint flags = uint(wf.misc.w);
+	const uint tf = uint(wf.uw.z);
 	float3 p = in.shPos;
 	float dist = max(length(p), 1e-3);
 	float3 v = p / dist;
@@ -2702,6 +2760,7 @@ static float4 waterSurface(VOut in, float3 gnRaw, float3 tint, float3 lm, float 
 	float S = wf.sunDir.w;
 	float3 col;
 	float alpha = 1.0;
+	float shore = 0.0;
 	if (below) {
 		// from under the surface: the sky through the window (refracted), total internal reflection of the scene beyond the critical angle
 		float3 rt = refract(v, Nf, 1.33);
@@ -2720,6 +2779,25 @@ static float4 waterSurface(VOut in, float3 gnRaw, float3 tint, float3 lm, float 
 			float3 T = exp(-wf.sigma.rgb * (dRay + 0.45));
 			trans = bed * T + scatter * (1.0 - T);
 			trans = mix(trans, float3(dot(trans, float3(0.3, 0.59, 0.11))), 0.18);
+			if ((tf & WF_REFRACT) != 0u && (flags & 1u) != 0u && dB >= 0.0) {
+				// refraction back: the previous frame's scene (colour of the finished picture, the bed's distance in alpha) at a point shifted by the wave normal
+				// times the depth of the water (the tangent normal x min(depth, 8) x 0.1: Photon's c1_blend_layers.fsh, adapted from Photon Shaders (c) Benjamin
+				// Stott, Photon licence), kept only if that point lies behind the surface; else the pixel in place stands. It already carries the water's tint,
+				// so it is blended in with a weight and not run through the absorption again.
+				float3 q = p + v * dRay + float3(Nf.x - gnf.x, 0.0, Nf.z - gnf.z) * (min(dRay, 8.0) * 0.5);
+				float2 uvr;
+				float sd = wPrevD(scene, q, wf, uvr);
+				if (sd > dist + 0.3) {
+					float4 pc = scene.sample(wLin, uvr, level(0.0));
+					float rw = wf.uw.w * saturate((sd - dist - 0.3) * 0.5);
+					trans = mix(trans, pc.rgb, rw);
+				}
+			}
+			if ((tf & WF_SHORE) != 0u) {
+				// the shore: where the water is thin the bed's edge shines (cube(1 - 2 depth |dir.y|): Photon's gbuffers_all_translucent.fsh, same notice)
+				float sh = saturate(1.0 - 2.0 * dRay * abs(v.y));
+				shore = sh * sh * sh;
+			}
 		} else if ((flags & 1u) != 0u) {
 			float zs = wZ(sdepth, in.pos.xy, wf);
 			float dRay = zs <= 0.0 ? wf.sigma.w : min(length(wRecon(in.pos.xy, zs, wf) - p), wf.sigma.w);
@@ -2756,6 +2834,13 @@ static float4 waterSurface(VOut in, float3 gnRaw, float3 tint, float3 lm, float 
 			alpha = max(1.0 - (1.0 - F) * dot(T0, float3(1.0 / 3.0)), 0.25);
 		}
 		col = mix(trans, refl, F);
+		if ((tf & WF_SHORE) != 0u) {
+			// (bright texels of the water's texture stay as small highlights: Photon :215-228) and the thin edge
+			float tl = dot(tint, float3(0.3, 0.59, 0.11));
+			float hl = smoothstep(0.42, 0.62, tl);
+			float3 lamp = (lm * 0.6 + 0.4) * mix(0.35, 1.0, access);
+			col += (shore * 0.55 + hl * 0.12) * wf.uw2.y * lamp * (1.0 - F);
+		}
 	}
 	// the sun's glitter: GGX of the wave normal, Fresnel at the half vector
 	if (S > 0.0 && !below) {
@@ -2771,7 +2856,14 @@ static float4 waterSurface(VOut in, float3 gnRaw, float3 tint, float3 lm, float 
 		// bloom of the colour pass picks it up (a Blinn lobe pair: a hot core and a broad skirt; the narrow GGX above is the glitter on the ripples)
 		float3 Ns = normalize(gnf + (Nf - gnf) * 0.3);  // (the swell without the ripples: the glare is one patch, the ripples break it up)
 		float NHs = saturate(dot(Ns, H));
-		float gl = min((3.0 * pow(NHs, 420.0) + 0.45 * pow(NHs, 70.0)) * (0.35 + 0.65 * pow(NH, 24.0)) + 0.8 * pow(NH, 260.0), 3.5);  // (a hot core and a skirt that stays near the reflection point; the capped sum keeps the rest of the water dark)
+		float gl;
+		if ((tf & WF_GLARE) != 0u) {
+			// the sphere-light glare: the swell only (the ripples' tilt scaled by wf.uw2.w), one coherent patch; the ripples' glitter (sp) stays
+			float3 Nsw = normalize(gnf + (Nf - gnf) * wf.uw2.w);
+			gl = wSunGlare(Nsw, v, L, cv, wf) * wf.uw.y;
+			NL = 1.0;
+		} else
+		gl = min((3.0 * pow(NHs, 420.0) + 0.45 * pow(NHs, 70.0)) * (0.35 + 0.65 * pow(NH, 24.0)) + 0.8 * pow(NH, 260.0), 3.5);  // (a hot core and a skirt that stays near the reflection point; the capped sum keeps the rest of the water dark)
 		col += wf.sunColor.rgb * ((sp + gl * step(0.001, NL)) * wf.sunColor.w * S * mix(0.2, 1.0, access));
 	}
 	return float4(col / alpha, alpha);
@@ -2817,7 +2909,7 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 	, constant WaterFrame &wf [[buffer(12), function_constant(F_WATER)]], texture2d<float> wScene [[texture(27), function_constant(F_WATER)]],
 	texture2d<float, access::read> wDepth [[texture(28), function_constant(F_WATER)]]
 #ifdef OWN_WTILE
-	, float4 wDst [[color(0), function_constant(F_WDST)]]
+	, float4 wDst [[color(0), function_constant(F_WDST)]], texture2d<float, access::write> wGlare [[texture(26), function_constant(F_WDST)]]
 #endif
 #endif
 #endif
@@ -2838,6 +2930,7 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 	bool isWater = false;
 #ifdef OWN_WATER
 	float4 dstC = float4(-1.0);
+	float3 wHdr = float3(0.0);
 #ifdef OWN_WTILE
 	if (F_WDST) dstC = wDst;
 #endif
@@ -2857,6 +2950,7 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 		if (isWater) {
 			float access = saturate((skyw - 0.35) / 0.55);
 			color = waterSurface(in, gnRaw, color.rgb, lmw, access, wf, fog, wScene, wDepth, sf, skLut, dstC);
+			wHdr = max(color.rgb - 1.0, 0.0);
 		} else if (translucent && !F_SHADE) {
 			color.rgb *= lmw;  // (the vertex stage left the lightmap out of the colour, as in the shaded variant)
 		}
@@ -2908,9 +3002,17 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 #ifdef OWN_WATER
 	// the camera in water: the medium replaces the fog (per channel absorption toward the water's fog colour)
 #ifdef OWN_WTILE
-	if (F_WATER && wf.misc.x > 0.5) return shOut(float4(waterMedium(color.rgb, length(in.shPos), wf, fog), color.a), dstC, in.shPos, in.pos.xy);
+	if (F_WATER && wf.misc.x > 0.5) {
+		float3 mdir = in.shPos / max(length(in.shPos), 1e-3);
+		float3 mc = (uint(wf.uw.z) & WF_UWSCAT) != 0u ? waterMediumLit(color.rgb, length(in.shPos), mdir, wf, fog) : waterMedium(color.rgb, length(in.shPos), wf, fog);
+		return shOut(float4(mc, color.a), dstC, in.shPos, in.pos.xy);
+	}
 #else
-	if (F_WATER && wf.misc.x > 0.5) return float4(waterMedium(color.rgb, length(in.shPos), wf, fog), color.a);
+	if (F_WATER && wf.misc.x > 0.5) {
+		float3 mdir = in.shPos / max(length(in.shPos), 1e-3);
+		float3 mc = (uint(wf.uw.z) & WF_UWSCAT) != 0u ? waterMediumLit(color.rgb, length(in.shPos), mdir, wf, fog) : waterMedium(color.rgb, length(in.shPos), wf, fog);
+		return float4(mc, color.a);
+	}
 #endif
 #endif
 	float fogValue;
@@ -2935,6 +3037,14 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 	}
 #endif
 #ifdef OWN_WTILE
+	if (F_WDST && (uint(wf.uw.z) & WF_HDR) != 0u) {
+		// the HDR side channel: what the water shows above white (the glare), as a quad mean at half resolution (the 8-bit target clips it before the bloom
+		// sees it). Every covered pixel of the quad writes the same value; the texture is cleared each frame (bloom_clear in the pre buffer), read by bloom_down.
+		float3 ex = wHdr * (1.0 - saturate(fogValue * fog.FogColor.a));
+		float3 sx = ex + quad_shuffle_xor(ex, 1);
+		sx += quad_shuffle_xor(sx, 2);
+		if (dot(sx, float3(1.0)) > 1e-4) wGlare.write(float4(sx * 0.25, 1.0), uint2(in.pos.xy) >> 1);
+	}
 	return shOut(float4(mix(color.rgb, fogRgb, fogValue * fog.FogColor.a), color.a), dstC, in.shPos, in.pos.xy);
 #else
 	return float4(mix(color.rgb, fogRgb, fogValue * fog.FogColor.a), color.a);
@@ -4203,6 +4313,7 @@ struct PostFrame {
 	float4 sz;      // x 1/width, y 1/height of the main target, z aspect (w / h), w 0
 	float4 sun;     // xy sun position in uv (v down), z in front of the camera (0..1 fade), w 0
 	float4 ws;      // x 1: write tile water's scene for the next frame (sceneSrc is bound)
+	float4 uw;      // 176 track water: x 1 the camera is under water (shafts through the water), y shaft noise time (seconds, mod 4096), z the HDR glare's gain into the bloom, w spare
 };
 
 struct PostV {
@@ -4277,7 +4388,8 @@ fragment half4 post_fs(PostV in [[stage_in]], half4 dst [[color(0)]], constant P
 constant float SHAFT_FAN = 0.05;
 constexpr sampler blS(filter::linear, address::clamp_to_edge);
 
-kernel void bloom_down(texture2d<float> src [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]], constant uint &first [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
+kernel void bloom_down(texture2d<float> src [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]], constant uint &first [[buffer(1)]], texture2d<float> glare [[texture(2)]],
+	constant float &glareGain [[buffer(2)]], uint2 gid [[thread_position_in_grid]]) {
 	uint W = dst.get_width(), H = dst.get_height();
 	if (gid.x >= W || gid.y >= H) return;
 	float2 uv = (float2(gid) + 0.5) / float2(W, H), t = 1.0 / float2(src.get_width(), src.get_height());
@@ -4294,6 +4406,12 @@ kernel void bloom_down(texture2d<float> src [[texture(0)]], texture2d<float, acc
 		const float3 lw = float3(0.2126, 0.7152, 0.0722);
 		float w0 = 1.0 / (1.0 + dot(b0, lw)), w1 = 1.0 / (1.0 + dot(b1, lw)), w2 = 1.0 / (1.0 + dot(b2, lw)), w3 = 1.0 / (1.0 + dot(b3, lw)), w4 = 1.0 / (1.0 + dot(b4, lw));
 		r = (b0 * w0 * 0.5 + (b1 * w1 + b2 * w2 + b3 * w3 + b4 * w4) * 0.125) / (w0 * 0.5 + (w1 + w2 + w3 + w4) * 0.125);
+		if (glareGain > 0.0) {
+			// the HDR side channel of the water (what is above white, linear, at the source's size): a 5-tap tent added to the source
+			float3 ge = glare.sample(blS, uv).rgb * 0.4 + (glare.sample(blS, uv + t * float2(-1, -1)).rgb + glare.sample(blS, uv + t * float2(1, -1)).rgb
+				+ glare.sample(blS, uv + t * float2(-1, 1)).rgb + glare.sample(blS, uv + t * float2(1, 1)).rgb) * 0.15;
+			r += ge * glareGain;
+		}
 	} else {
 		r = (d + e + j + k) * 0.125 + (a + b + g + h) * 0.03125 + (b + c + h + i) * 0.03125 + (g + h + l + m) * 0.03125 + (h + i + m + n) * 0.03125;
 	}
@@ -4316,6 +4434,7 @@ kernel void bloom_up(texture2d<float> lowT [[texture(0)]], texture2d<float> high
 		float2 d = f.sun.xy - uv;
 		float2 da = float2(d.x * f.sz.z, d.y);
 		float dist = length(da);
+		const bool uwater = f.uw.x > 0.5;
 		if (f.sun.z > 0.0 && f.bl.y > 0.0) {
 			const int N = 20;
 			float acc = 0.0, wsum = 0.0;
@@ -4337,6 +4456,12 @@ kernel void bloom_up(texture2d<float> lowT [[texture(0)]], texture2d<float> high
 			shaft = acc / wsum * fall * fall * f.sun.z;
 			// the pixel's own sky: the haze matters where the light has something to fall on, the sky is bright already
 			shaft *= 0.35 + 0.65 * (1.0 - srcTex.sample(blS, uv).a);
+			if (uwater) {
+				// under water the shafts are bands that move: noise across the angle toward the sun (the surface's ripples focus the light into them)
+				float ang = atan2(da.y, da.x), t = f.uw.y;
+				float bands = 0.5 + 0.5 * sin(ang * 31.0 + t * 0.55 + 1.7 * sin(ang * 17.0 - t * 0.35)) * sin(ang * 53.0 - t * 0.4);
+				shaft *= 0.25 + 1.1 * bands * bands;
+			}
 		}
 		b.a = shaft;
 	}
