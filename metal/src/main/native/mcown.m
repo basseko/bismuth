@@ -608,6 +608,9 @@ static NSString *ownLayerName(int kind) {
 	return k == 3 ? @"own translucent" : k == 1 || k == 5 || k == 6 ? @"own cutout" : @"own solid";
 }
 
+// tile water (OwnWater.TILE, mcs_water_tile): the translucent water draws read the colour behind them in place, so their blending is off (they blend by hand)
+static int ownWaterTile;
+
 static id<MTLRenderPipelineState> ownPipeline(Own *w, Enc *enc, int cutout, char *err, int errCap) {
 	for (int i = 0; i < w->layoutCount; i++) {
 		OwnLayout *k = &w->layouts[i];
@@ -650,7 +653,7 @@ static id<MTLRenderPipelineState> ownPipeline(Own *w, Enc *enc, int cutout, char
 			if (!enc->colors[c]) continue;
 			pd.colorAttachments[c].pixelFormat = enc->colors[c].pixelFormat;
 			pd.colorAttachments[c].writeMask = c == 0 && (cutout & 15) != 6 && !(cutout & (1 << 30)) ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
-			if (c == 0 && (cutout & 15) == 3) {
+			if (c == 0 && (cutout & 15) == 3 && !(ownWaterTile && (cutout & (1 << 10)))) {
 				// vanilla's BlendFunction.TRANSLUCENT
 				pd.colorAttachments[c].blendingEnabled = YES;
 				pd.colorAttachments[c].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
@@ -706,6 +709,10 @@ static struct {
 	id<MTLTexture> copyCol, copyDepth;  // the split's copies of the pass's colour (RGBA8 / RGBA16F) and depth (R32Float), half or full size
 	id<MTLTexture> dummyCol, dummyDepth;
 	id<MTLComputePipelineState> copyPso;
+	// tile water: the colour pass's half-size scene copies (RGBA16F: colour, distance), written alternately; last: the one the previous frame wrote (nil: none)
+	id<MTLTexture> tile[2], tileLast;
+	unsigned tileFrame;
+	int tileWant, tileOn, tileWrote;
 } wat;
 
 extern int mc_tl_restart_ok(Enc *enc);
@@ -713,7 +720,7 @@ extern int mc_tl_restart_ok(Enc *enc);
 // scene: the draw is a translucent one (the only kind that reads the scene); the opaque draws under water get the dummies
 static void ownBindWater(id<MTLRenderCommandEncoder> r, id<MTLTexture> light, id<MTLSamplerState> lightSampler, bool scene) {
 	[r setFragmentBytes:wat.frame length:(NSUInteger) wat.frameLen atIndex:12];
-	[r setFragmentTexture:scene && wat.scene && wat.depth ? wat.scene : wat.dummyCol atIndex:27];
+	[r setFragmentTexture:scene && wat.scene && (wat.depth || wat.tileOn) ? wat.scene : wat.dummyCol atIndex:27];
 	[r setFragmentTexture:scene && wat.scene && wat.depth ? wat.depth : wat.dummyDepth atIndex:28];
 	[r setFragmentTexture:light atIndex:17];
 	[r setFragmentSamplerState:lightSampler atIndex:15];
@@ -2387,10 +2394,27 @@ int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int le
 	id<MTLRenderCommandEncoder> r = enc->render;
 	if (!r || enc->colorCount != 1 || !enc->colors[0] || enc->colors[0] != target || length > 256) return 0;
 	float pbuf[64];
+	memset(pbuf, 0, sizeof pbuf);
 	memcpy(pbuf, params, (size_t) length);
 	int bloom = length >= 160 && pbuf[27] > 0.5f && blEnsure(w, enc);
 	if (length >= 160 && !bloom) pbuf[27] = 0.0f;  // (the shader must not touch textures that are not bound)
+	if (length < 176) length = 176;  // (PostFrame.ws, set here)
 	params = pbuf;
+	// tile water: the scene copy for the next frame's water (half size; a new size starts without one)
+	id<MTLTexture> sceneOut = nil;
+	if (wat.tileWant) {
+		NSUInteger tw = ((NSUInteger) enc->width + 1) / 2, th = ((NSUInteger) enc->height + 1) / 2;
+		if (!wat.tile[0] || wat.tile[0].width != tw || wat.tile[0].height != th) {
+			for (int i = 0; i < 2; i++) {
+				[wat.tile[i] release];
+				wat.tile[i] = blTex(w, MTLPixelFormatRGBA16Float, tw, th, [NSString stringWithFormat:@"shade water tile scene %d", i]);
+			}
+			wat.tileLast = nil;
+		}
+		if (wat.tile[0] && wat.tile[1]) sceneOut = wat.tile[wat.tileFrame++ & 1];
+	}
+	pbuf[40] = sceneOut ? 1.0f : 0.0f;
+	if (sceneOut) [r setFragmentTexture:sceneOut atIndex:2];
 	if (bloom) {
 		unsigned f = bl.frame++;
 		if (pbuf[35] < 0.5f) blChain(w, enc, bl.src[(f + 1) & 1], params, length);  // (pbuf[35]: probe shaders.bloom.chain off, a measurement)
@@ -2446,6 +2470,10 @@ int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int le
 		[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 		[r popDebugGroup];
 		w->lastPso = nil;
+	}
+	if (sceneOut) {
+		wat.tileLast = sceneOut;
+		wat.tileWrote = 1;
 	}
 	return 1;
 }
@@ -2615,6 +2643,7 @@ int mcs_sky_clouds(Own *w, Enc *enc, int k, const void *params, int length, int 
 		[r setFragmentBytes:params length:(NSUInteger) length atIndex:0];
 		[r setFragmentTexture:sk.cur atIndex:0];
 		if (sk.noise) [r setFragmentTexture:sk.noise atIndex:1];
+		[r setFragmentTexture:(sk.cloudCur && sk.cloudCur != t ? sk.cloudCur : t) atIndex:3];  // (the previous frame's target: temporal clouds; SkyFrame.cloudT.y says whether to use it)
 		[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 		[r endEncoding];
 		sk.cloudCur = t;
@@ -2670,6 +2699,25 @@ static id<MTLTexture> watCopyTex(Own *w, id<MTLTexture> *slot, MTLPixelFormat fm
 // or full size (copy 2); the encoder reopens with both loaded. The water's draws bind only the copies, so no texture is ever read while it is also an
 // attachment of the pass that reads it (that is undefined, and corrupted the colour). Returns 1 done (the scene is bound by the following translucent K_WATER
 // draws), 0 the pass has the wrong shape or the kernel is missing (nothing was changed), -1 the attachments cannot be read as textures (nothing changed).
+// Tile water, at the start of each world frame: mode 1 on for the session (the pipelines' blending), want 1 the colour pass writes the scene copy this frame.
+void mcs_water_tile(Own *w, int mode, int want) {
+	ownWaterTile = mode;
+	if (!wat.tileWrote) wat.tileLast = nil;  // (the previous frame wrote no copy: an older one would be reprojected with the wrong matrices)
+	wat.tileWrote = 0;
+	wat.tileWant = want;
+	wat.tileOn = 0;
+	wat.scene = nil;
+	wat.depth = nil;
+}
+
+// Tile water, before the translucent draw: this frame's water reads the scene the previous frame's colour pass wrote. 1 there is one, 0 none.
+int mcs_water_tile_scene(Own *w) {
+	wat.depth = nil;
+	wat.scene = wat.tileLast;
+	wat.tileOn = wat.tileLast != nil;
+	return wat.tileOn;
+}
+
 int mcs_water_split(Own *w, Enc *enc, id<MTLTexture> target, int copy) {
 	wat.scene = nil;
 	wat.depth = nil;

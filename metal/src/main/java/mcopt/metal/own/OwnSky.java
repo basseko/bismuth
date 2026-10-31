@@ -28,7 +28,7 @@ public final class OwnSky {
 	static final float HAZE_CLEAR = Float.parseFloat(System.getProperty("mcopt.shaders.haze", "700"));
 	static final float HAZE_RAIN = Float.parseFloat(System.getProperty("mcopt.shaders.hazeRain", "170"));
 	static final float HAZE_STRENGTH = Float.parseFloat(System.getProperty("mcopt.shaders.hazeStrength", "1.0"));
-	private static final int PARAM_BYTES = 192, LUT_BYTES = 32;
+	private static final int PARAM_BYTES = 256, LUT_BYTES = 32;
 
 	/** The dome drew this frame (the shaded terrain may read the table, vanilla's sun and sunrise fan are skipped). */
 	static boolean active;
@@ -159,6 +159,8 @@ public final class OwnSky {
 	/** Draws the dome into the sky pass (called by the mixin at vanilla's sky disc). True: drawn, vanilla's disc, sunrise fan and sun are skipped. */
 	public static boolean draw() {
 		active = false;
+		boolean cloudsBefore = cloudPrev;
+		cloudPrev = false;  // (set again below once this frame's clouds are drawn: a frame without them breaks the history)
 		if (!ON || failed || !OwnProbe.bool("shaders", true) || !OwnProbe.bool("shaders.sky", true)) return false;
 		OwnTerrain t = OwnShade.lastOwner;
 		if (t == null) return why("no terrain renderer yet");
@@ -247,8 +249,21 @@ public final class OwnSky {
 			MemoryUtil.memPutFloat(p + 108, exposure);
 			if (clouds) {
 				int cw = Math.max(64, (int) Math.ceil(screenW() / (double) CLOUD_DIV)), ch = Math.max(64, (int) Math.ceil(screenH() / (double) CLOUD_DIV));
+				// temporal: a quarter of the pixels marched per frame, the rest reprojected from the previous frame's target (same size, drawn last frame, no jump)
+				boolean hist = TEMPORAL && OwnProbe.bool("shaders.clouds.temporal", true) && cloudsBefore && cw == cloudW && ch == cloudH
+					&& Math.abs(cam.pos.x - cloudPos[0]) + Math.abs(cam.pos.y - cloudPos[1]) + Math.abs(cam.pos.z - cloudPos[2]) < 16.0;
+				for (int i = 0; i < 12; i++) MemoryUtil.memPutFloat(p + 192 + i * 4 + (i / 3) * 4, cloudView[i]);
+				MemoryUtil.memPutFloat(p + 240, (float) (cloudPhase++ & 3));
+				MemoryUtil.memPutFloat(p + 244, hist ? 1f : 0f);
 				if (!OwnNative.skyClouds(own, enc, k, p, PARAM_BYTES, cw, ch)) throw new IllegalStateException("cloud target missing");
+				for (int i = 0; i < 12; i++) cloudView[i] = MemoryUtil.memGetFloat(p + i * 4 + (i / 3) * 4);
+				cloudW = cw;
+				cloudH = ch;
+				cloudPos[0] = cam.pos.x;
+				cloudPos[1] = cam.pos.y;
+				cloudPos[2] = cam.pos.z;
 			}
+			cloudPrev = clouds;
 			if (!OwnNative.skyDraw(own, enc, p, PARAM_BYTES)) return why("no open render encoder for the dome");
 		} catch (RuntimeException e) {
 			System.out.println("mcopt-shaders: sky disabled: " + e);
@@ -273,6 +288,13 @@ public final class OwnSky {
 	static final int NOISE = 256;
 	/** The cloud target is the screen divided by this in each direction. */
 	static final int CLOUD_DIV = Integer.getInteger("mcopt.shaders.clouds.div", 6);
+	/** Temporal clouds: one pixel of each 2 x 2 marched per frame, the others reprojected from the previous frame (-Dmcopt.shaders.clouds.temporal=false: all marched). */
+	static final boolean TEMPORAL = !"false".equals(System.getProperty("mcopt.shaders.clouds.temporal"));
+	/** The previous cloud frame: its view (fwd, right, up as xyz triples), target size, camera position, whether clouds were drawn. */
+	private static final float[] cloudView = new float[12];
+	private static final double[] cloudPos = new double[3];
+	private static int cloudW, cloudH, cloudPhase;
+	private static boolean cloudPrev;
 
 	private static int screenW() {
 		return Minecraft.getInstance().gameRenderer.mainRenderTarget().width;

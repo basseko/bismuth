@@ -75,6 +75,8 @@ final class OwnNative {
 	// water (-Dmcopt.shaders.water): mcown.m mcs_water_*
 	private static final MethodHandle WATER_FRAME = OwnWater.ON ? fn("mcs_water_frame", false, null, JAVA_LONG, JAVA_LONG, JAVA_INT) : null;
 	private static final MethodHandle WATER_SPLIT = OwnWater.ON ? fn("mcs_water_split", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT) : null;
+	private static final MethodHandle WATER_TILE = OwnWater.ON ? fn("mcs_water_tile", false, null, JAVA_LONG, JAVA_INT, JAVA_INT) : null;
+	private static final MethodHandle WATER_TILE_SCENE = OwnWater.ON ? fn("mcs_water_tile_scene", false, JAVA_INT, JAVA_LONG) : null;
 
 	private static final MethodHandle POST = OwnShade.ON ? fn("mcs_post", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT) : null;
 
@@ -85,6 +87,24 @@ final class OwnNative {
 	static void waterFrame(long own, long bytes, int length) {
 		try {
 			WATER_FRAME.invokeExact(own, bytes, length);
+		} catch (Throwable t) {
+			throw rethrow(t);
+		}
+	}
+
+	/** Tile water at the start of a world frame (mcs_water_tile): mode 1 for the session, want 1 the colour pass writes the scene copy this frame. */
+	static void waterTile(long own, int mode, int want) {
+		try {
+			WATER_TILE.invokeExact(own, mode, want);
+		} catch (Throwable t) {
+			throw rethrow(t);
+		}
+	}
+
+	/** Tile water before the translucent draw (mcs_water_tile_scene): true if the previous frame's colour pass left a scene copy, now bound for the water. */
+	static boolean waterTileScene(long own) {
+		try {
+			return (int) WATER_TILE_SCENE.invokeExact(own) > 0;
 		} catch (Throwable t) {
 			throw rethrow(t);
 		}

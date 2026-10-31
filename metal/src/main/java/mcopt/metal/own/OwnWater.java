@@ -49,6 +49,16 @@ public final class OwnWater {
 	static final int STEPS = !"false".equals(System.getProperty("mcopt.shaders.water.ssr")) ? Math.max(0, Math.min(48, Integer.getInteger("mcopt.shaders.water.steps", 14))) : 0;
 	/** Split the world pass for the scene's colour and depth (false: no scene, the fallback look). */
 	static final boolean SPLIT = !"false".equals(System.getProperty("mcopt.shaders.water.split"));
+	/**
+	 * Tile water (default; {@code -Dmcopt.shaders.water.tile=false} for the split): no split of the world pass. The water's pixels read the colour behind them in
+	 * place (programmable blending) and the distance behind them from that colour's alpha, which the shaded opaque terrain writes as a code; the reflection marches
+	 * the previous frame's half-size scene, which the colour pass writes (colour and distance), reprojected to this frame's camera. Costs: no refraction offset
+	 * (the pixel behind is all a pass can read), reflections one frame late, the bed's depth to about 3 % (an 8-bit code, dithered).
+	 */
+	static final boolean TILE = ON && SPLIT && !"false".equals(System.getProperty("mcopt.shaders.water.tile"));
+	/** This frame's and the previous frame's camera-relative clip matrix (projection x view rotation) and camera position (tile water). */
+	private static Matrix4f viewNow, viewPrev;
+	private static final Vector3d posNow = new Vector3d(), posPrev = new Vector3d();
 	/** The scene copy's size at the split: 1 half resolution (default), 2 full resolution. */
 	static final int COPY = "full".equals(System.getProperty("mcopt.shaders.water.copy")) ? 2 : 1;
 	/** Keep vanilla's blue screen overlay under water. */
@@ -62,7 +72,7 @@ public final class OwnWater {
 		String[] p = s.split(",");
 		return new float[] {Float.parseFloat(p[0]), Float.parseFloat(p[1]), Float.parseFloat(p[2])};
 	}
-	private static final int FRAME_BYTES = 320;
+	private static final int FRAME_BYTES = 336;
 	/** kind bit 10 */
 	static final int K_WATER = 1 << 10;
 
@@ -104,7 +114,9 @@ public final class OwnWater {
 	static void beginFrame(OwnTerrain t, CameraRenderState camera, SkyRenderState sky) {
 		frameOn = false;
 		surface = false;
-		if (!ON || failed || !OwnProbe.bool("shaders.water", true)) return;
+		boolean on = ON && !failed && OwnProbe.bool("shaders.water", true);
+		if (TILE) OwnNative.waterTile(t.shadeOwn(), 1, on ? 1 : 0);
+		if (!on) return;
 		underwater = camera.fogType == FogType.WATER;
 		try {
 			write(t, camera, sky, null, null, false);
@@ -125,7 +137,9 @@ public final class OwnWater {
 		try {
 			SkyRenderState sky = Minecraft.getInstance().gameRenderer.gameRenderState().levelRenderState.skyRenderState;
 			boolean scene = false;
-			if (SPLIT && OwnProbe.bool("shaders.water.split", true)) {
+			if (TILE) {
+				scene = viewPrev != null && OwnNative.waterTileScene(t.shadeOwn());
+			} else if (SPLIT && OwnProbe.bool("shaders.water.split", true)) {
 				RenderTarget main = Minecraft.getInstance().gameRenderer.mainRenderTarget();
 				int r = OwnNative.waterSplit(t.shadeOwn(), t.shadeEnc(), MetalBridge.textureHandle(main.getColorTexture()), COPY);
 				if (r > 0) {
@@ -141,12 +155,22 @@ public final class OwnWater {
 			surface = true;
 			if (!said) {
 				said = true;
-				System.out.println("mcopt-shaders: water on (" + (scene ? "split pass, scene copied at " + (COPY == 1 ? "half" : "full") + " resolution, " + (STEPS > 0 ? "SSR " + STEPS + " steps" : "no SSR")
+				System.out.println("mcopt-shaders: water on (" + (TILE ? "in the pass, the bed read in place, " + (STEPS > 0 ? "SSR " + STEPS + " steps over the previous frame" : "no SSR") : scene ? "split pass, scene copied at " + (COPY == 1 ? "half" : "full") + " resolution, " + (STEPS > 0 ? "SSR " + STEPS + " steps" : "no SSR")
 					: "no scene") + ")");
 			}
 		} catch (RuntimeException | LinkageError e) {
 			fail(e);
 		}
+	}
+
+	/** Tile water: this frame's view (OwnTerrain.drawOpaque, every world frame; clip = projection x view rotation, camera-relative). */
+	static void noteView(Matrix4f clip, CameraRenderState camera) {
+		if (viewNow != null) {
+			viewPrev = viewNow;
+			posPrev.set(posNow);
+		}
+		viewNow = new Matrix4f(clip);
+		posNow.set(camera.pos.x, camera.pos.y, camera.pos.z);
 	}
 
 	/** The kind of a terrain draw with water applied: the medium on every fragment kind under water, the surface on translucent ones. */
@@ -209,8 +233,9 @@ public final class OwnWater {
 			int w = main.width, h = main.height;
 			float projA = 0, projB = 1;
 			if (clip != null) {
-				// the matrix the vertex stage multiplies by, with y flipped as it flips it
-				Matrix4f vp = new Matrix4f(clip);
+				// the matrix the vertex stage multiplies by, with y flipped as it flips it (tile water: the previous frame's, from this frame's camera-relative positions)
+				Matrix4f vp = new Matrix4f(TILE && viewPrev != null ? viewPrev : clip);
+				if (TILE && viewPrev != null) vp.translate((float) (camera.pos.x - posPrev.x), (float) (camera.pos.y - posPrev.y), (float) (camera.pos.z - posPrev.z));
 				vp.m01(-vp.m01()).m11(-vp.m11()).m21(-vp.m21()).m31(-vp.m31());
 				vp.getToAddress(b);
 				new Matrix4f(vp).invert().getToAddress(b + 64);
@@ -248,6 +273,7 @@ public final class OwnWater {
 				put4(b + 288, rc[4], rc[5], rc[6], rc[7]);
 			}
 			put4(b + 304, MEDIUM[0] * MURK, MEDIUM[1] * MURK, MEDIUM[2] * MURK, COPY == 1 ? 0.5f : 1.0f);  // (w: the scene depth copy's pixels per screen pixel)
+			if (TILE && viewPrev != null) put4(b + 320, (float) (camera.pos.x - posPrev.x), (float) (camera.pos.y - posPrev.y), (float) (camera.pos.z - posPrev.z), 0f);
 			OwnNative.waterFrame(t.shadeOwn(), b, FRAME_BYTES);
 		}
 	}

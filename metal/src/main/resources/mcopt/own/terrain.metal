@@ -2255,6 +2255,11 @@ static float linear_fog_value(float vertexDistance, float fogStart, float fogEnd
 
 constant bool CUTOUT [[function_constant(0)]];
 constant float CUTOUT_LIMIT [[function_constant(5)]];  // vanilla's ALPHA_CUTOUT: 0.5 cutout, 0.1 translucent
+#ifdef OWN_WTILE
+// tile water (OwnWater.TILE): the translucent water draw reads the colour behind it in place (programmable blending, its blending is off) and the distance
+// behind it from that colour's alpha, a code the shaded opaque terrain writes (shDCode): no split of the world pass. F_WDST: such a draw.
+constant bool F_WDST = F_WATER && CUTOUT && CUTOUT_LIMIT < 0.2;
+#endif
 
 #ifdef OWN_SHADE
 // ---- shaded variant (F_SHADE): normal, shadow lookup ----
@@ -2266,6 +2271,22 @@ constexpr sampler shCmp(coord::normalized, filter::linear, address::clamp_to_edg
 // interleaved gradient noise (Jimenez 2014): a per-pixel rotation for the filter disc
 static float shIgn(float2 p) {
 	return fract(52.9829189 * fract(dot(p, float2(0.06711056, 0.00583715))));
+}
+
+// the distance code in the main colour's alpha (tile water): 0 the sky (the dome writes it), 1 .. 254 (/ 255) a log2 code of the distance from the camera
+// (0 .. 1024 blocks, dithered by half a step), 255 unknown (what writes its texture's alpha: entities, the far LOD, the hand). The colour pass writes 1 back.
+constant float SH_DL = 10.00141;  // log2(1 + 1024)
+static float shDCode(float d, float2 pix) {
+	float f = log2(1.0 + min(d, 1024.0)) * (1.0 / SH_DL);
+	return clamp(1.0 + 253.0 * f + (shIgn(pix) - 0.5), 1.0, 254.0) * (1.0 / 255.0);
+}
+
+// the distance a code stands for: -1 unknown, 1e4 the sky
+static float shDDecode(float a) {
+	float k = a * 255.0;
+	if (k < 0.5) return 1e4;
+	if (k > 254.5) return -1.0;
+	return exp2((k - 1.0) * (SH_DL / 253.0)) - 1.0;
 }
 
 // the face normal: the unit's facing bucket for axis-aligned quads, else the screen-space derivative of the position oriented to the camera
@@ -2433,6 +2454,7 @@ struct WaterFrame {
 	float4 still;         // 272 water_still's uv rectangle u0 v0 u1 v1
 	float4 flow;          // 288 water_flow's
 	float4 med;           // 304 rgb the underwater medium's absorption per block, w the scene copy's pixels per screen pixel (0.5 half size, 1 full)
+	float4 prevOff;       // 320 tile water: xyz this frame's camera minus the previous frame's (blocks; viewProj is then the previous frame's), w 0
 };
 
 constexpr sampler wLin(coord::normalized, filter::linear, address::clamp_to_edge);
@@ -2581,6 +2603,55 @@ static float4 wSsr(float3 p, float3 r, float jitter, constant WaterFrame &wf, te
 	return float4(scene.sample(wLin, qh * wf.screen.zw, level(0.0)).rgb, conf);
 }
 
+// tile water's reflection: the ray p + r s marched through the PREVIOUS frame's half-size scene (post_fs writes it: colour, and in alpha the distance from that
+// frame's camera, the sky and unknown far), reprojected: wf.viewProj is the previous frame's projection of this frame's camera-relative positions and
+// wf.prevOff.xyz this camera minus that one. Steps spread quadratically along the ray with a per-pixel offset, then four bisections; rgb the scene colour
+// at the hit, w the confidence (0 no hit). One frame late: what moves shows where it was a frame ago.
+static float wPrevD(texture2d<float> scene, float3 q, constant WaterFrame &wf, thread float2 &uv) {
+	float4 c = wf.viewProj * float4(q, 1.0);
+	if (c.w < 0.15) return -1.0;
+	uv = float2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);
+	if (any(uv < 0.0) || any(uv > 1.0)) return -1.0;
+	return scene.read(uint2(uv * float2(scene.get_width(), scene.get_height()))).a;
+}
+
+static float4 wSsrPrev(float3 p, float3 r, float jitter, constant WaterFrame &wf, texture2d<float> scene) {
+	const int N = int(wf.misc.z);
+	const float3 off = wf.prevOff.xyz;
+	float lo = 0.0, hi = -1.0;
+	float2 uv;
+	for (int i = 1; i <= N; i++) {
+		float f = min((float(i) + jitter) / float(N), 1.0);
+		float s = 128.0 * f * f;
+		float3 q = p + r * s;
+		float sd = wPrevD(scene, q, wf, uv);
+		if (sd < 0.0) return float4(0.0);  // (off the screen, or behind the camera)
+		if (sd < length(q + off)) {  // the ray is behind the scene here
+			hi = s;
+			break;
+		}
+		lo = s;
+	}
+	if (hi < 0.0) return float4(0.0);
+	for (int i = 0; i < 4; i++) {
+		float mid = 0.5 * (lo + hi);
+		float3 q = p + r * mid;
+		float sd = wPrevD(scene, q, wf, uv);
+		if (sd >= 0.0 && sd < length(q + off)) hi = mid;
+		else lo = mid;
+	}
+	float3 qh = p + r * hi;
+	float sd = wPrevD(scene, qh, wf, uv);
+	if (sd < 0.0) return float4(0.0);
+	// thickness: as wSsr (a ray that merely passes behind a thin object's silhouette is not a hit)
+	float thick = min(wf.proj.z, 0.3 + 0.04 * sd);
+	float dd = length(qh + off) - sd;
+	if (dd > thick) return float4(0.0);
+	float2 e = min(uv, 1.0 - uv) * wf.screen.xy;
+	float conf = saturate(min(e.x, e.y) / (0.06 * wf.screen.y)) * (1.0 - 0.6 * dd / thick);
+	return float4(scene.sample(wLin, uv, level(0.0)).rgb, conf);
+}
+
 // the sky seen along d: the milestone 3 table (the shaded variant has it) or the zenith-to-horizon blend of the frame block
 static float3 wSkyAt(float3 d, float3 horizon, constant WaterFrame &wf, constant ShadeFrame &sf, texture2d<float> lut) {
 	if (F_SHADE) {
@@ -2593,8 +2664,9 @@ static float3 wSkyAt(float3 d, float3 horizon, constant WaterFrame &wf, constant
 
 // The water surface: tint = the vertex colour (the biome's water colour, no light in it), lm the lightmap at the quad, access its sky exposure 0..1, gnRaw the
 // derivative normal of the position (taken by the caller in uniform control flow). rgb and the alpha the blend applies (1 with a scene to refract).
+// dstC: tile water's colour behind the pixel (alpha: its distance code), alpha < 0 for the split's scene copy instead.
 static float4 waterSurface(VOut in, float3 gnRaw, float3 tint, float3 lm, float access, constant WaterFrame &wf, constant Fog &fog,
-	texture2d<float> scene, texture2d<float, access::read> sdepth, constant ShadeFrame &sf, texture2d<float> lut) {
+	texture2d<float> scene, texture2d<float, access::read> sdepth, constant ShadeFrame &sf, texture2d<float> lut, float4 dstC) {
 	const uint flags = uint(wf.misc.w);
 	float3 p = in.shPos;
 	float dist = max(length(p), 1e-3);
@@ -2623,7 +2695,7 @@ static float4 waterSurface(VOut in, float3 gnRaw, float3 tint, float3 lm, float 
 	float3 horizon = fog.FogColor.rgb;
 	float3 refl = below ? horizon : wSkyAt(r, horizon, wf, sf, lut) * mix(0.25, 1.0, access);
 	if ((flags & 1u) != 0u && wf.misc.z > 0.5 && F > 0.04) {
-		float4 h = wSsr(p, r, shIgn(in.pos.xy), wf, scene, sdepth);
+		float4 h = dstC.a >= 0.0 ? wSsrPrev(p, r, shIgn(in.pos.xy), wf, scene) : wSsr(p, r, shIgn(in.pos.xy), wf, scene, sdepth);
 		refl = mix(refl, h.rgb, h.w * (below ? 0.6 : 1.0));
 	}
 	float3 L = wf.sunDir.xyz;
@@ -2640,7 +2712,15 @@ static float4 waterSurface(VOut in, float3 gnRaw, float3 tint, float3 lm, float 
 		float3 tintN = tint / max(max(tint.r, tint.g), max(tint.b, 0.01));
 		float3 scatter = wf.body.rgb * mix(float3(1.0), tintN, 0.4) * (lm * 0.85 + wf.sunColor.rgb * (S * 0.35 * access)) * wf.body.w;
 		float3 trans;
-		if ((flags & 1u) != 0u) {
+		if (dstC.a >= 0.0) {
+			// tile water: the bed is the pixel behind (no refraction offset: the pixel is all this pass can read), its depth from the alpha code
+			float dB = shDDecode(dstC.a);
+			float dRay = dB < 0.0 ? 1.5 : clamp(dB - dist, 0.0, wf.sigma.w);  // (unknown: an entity in the water, a block and a half)
+			float3 bed = mix(dstC.rgb, float3(dot(dstC.rgb, float3(0.3, 0.59, 0.11))), 0.30) * 0.56;
+			float3 T = exp(-wf.sigma.rgb * (dRay + 0.45));
+			trans = bed * T + scatter * (1.0 - T);
+			trans = mix(trans, float3(dot(trans, float3(0.3, 0.59, 0.11))), 0.18);
+		} else if ((flags & 1u) != 0u) {
 			float zs = wZ(sdepth, in.pos.xy, wf);
 			float dRay = zs <= 0.0 ? wf.sigma.w : min(length(wRecon(in.pos.xy, zs, wf) - p), wf.sigma.w);
 			// refraction: where the bent ray lands, relative to where the flat surface would send it (so calm water shifts nothing)
@@ -2717,6 +2797,16 @@ kernel void water_copy(texture2d<float, access::read> col [[texture(0)]], depth2
 }
 #endif
 
+#ifdef OWN_WTILE
+// tile water: what own_fs writes. The water draw (blending off) blends by hand and keeps the code behind it (the colour pass reads the bed's distance under
+// water); the shaded opaque terrain writes its distance code in alpha (shDCode); anything else is unchanged.
+static float4 shOut(float4 c, float4 dstC, float3 pos, float2 pix) {
+	if (F_WDST) return float4(mix(dstC.rgb, c.rgb, saturate(c.a)), dstC.a);
+	if (F_SHADE && !(CUTOUT && CUTOUT_LIMIT < 0.2)) return float4(c.rgb, shDCode(length(pos), pix));
+	return c;
+}
+#endif
+
 fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]], constant Terrain &t [[buffer(23)]], constant Fog &fog [[buffer(24)]],
 	texture2d<float> atlas [[texture(16)]], sampler atlasSampler [[sampler(14)]]
 #ifdef OWN_SHADE
@@ -2726,6 +2816,9 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 #ifdef OWN_WATER
 	, constant WaterFrame &wf [[buffer(12), function_constant(F_WATER)]], texture2d<float> wScene [[texture(27), function_constant(F_WATER)]],
 	texture2d<float, access::read> wDepth [[texture(28), function_constant(F_WATER)]]
+#ifdef OWN_WTILE
+	, float4 wDst [[color(0), function_constant(F_WDST)]]
+#endif
 #endif
 #endif
 	) {
@@ -2744,6 +2837,10 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 #ifdef OWN_SHADE
 	bool isWater = false;
 #ifdef OWN_WATER
+	float4 dstC = float4(-1.0);
+#ifdef OWN_WTILE
+	if (F_WDST) dstC = wDst;
+#endif
 	if (F_WATER) {
 		// (derivatives in uniform control flow: the water surface below needs the position's)
 		const bool translucent = CUTOUT && CUTOUT_LIMIT < 0.2;
@@ -2759,7 +2856,7 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 		}
 		if (isWater) {
 			float access = saturate((skyw - 0.35) / 0.55);
-			color = waterSurface(in, gnRaw, color.rgb, lmw, access, wf, fog, wScene, wDepth, sf, skLut);
+			color = waterSurface(in, gnRaw, color.rgb, lmw, access, wf, fog, wScene, wDepth, sf, skLut, dstC);
 		} else if (translucent && !F_SHADE) {
 			color.rgb *= lmw;  // (the vertex stage left the lightmap out of the colour, as in the shaded variant)
 		}
@@ -2810,7 +2907,11 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 	if (CUTOUT && color.a < CUTOUT_LIMIT) discard_fragment();
 #ifdef OWN_WATER
 	// the camera in water: the medium replaces the fog (per channel absorption toward the water's fog colour)
+#ifdef OWN_WTILE
+	if (F_WATER && wf.misc.x > 0.5) return shOut(float4(waterMedium(color.rgb, length(in.shPos), wf, fog), color.a), dstC, in.shPos, in.pos.xy);
+#else
 	if (F_WATER && wf.misc.x > 0.5) return float4(waterMedium(color.rgb, length(in.shPos), wf, fog), color.a);
+#endif
 #endif
 	float fogValue;
 	if (F_FVT && in.fogIn != 0) {
@@ -2833,7 +2934,11 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 		fogValue = max(fogValue, hv);
 	}
 #endif
+#ifdef OWN_WTILE
+	return shOut(float4(mix(color.rgb, fogRgb, fogValue * fog.FogColor.a), color.a), dstC, in.shPos, in.pos.xy);
+#else
 	return float4(mix(color.rgb, fogRgb, fogValue * fog.FogColor.a), color.a);
+#endif
 }
 
 // The per-quad path's lists drawn by mesh shading (-Dmcopt.own.frag.qmesh, with -Dmcopt.own.quads): a threadgroup per 32 listed quads
@@ -4097,6 +4202,7 @@ struct PostFrame {
 	float4 shc;     // rgb light shaft colour (linear), w shaft falloff (1 / screen distance)
 	float4 sz;      // x 1/width, y 1/height of the main target, z aspect (w / h), w 0
 	float4 sun;     // xy sun position in uv (v down), z in front of the camera (0..1 fade), w 0
+	float4 ws;      // x 1: write tile water's scene for the next frame (sceneSrc is bound)
 };
 
 struct PostV {
@@ -4114,8 +4220,19 @@ vertex PostV post_vs(uint vid [[vertex_id]]) {
 // one write per quad) that compute kernels blur and march in the next frame's pre command buffer (bloom_down / bloom_up); this pass ADDS the
 // result of the previous frame (bloomTex, a quarter-resolution RGBA16F: bloom in rgb, shaft strength in a). One frame of lag, no pass split.
 fragment half4 post_fs(PostV in [[stage_in]], half4 dst [[color(0)]], constant PostFrame &f [[buffer(0)]], texture2d<half> bloomTex [[texture(0)]],
-	texture2d<half, access::write> bloomSrc [[texture(1)]], uint lane [[thread_index_in_quadgroup]]) {
-	if (f.lb.w > 0.5) return dst;  // (probe shaders.postnop: the pass without its maths, to measure the pass's own cost)
+	texture2d<half, access::write> bloomSrc [[texture(1)]], texture2d<float, access::write> sceneSrc [[texture(2)]], uint lane [[thread_index_in_quadgroup]]) {
+	if (f.ws.x > 0.5) {
+		// tile water's scene for the next frame (OwnWater.TILE, half size): the colour before the grade (a quad mean) and the quad's nearest distance from the
+		// alpha code (the sky and unknown: far)
+		float d = shDDecode(float(dst.a));
+		float4 v = float4(float3(dst.rgb), d < 0.0 ? 1e4 : d);
+		float3 cs = v.rgb + quad_shuffle_xor(v.rgb, 1);
+		cs += quad_shuffle_xor(cs, 2);
+		float dm = min(v.a, quad_shuffle_xor(v.a, 1));
+		dm = min(dm, quad_shuffle_xor(dm, 2));
+		if (lane == 0) sceneSrc.write(float4(cs * 0.25, dm), uint2(in.pos.xy) >> 1);
+	}
+	if (f.lb.w > 0.5) return half4(dst.rgb, 1.0h);  // (probe shaders.postnop: the pass without its maths, to measure the pass's own cost)
 	// display -> linear with gamma 2 (a multiply instead of a pow), expose and balance, tone curve, back with a square root
 	half3 lin = dst.rgb * dst.rgb * half3(f.gk.rgb);
 	half3 mapped = (lin * (2.51h * lin + 0.03h)) / (lin * (2.43h * lin + 0.59h) + 0.14h);
@@ -4125,7 +4242,7 @@ fragment half4 post_fs(PostV in [[stage_in]], half4 dst [[color(0)]], constant P
 	float2 pp = in.pos.xy;
 	if (f.bl.w > 0.5) {
 		// the source for the next frame: the bright part of THIS picture before the bloom is added (else it feeds on itself) and the sky mask, averaged over the quad
-		half sky = saturate(1.0h - dst.a);  // the dome writes alpha 0, everything else 1
+		half sky = dst.a < half(0.5 / 255.0) ? 1.0h : 0.0h;  // the dome writes alpha 0, everything else 1 or (tile water) a distance code of 1 .. 255
 		half l = dot(max(o, 0.0h), half3(0.2126h, 0.7152h, 0.0722h));
 		half k = saturate((l - half(f.bl.z)) * (1.0h / (1.0h - half(f.bl.z))));
 		half4 v = half4(min(o, 1.0h) * k * k, sky);
@@ -4137,7 +4254,7 @@ fragment half4 post_fs(PostV in [[stage_in]], half4 dst [[color(0)]], constant P
 		half4 bt = bloomTex.sample(bs, pp * f.sz.xy);
 		// the shafts: full over the sky, a fraction over geometry (it is in front of the haze, the light does not fill it) and blended "screen" style so
 		// that a lit surface keeps its contrast (additive light on a mid-grey cliff washed it into a milky fog)
-		half skyP = saturate(1.0h - dst.a);
+		half skyP = sky;
 		half3 sh = half3(f.shc.rgb) * (bt.a * half(f.bl.y)) * mix(0.35h, 1.0h, skyP);
 		half3 lo = o * o;
 		lo = lo + bt.rgb * half(f.bl.x) + sh * (1.0h - min(lo, 1.0h) * 0.85h);
@@ -4320,6 +4437,10 @@ struct SkyFrame {
 	float4 cloudC;    // x camera y (world), y time, z cloud softness, w unused
 	float4 cloudSun;  // rgb the sunlight colour on the clouds, w the sun's elevation (sine)
 	float4 cloudAmb;  // rgb the ambient (sky) light colour on the clouds
+	float4 pFwd;      // the previous frame's fwd, right, up (temporal clouds)
+	float4 pRight;
+	float4 pUp;
+	float4 cloudT;    // x this frame's quarter (0..3: which pixel of each 2 x 2 is marched), y 1: the previous frame's cloud target is valid (texture 3)
 };
 
 
@@ -4411,8 +4532,25 @@ vertex SkyV sky_vs(uint vid [[vertex_id]]) {
 }
 
 // the cloud layer into a small target (a quarter of the screen's pixels: clouds are soft), premultiplied colour and coverage
-fragment float4 cloud_fs(SkyV in [[stage_in]], constant SkyFrame &f [[buffer(0)]], texture2d<float> lut [[texture(0)]], texture2d<float> noise [[texture(1)]]) {
+// Temporal (OwnSky.TEMPORAL): each frame marches one pixel of every 2 x 2 block; the other three take the previous frame's target where their direction lies
+// on it (the clouds are hundreds of blocks away and move slowly: a direction reprojection, the camera's own movement in a frame is negligible against that).
+fragment float4 cloud_fs(SkyV in [[stage_in]], constant SkyFrame &f [[buffer(0)]], texture2d<float> lut [[texture(0)]], texture2d<float> noise [[texture(1)]],
+	texture2d<float> prevCl [[texture(3)]]) {
 	float3 dir = normalize(f.fwd.xyz + f.right.xyz * in.ndc.x - f.up.xyz * in.ndc.y);
+	if (f.cloudT.y > 0.5) {
+		uint2 ip = uint2(in.pos.xy);
+		if (((ip.x & 1u) | ((ip.y & 1u) << 1)) != uint(f.cloudT.x)) {
+			// dir = F + R x - U y (unnormalised; F unit, R and U orthogonal to it): the previous frame's x, y of this direction
+			float df = dot(dir, f.pFwd.xyz);
+			if (df > 0.05) {
+				float x = dot(dir, f.pRight.xyz) / (dot(f.pRight.xyz, f.pRight.xyz) * df);
+				float y = -dot(dir, f.pUp.xyz) / (dot(f.pUp.xyz, f.pUp.xyz) * df);
+				float2 uv = float2(x * 0.5 + 0.5, 0.5 - y * 0.5);
+				float2 m = 1.0 / float2(prevCl.get_width(), prevCl.get_height());
+				if (all(uv >= m) && all(uv <= 1.0 - m)) return prevCl.sample(skSmp, uv, level(0.0));
+			}
+		}
+	}
 	float3 S = f.sun.xyz;
 	float exposure = f.nightH.w;
 	float3 amb = (0.5 + 0.5 * skTone(lut.sample(skSmp, skUvS(float2(0.0, 1.0), 0.93, S), level(0.0)).rgb * exposure)) * f.cloudAmb.rgb * 0.85;
