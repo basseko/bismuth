@@ -2714,7 +2714,7 @@ static float wSunGlare(float3 Ns, float3 v, float3 L, float cv, constant WaterFr
 	float d = NH * NH * (aw * aw - 1.0) + 1.0;
 	float D = aw * aw / (3.14159265 * d * d) * ((a / aw) * (a / aw));
 	float m = 1.0 - saturate(dot(-v, H));
-	float F = 0.02 + 0.98 * m * m * m * m * m;
+	float F = 0.25 + 0.75 * m * m * m * m * m;  // (a floor: water's true 0.02 at the half vector of a high sun leaves the patch dim, BSL's is far brighter)
 	float g = 1.0 / (4.0 * max(cv, 0.08));  // (the visibility term, Schlick-Smith folded: bounded)
 	return min(D * F * g * NL, 4.0) * smoothstep(0.0, 0.15, cv) * step(0.001, NL);
 }
