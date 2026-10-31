@@ -173,7 +173,7 @@ public final class OwnSky {
 			update(st);
 			long own = t.shadeOwn(), enc = t.shadeEnc();
 			if (!noiseDone) {
-				long nb = MemoryUtil.nmemAlloc(NOISE * NOISE * 4L);
+				long nb = MemoryUtil.nmemAlloc(NOISE * NOISE * 8L);
 				try {
 					fillNoise(nb);
 					if (!OwnNative.skyInit(own, LW, LH, nb, NOISE)) throw new IllegalStateException("sky table allocation failed");
@@ -391,7 +391,7 @@ public final class OwnSky {
 			for (int i = 0; i < chan[c].length; i++) chan[c][i] = (chan[c][i] / sum - lo) / (hi - lo);
 		}
 		for (int i = 0; i < NOISE * NOISE; i++)
-			for (int c = 0; c < 4; c++) MemoryUtil.memPutByte(out + i * 4L + c, (byte) Math.round(chan[c][i] * 255f));
+			for (int c = 0; c < 4; c++) MemoryUtil.memPutShort(out + i * 8L + c * 2L, (short) Math.round(chan[c][i] * 65535f));
 	}
 
 	private static long frameNo;

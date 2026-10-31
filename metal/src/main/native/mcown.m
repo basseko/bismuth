@@ -2485,7 +2485,7 @@ int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int le
 
 // ---- shaders: the sky (-Dmcopt.shaders; OwnSky): the sky-view table and the dome ----
 
-// The table ring (lw x lh RGBA16F) and the cloud noise (size x size RGBA8 from `noise`, may be NULL). 1 made, 0 failed.
+// The table ring (lw x lh RGBA16F) and the cloud noise (size x size RGBA16 from `noise`, may be NULL). 1 made, 0 failed.
 int mcs_sky_init(Own *w, int lw, int lh, const uint8_t *noise, int size) {
 	if (sk.lut[0] && sk.lw == lw && sk.lh == lh) return 1;
 	@autoreleasepool {
@@ -2503,13 +2503,13 @@ int mcs_sky_init(Own *w, int lw, int lh, const uint8_t *noise, int size) {
 		sk.lh = lh;
 		sk.cur = sk.lut[0];
 		if (noise && size > 0 && !sk.noise) {
-			MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:(NSUInteger) size height:(NSUInteger) size mipmapped:NO];
+			MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Unorm width:(NSUInteger) size height:(NSUInteger) size mipmapped:NO];
 			d.usage = MTLTextureUsageShaderRead;
 			d.storageMode = MTLStorageModeShared;
 			sk.noise = [w->ctx->device newTextureWithDescriptor:d];
 			if (!sk.noise) return 0;
 			sk.noise.label = @"shade cloud noise";
-			[sk.noise replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger) size, (NSUInteger) size) mipmapLevel:0 withBytes:noise bytesPerRow:(NSUInteger) size * 4];
+			[sk.noise replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger) size, (NSUInteger) size) mipmapLevel:0 withBytes:noise bytesPerRow:(NSUInteger) size * 8];
 		}
 	}
 	return 1;
