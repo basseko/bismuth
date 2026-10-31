@@ -18,10 +18,10 @@ final class OwnFog {
 	static final boolean ON = OwnShade.ON && !"false".equals(System.getProperty("mcopt.shaders.skyfog"));
 	static final boolean MS = ON && !"false".equals(System.getProperty("mcopt.shaders.skyfog.ms"));
 	private static final boolean FOG = !"false".equals(System.getProperty("mcopt.shaders.skyfog.fog"));
-	static final float MIE = Float.parseFloat(System.getProperty("mcopt.shaders.skyfog.mie", "1.0"));
+	static final float MIE = Float.parseFloat(System.getProperty("mcopt.shaders.skyfog.mie", "0.45"));
 	static final float RAY = Float.parseFloat(System.getProperty("mcopt.shaders.skyfog.ray", "3.0"));
 	static final float HALO = Float.parseFloat(System.getProperty("mcopt.shaders.skyfog.halo", "0.5"));
-	static final float GAIN = Float.parseFloat(System.getProperty("mcopt.shaders.skyfog.gain", "0.35"));
+	static final float GAIN = Float.parseFloat(System.getProperty("mcopt.shaders.skyfog.gain", "0.4"));
 	static final float SUN_BOOST = Float.parseFloat(System.getProperty("mcopt.shaders.skyfog.sun", "0.5"));
 	static final float SEA = 63.0f;
 
