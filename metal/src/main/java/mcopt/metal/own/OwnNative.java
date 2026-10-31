@@ -72,9 +72,31 @@ final class OwnNative {
 	private static final MethodHandle SKY_LUT = OwnShade.ON ? fn("mcs_sky_lut", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT) : null;
 	private static final MethodHandle SKY_CLOUDS = OwnShade.ON ? fn("mcs_sky_clouds", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_INT) : null;
 	private static final MethodHandle SKY_DRAW = OwnShade.ON ? fn("mcs_sky_draw", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT) : null;
+	// water (-Dmcopt.shaders.water): mcown.m mcs_water_*
+	private static final MethodHandle WATER_FRAME = OwnWater.ON ? fn("mcs_water_frame", false, null, JAVA_LONG, JAVA_LONG, JAVA_INT) : null;
+	private static final MethodHandle WATER_SPLIT = OwnWater.ON ? fn("mcs_water_split", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT) : null;
+
 	private static final MethodHandle POST = OwnShade.ON ? fn("mcs_post", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT) : null;
 
 	private OwnNative() {
+	}
+
+	/** This frame's WaterFrame block (mcs_water_frame). */
+	static void waterFrame(long own, long bytes, int length) {
+		try {
+			WATER_FRAME.invokeExact(own, bytes, length);
+		} catch (Throwable t) {
+			throw rethrow(t);
+		}
+	}
+
+	/** The split before the translucent draw (mcs_water_split): 1 done, 0 the open pass is not the plain main pass, -1 its attachments are not shader readable. */
+	static int waterSplit(long own, long enc, long target, boolean copy) {
+		try {
+			return (int) WATER_SPLIT.invokeExact(own, enc, target, copy ? 1 : 0);
+		} catch (Throwable t) {
+			throw rethrow(t);
+		}
 	}
 
 	/** The colour response pass into the open render encoder (mcs_post); throws with the native error. */
@@ -723,6 +745,17 @@ final class OwnNative {
 		long uniforms, long atlas, long atlasSampler, long light, long lightSampler, long indices) {
 		if (OwnShade.ON) {
 			int shaded = OwnShade.kind(kind);
+			if (OwnWater.ON) {
+				int watered = OwnWater.kind(shaded);
+				if (watered != shaded) {
+					try {
+						return draw0(own, enc, watered, frame, frameLength, arena, sections, recs, lists, args, argsOffset, uniforms, atlas, atlasSampler, light, lightSampler, indices);
+					} catch (IllegalStateException e) {
+						// the water variant could not be built: the shaded (or plain) one for this draw and the rest of the session
+						OwnWater.drawFailed(e);
+					}
+				}
+			}
 			if (shaded != kind) {
 				try {
 					return draw0(own, enc, shaded, frame, frameLength, arena, sections, recs, lists, args, argsOffset, uniforms, atlas, atlasSampler, light, lightSampler, indices);

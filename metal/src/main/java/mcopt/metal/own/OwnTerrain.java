@@ -449,7 +449,7 @@ public final class OwnTerrain {
 		this.encoder = encoder;
 		this.ctx = MetalBridge.ctx(encoder);
 		this.enc = MetalBridge.enc(encoder);
-		this.own = OwnNative.create(this.ctx, (OwnShade.ON ? "#define OWN_SHADE 1\n#define OWN_SHADE_TAPS " + OwnShade.TAPS + "\n" : "") + (OwnPosTable.ON ? "#define OWN_EXACT_POS 1\n" : "") + (OwnQrec.ON ? "#define OWN_QREC 1\n" : "") + (VCOUNT ? "#define OWN_VCOUNT 1\n" : "") + (TFLAT ? "#define OWN_TFLAT 1\n" : "") + (TPROBE > 0 ? "#define OWN_TPROBE " + TPROBE + "\n" : "") + (OwnFrag.EXACT_SHIFT != 2 ? "#define A1_SH " + OwnFrag.EXACT_SHIFT + "\n" : "") + resource("/mcopt/own/terrain.metal"), COMPACT, FAT, CPU_CLIP);
+		this.own = OwnNative.create(this.ctx, (OwnShade.ON ? "#define OWN_SHADE 1\n#define OWN_SHADE_TAPS " + OwnShade.TAPS + "\n" + (OwnWater.ON ? "#define OWN_WATER 1\n" : "") : "") + (OwnPosTable.ON ? "#define OWN_EXACT_POS 1\n" : "") + (OwnQrec.ON ? "#define OWN_QREC 1\n" : "") + (VCOUNT ? "#define OWN_VCOUNT 1\n" : "") + (TFLAT ? "#define OWN_TFLAT 1\n" : "") + (TPROBE > 0 ? "#define OWN_TPROBE " + TPROBE + "\n" : "") + (OwnFrag.EXACT_SHIFT != 2 ? "#define A1_SH " + OwnFrag.EXACT_SHIFT + "\n" : "") + resource("/mcopt/own/terrain.metal"), COMPACT, FAT, CPU_CLIP);
 		// -Dmcopt.own.hizTile=true: the per-quad path's pyramid in one tiled pass for its first five levels (padded to 32 texels)
 		applyNativeFlags();
 		// -Dmcopt.own.gputime=true: GPU timestamps of our compute encoders (cull, list build, pyramid + test), logged per 500 frames
@@ -2842,6 +2842,8 @@ public final class OwnTerrain {
 		else proj.set(camera.projectionMatrix);
 		Matrix4fc view = camera.viewRotationMatrix;
 		Matrix4f clip = new Matrix4f(proj).mul(view);
+		// (shaders water: splits the world pass for the scene behind the water, before anything below is bound to the encoder)
+		if (OwnWater.ON) OwnWater.beforeTranslucent(this, this.encoder, camera, proj, clip);
 		GpuBufferSlice terrain = RenderSystem.getDynamicUniforms().writeTerrainTransform(new Matrix4f(view), atlas.getWidth(0), atlas.getHeight(0));
 		try (MemoryStack stack = MemoryStack.stackPush()) {
 			long u = stack.nmalloc(8, 8 * 8);

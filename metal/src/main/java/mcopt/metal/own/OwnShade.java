@@ -87,6 +87,7 @@ public final class OwnShade {
 	static void frame(OwnTerrain t, CameraRenderState camera, long u, long d, long atlas, long atlasSampler, long light, long lightSampler, int k, int atlasW, int atlasH,
 		boolean cpuClip, boolean fat) {
 		frameActive = false;
+		if (OwnWater.ON) OwnWater.off();
 		if (t.changedCount() > 0) geomDirty = true;
 		if (failed) return;
 		Minecraft mc = Minecraft.getInstance();
@@ -95,6 +96,7 @@ public final class OwnShade {
 		postOwner = t;
 		lastOwner = t;
 		OwnLight.update(sky.sunAngle, 1.0f - sky.rainBrightness, camera.fogType == FogType.WATER);
+		if (OwnWater.ON && !fat) OwnWater.beginFrame(t, camera, sky);  // (the water's frame block: independent of the sun, so before the no-sun return below)
 		if (fat) {
 			if (!said) System.out.println("mcopt-shaders: not with -Dmcopt.own.fat (lists of instances), off");
 			said = true;
