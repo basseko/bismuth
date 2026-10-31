@@ -108,10 +108,11 @@ public final class OwnSky {
 			}
 		}
 		float[] acc = hAcc;
+		if (LOG && (frameNo % 600) == 1) System.out.println("mcopt-shaders: sky horizon radiance*exposure " + acc[0] * 0.8f + " " + acc[1] * 0.8f + " " + acc[2] * 0.8f + " exp " + (EXPOSURE * (0.55f + 0.45f * smooth(0.05f, 0.5f, sinEl))) + " sinEl " + sinEl);
 		exposure = EXPOSURE * (0.55f + 0.45f * smooth(0.05f, 0.5f, sinEl)) * (1.0f - 0.3f * rain);
 		float mx = Math.max(sunTrans[0], Math.max(sunTrans[1], Math.max(sunTrans[2], 1e-3f)));
 		for (int k = 0; k < 3; k++) warmTint[k] = sunTrans[k] / mx;
-		warm = WARM * (1.0f - smooth(0.0f, 0.42f, sinEl)) * smooth(-0.12f, 0.03f, sinEl);
+		warm = WARM * (1.0f - smooth(0.0f, 0.6f, sinEl)) * smooth(-0.12f, 0.03f, sinEl);
 		float[] d = new float[3];
 		// the daytime grade (terrain.metal skLift) at the horizon's elevation of the table sample (0.05)
 		float day = smooth(0.12f, 0.55f, sinEl), lw = (float) Math.pow(0.95, 9);
@@ -207,6 +208,7 @@ public final class OwnSky {
 					sunScreen[1] = 0.5f + 0.5f * sd / (sf * ty);
 					float off = Math.max(Math.abs(sunScreen[0] - 0.5f), Math.abs(sunScreen[1] - 0.5f)) * 2.0f;  // 1 at the screen's edge
 					sunScreen[2] = Math.min(1.0f, sf * 4.0f) * (1.0f - smooth(1.2f, 3.2f, off));
+					if (LOG && (frameNo % 600) == 1) System.out.println("mcopt-shaders: sun on screen " + sunScreen[0] + " " + sunScreen[1] + " w " + sunScreen[2]);
 				} else {
 					sunScreen[2] = 0;
 				}
@@ -214,7 +216,7 @@ public final class OwnSky {
 			float night = 1.0f - smooth(-0.32f, -0.05f, sinEl);
 			// clouds
 			boolean clouds = cloudsWanted();
-			float cover = CLOUD_COVER + (1.0f - CLOUD_COVER) * rain * 0.9f;
+			float cover = CLOUD_COVER * (1.0f - MORN_CLOUD * morning() * (1.0f - rain)) + (1.0f - CLOUD_COVER) * rain * 0.9f;
 			MemoryUtil.memPutFloat(p + 112, CLOUD_Y0);
 			MemoryUtil.memPutFloat(p + 116, CLOUD_Y1);
 			MemoryUtil.memPutFloat(p + 120, cover);
@@ -334,6 +336,13 @@ public final class OwnSky {
 	/** Haze density of this frame (1 / blocks). */
 	static float hazeDensity() {
 		float len = HAZE_CLEAR + (HAZE_RAIN - HAZE_CLEAR) * rain;
-		return 1.0f / len;
+		return 1.0f / (len * (1.0f + MORN_HAZE * morning() * (1.0f - rain)));
 	}
+
+	/** A clear mid-morning sun (terrain.metal skMorn): 0..1. */
+	static float morning() {
+		return smooth(0.08f, 0.2f, sinEl) * (1.0f - smooth(0.5f, 0.8f, sinEl));
+	}
+	static final float MORN_CLOUD = Float.parseFloat(System.getProperty("mcopt.shaders.sky.mornCloud", "0.25"));
+	static final float MORN_HAZE = Float.parseFloat(System.getProperty("mcopt.shaders.sky.mornHaze", "0.8"));
 }

@@ -2373,6 +2373,20 @@ static float3 skLift(float3 c, float e, float sunY) {
 	return c + mix(float3(0.26, 0.17, 0.0), float3(0.10, 0.80, 4.0), w) * day;
 }
 
+// a clear morning (sun 5 to 50 degrees up): the single-scattering table is much too neutral overhead and its white horizon band too tall next to what the eye
+// sees (a deep blue zenith that shades into a pale warm horizon). 0..1, 1 in the mid morning; OwnSky.morning() is its CPU twin.
+static float skMorn(float sunY) {
+	return smoothstep(0.08, 0.2, sunY) * (1.0 - smoothstep(0.5, 0.8, sunY));
+}
+
+// the morning's blue: the red and green radiance falls off toward the zenith (the table's grey there is the multiple scattering term, which is not blue enough)
+static float3 skBlue(float3 rad, float e, float cs, float sunY, float rain) {
+	// (cs: the cosine to the sun: the horizon away from it is blue too, toward it stays warm and pale)
+	float m = skMorn(sunY) * (1.0 - rain), z = max(pow(saturate(e), 0.5), 0.7 * saturate(0.5 - 0.5 * cs));
+	// (and the white band along the horizon, which the tone curve saturates, is dimmed so that it keeps a colour)
+	return rad * mix(float3(1.0), float3(0.5, 0.8, 1.2), m * z) * (1.0 - 0.5 * m * (1.0 - smoothstep(0.0, 0.35, e)));
+}
+
 // overcast: the sky's colour turns grey and dull in rain
 static float3 skOvercast(float3 sky, float rain) {
 	float lum = dot(sky, float3(0.3, 0.59, 0.11));
@@ -2387,7 +2401,8 @@ static float3 skWarm(float3 d, float4 warm) {
 
 static float3 skHaze(texture2d<float> lut, float3 dir, float3 sunDir, float exposure, float rain, float4 warm) {
 	float sy = clamp(dir.y, 0.025, 0.29);  // (sin of an elevation of 1.5 to 17 degrees)
-	return skOvercast(skWarm(skTone(skLift(lut.sample(skSmp, skUvS(dir.xz, sy, sunDir), level(0.0)).rgb * exposure, sy, sunDir.y)), warm), rain);
+	float3 h = skOvercast(skWarm(skTone(skLift(skBlue(lut.sample(skSmp, skUvS(dir.xz, sy, sunDir), level(0.0)).rgb * exposure, sy, dot(dir, sunDir), sunDir.y, rain), sy, sunDir.y)), warm), rain);
+	return h * mix(float3(1.0), float3(0.9, 0.96, 1.06), skMorn(sunDir.y) * (1.0 - rain));  // (the far hills of a morning go a little blue, not white)
 }
 #endif
 
@@ -2565,7 +2580,7 @@ static float3 wSkyAt(float3 d, float3 horizon, constant WaterFrame &wf, constant
 	if (F_SHADE) {
 		float e = max(d.y, 0.012);
 		float3 rad = lut.sample(skSmp, skUvS(d.xz, e, sf.sunTrue.xyz), level(0.0)).rgb * sf.haze.z;
-		return skOvercast(skWarm(skTone(skLift(rad, e, sf.sunTrue.y)), sf.skyWarm), sf.sunTrue.w) * wf.skyTop.w;
+		return skOvercast(skWarm(skTone(skLift(skBlue(rad, e, dot(d, sf.sunTrue.xyz), sf.sunTrue.y, sf.sunTrue.w), e, sf.sunTrue.y)), sf.skyWarm), sf.sunTrue.w) * wf.skyTop.w;
 	}
 	return skyRadiance(d, horizon, wf);
 }
@@ -2666,7 +2681,12 @@ static float4 waterSurface(VOut in, float3 gnRaw, float3 tint, float3 lm, float 
 		float m = 1.0 - saturate(dot(-v, H));
 		float Fh = 0.02 + 0.98 * m * m * m * m * m;
 		float sp = min(D * Fh / (4.0 * cv) * step(0.001, NL), 6.0);
-		col += wf.sunColor.rgb * (sp * wf.sunColor.w * S * mix(0.2, 1.0, access));
+		// the glare: the sun's reflection seen through the wave field spreads over a wide patch (the facets' normals scatter it), far above white, so the
+		// bloom of the colour pass picks it up (a Blinn lobe pair: a hot core and a broad skirt; the narrow GGX above is the glitter on the ripples)
+		float3 Ns = normalize(gnf + (Nf - gnf) * 0.3);  // (the swell without the ripples: the glare is one patch, the ripples break it up)
+		float NHs = saturate(dot(Ns, H));
+		float gl = (4.0 * pow(NHs, 140.0) + 1.3 * pow(NHs, 12.0)) * (0.45 + 0.55 * pow(NH, 14.0)) + 1.0 * pow(NH, 180.0);
+		col += wf.sunColor.rgb * ((sp + gl * step(0.001, NL)) * wf.sunColor.w * S * mix(0.2, 1.0, access));
 	}
 	return float4(col / alpha, alpha);
 }
@@ -4126,6 +4146,7 @@ fragment half4 post_fs(PostV in [[stage_in]], half4 dst [[color(0)]], constant P
 // the way up adds a 3x3 tent of the smaller level to the bigger one (into a second set of textures: in-place read_write was garbage here). The last level (1/4 of the screen) also gets the light shafts in its alpha:
 // a radial march from the pixel toward the sun through the sky mask (Mitchell 2007, "Light shaft rendering", GPU Gems 3 ch. 13 in the idea), weighted
 // toward the sun so what stands between the pixel and the sun (leaves, trunks, hills) blocks the light.
+constant float SHAFT_FAN = 0.05;
 constexpr sampler blS(filter::linear, address::clamp_to_edge);
 
 kernel void bloom_down(texture2d<float> src [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]], constant uint &first [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
@@ -4173,10 +4194,14 @@ kernel void bloom_up(texture2d<float> lowT [[texture(0)]], texture2d<float> high
 			// march from the pixel to the sun (at most 0.55 of the screen), samples nearer the sun count more
 			float2 stepv = d * min(1.0, 0.55 / max(dist, 1e-3)) / float(N);
 			float2 p = uv + stepv * (0.5 + 0.5 * fract(52.9829189 * fract(dot(float2(gid), float2(0.06711056, 0.00583715)))));
+			// the march is a cone, not a line: the offset across the ray grows with the way travelled (fan half-angle 0.05, a different line per pixel), so a single
+			// small gap in the canopy near the sun spreads into a soft fan and not a hard one-pixel streak along the line through the sun
+			float2 perp = float2(-da.y / f.sz.z, da.x) / max(dist, 1e-3);
+			float jf = (fract(52.9829189 * fract(dot(float2(gid) + 17.0, float2(0.00583715, 0.06711056)))) * 2.0 - 1.0) * SHAFT_FAN * min(dist, 0.55) / float(N);
 			for (int i = 0; i < N; i++) {
 				float w = float(i + 1);
 				w *= w;
-				acc += srcTex.sample(blS, p).a * w;
+				acc += srcTex.sample(blS, p + perp * (jf * float(i + 1))).a * w;
 				wsum += w;
 				p += stepv;
 			}
@@ -4336,6 +4361,9 @@ static float4 skClouds(texture2d<float> nz, float3 dir, constant SkyFrame &f, fl
 	float cosS = dot(dir, sunDir);
 	float hgF = skHg(cosS, 0.62);  // the forward lobe: silver linings toward the sun
 	float3 sunC = f.cloudSun.rgb;
+	// the twilight: the sky overhead behind a low sun is violet and pink (what is left of the sky's light is the blue-red band of the Earth's shadow), so the shaded
+	// sides and the undersides of the clouds are lit violet, not brown
+	float3 twVio = float3(0.50, 0.29, 0.48) * (1.0 - smoothstep(0.0, 0.25, sunDir.y)) * smoothstep(-0.14, -0.02, sunDir.y) * (1.0 - f.sunCol.w);
 	float T = 1.0;
 	float3 col = float3(0.0);
 	for (int i = 0; i < N; i++) {
@@ -4350,6 +4378,7 @@ static float4 skClouds(texture2d<float> nz, float3 dir, constant SkyFrame &f, fl
 			float od = (l1 * 70.0 + l2 * 140.0) * 0.032;
 			float lightT = 0.7 * exp(-od) + 0.3 * exp(-od * 0.2);  // (two octaves: the second is the multiply scattered light that fills a thick cloud's shadowed side; Hillaire 2016)
 			float3 c = sunC * (lightT * (0.62 + 2.2 * hgF)) + ambCol * (0.38 + 0.62 * hf);
+			c += twVio * (0.4 + 0.6 * hf);
 			c = mix(c, float3(0.50, 0.55, 0.58) * (0.8 + 0.2 * hf), f.sunCol.w * 0.9);  // overcast: even grey light
 			float a = 1.0 - exp(-d * min(dt, 140.0) * 0.05);  // (a long slanted path is not more cloud: the slab's horizontal variation is already in d)
 			col += T * a * c;
@@ -4373,6 +4402,8 @@ fragment float4 cloud_fs(SkyV in [[stage_in]], constant SkyFrame &f [[buffer(0)]
 	float3 S = f.sun.xyz;
 	float exposure = f.nightH.w;
 	float3 amb = (0.5 + 0.5 * skTone(lut.sample(skSmp, skUvS(float2(0.0, 1.0), 0.93, S), level(0.0)).rgb * exposure)) * f.cloudAmb.rgb * 0.85;
+	// the twilight: the sky overhead behind a low sun is violet and pink (the sunlit side of the atmosphere is far away, what is left is the Earth's shadow's
+	// blue-red band), so the shaded sides and the flat undersides of the clouds are lit violet, not brown
 	return skClouds(noise, dir, f, S, amb, in.pos.xy);
 }
 
@@ -4398,8 +4429,13 @@ fragment float4 sky_fs(SkyV in [[stage_in]], constant SkyFrame &f [[buffer(0)]],
 		cl = 0.25 * (cloudTex.sample(skSmp, cuv + tx * float2(-1.0, -1.0), level(0.0)) + cloudTex.sample(skSmp, cuv + tx * float2(1.0, -1.0), level(0.0))
 			+ cloudTex.sample(skSmp, cuv + tx * float2(-1.0, 1.0), level(0.0)) + cloudTex.sample(skSmp, cuv + tx * float2(1.0, 1.0), level(0.0)));
 	}
-	float3 c = skLift(rad, e, S.y);
-	float3 sky = skWarm(skTone(c), float4(f.sunCol.rgb / max(max(f.sunCol.r, f.sunCol.g), max(f.sunCol.b, 1e-3)), f.cloudAmb.w));
+	float3 c = skLift(skBlue(rad, e, cs, S.y, f.sunCol.w), e, S.y);
+	// twilight: away from a low sun the sky is violet and pink (the Earth's shadow band), not the sun's orange: the warm desaturation fades there and a violet cast
+	// takes its place (OwnSky.horizon, the CPU twin for the haze, is left as it is)
+	float anti = saturate(0.85 - 0.85 * cs) * (1.0 - f.sunCol.w);
+	float twi = (1.0 - smoothstep(0.0, 0.25, S.y)) * smoothstep(-0.14, -0.02, S.y);
+	float3 sky = skWarm(skTone(c), float4(f.sunCol.rgb / max(max(f.sunCol.r, f.sunCol.g), max(f.sunCol.b, 1e-3)), f.cloudAmb.w * (1.0 - 0.85 * twi * anti)));
+	sky *= mix(float3(1.0), float3(1.7, 0.9, 1.75), twi * anti * smoothstep(-0.1, 0.2, e));
 	// night: a faint blue gradient where the sun's light has faded
 	float3 nightC = mix(f.nightH.rgb, f.night.rgb, saturate(e * 2.5)) * f.night.w;
 	sky = sky + nightC * (1.0 - sky);

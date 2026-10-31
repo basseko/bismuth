@@ -53,8 +53,8 @@ public final class OwnWater {
 	static final int COPY = "full".equals(System.getProperty("mcopt.shaders.water.copy")) ? 2 : 1;
 	/** Keep vanilla's blue screen overlay under water. */
 	public static final boolean OVERLAY = Boolean.getBoolean("mcopt.shaders.water.overlay");
-	static final float WAVES = prop("mcopt.shaders.water.waves", 0.6f), ABSORB = prop("mcopt.shaders.water.absorb", 1.0f), GLITTER = prop("mcopt.shaders.water.glitter", 0.7f),
-		BODY = prop("mcopt.shaders.water.body", 1.0f), SKY = prop("mcopt.shaders.water.sky", 1.0f), MURK = prop("mcopt.shaders.water.murk", 1.0f),
+	static final float WAVES = prop("mcopt.shaders.water.waves", 0.6f), ABSORB = prop("mcopt.shaders.water.absorb", 0.7f), GLITTER = prop("mcopt.shaders.water.glitter", 0.7f),
+		BODY = prop("mcopt.shaders.water.body", 0.7f), SKY = prop("mcopt.shaders.water.sky", 1.0f), MURK = prop("mcopt.shaders.water.murk", 1.0f),
 		CAUSTIC = prop("mcopt.shaders.water.caustic", 0.5f), THICK = prop("mcopt.shaders.water.thick", 0.6f);
 	static final float[] FOG = parse3(System.getProperty("mcopt.shaders.water.fog", "0.26,0.35,0.36"));
 
