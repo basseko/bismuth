@@ -744,14 +744,14 @@ extern int mc_tl_restart_ok(Enc *enc);
 // scene: the draw is a translucent one (the only kind that reads the scene); the opaque draws under water get the dummies
 static id<MTLTexture> blGlareTex(void);
 static void ownBindWater(id<MTLRenderCommandEncoder> r, id<MTLTexture> light, id<MTLSamplerState> lightSampler, bool scene) {
-	[r setFragmentBytes:wat.frame length:(NSUInteger) wat.frameLen atIndex:12];
-	[r setFragmentTexture:scene && wat.scene && (wat.depth || wat.tileOn) ? wat.scene : wat.dummyCol atIndex:27];
-	[r setFragmentTexture:scene && wat.scene && wat.depth ? wat.depth : wat.dummyDepth atIndex:28];
-	[r setFragmentTexture:light atIndex:17];
-	[r setFragmentSamplerState:lightSampler atIndex:15];
+	mce_set_fragment_bytes(r, wat.frame, (NSUInteger) wat.frameLen, 12);
+	mce_set_fragment_texture(r, scene && wat.scene && (wat.depth || wat.tileOn) ? wat.scene : wat.dummyCol, 27);
+	mce_set_fragment_texture(r, scene && wat.scene && wat.depth ? wat.depth : wat.dummyDepth, 28);
+	mce_set_fragment_texture(r, light, 17);
+	mce_set_fragment_sampler(r, lightSampler, 15);
 	// the HDR side channel (track water): this frame's glare texture, written by the tile water fragments (fragment texture 26)
 	id<MTLTexture> gt = blGlareTex();
-	[r setFragmentTexture:gt ? gt : wat.dummyGlare atIndex:26];
+	mce_set_fragment_texture(r, gt ? gt : wat.dummyGlare, 26);
 }
 
 // The frag occlusion's mesh-stage resources for a draw of kind (bit 27 phase A, 28 phase B; bit 0 the layer): terrain.metal FragOcc.
@@ -2229,7 +2229,7 @@ int mcs_init(Own *w, int res, int layers, int ring) {
 	if (sh.tex[0] && sh.res == res && sh.layers == layers && sh.ring == ring) return 1;
 	@autoreleasepool {
 		for (int i = 0; i < SHADE_RING; i++) {
-			[sh.tex[i] release];
+			mce_release(sh.tex[i]);
 			sh.tex[i] = nil;
 		}
 		sh.cur = nil;
@@ -2240,7 +2240,7 @@ int mcs_init(Own *w, int res, int layers, int ring) {
 			d.arrayLength = (NSUInteger) layers;
 			d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
 			d.storageMode = MTLStorageModePrivate;
-			sh.tex[i] = [w->ctx->device newTextureWithDescriptor:d];
+			sh.tex[i] = [w->ctx->device newTextureWithDescriptor:d]; mce_make_resident(sh.tex[i]);
 			if (!sh.tex[i]) return 0;
 			sh.tex[i].label = [NSString stringWithFormat:@"shade shadow map %d", i];
 		}
@@ -2278,22 +2278,22 @@ int mcs_shadow_cull(Own *w, Enc *enc, const void *cullFrame, int cullLength, con
 	@autoreleasepool {
 		id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];
 		c.label = @"shade shadow cull";
-		[c setBytes:cullFrame length:(NSUInteger) cullLength atIndex:0];
-		[c setBuffer:sections offset:0 atIndex:1];
-		[c setBuffer:recs offset:0 atIndex:2];
-		[c setBuffer:args offset:0 atIndex:3];
-		[c setBuffer:lists offset:0 atIndex:4];
-		[c setComputePipelineState:w->reset];
-		[c dispatchThreads:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(4, 1, 1)];
-		[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-		[c setBytes:cull length:(NSUInteger) cullBytes atIndex:0];
-		[c setComputePipelineState:pso];
-		[c dispatchThreads:MTLSizeMake((NSUInteger) recCap, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-		[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-		[c setBytes:cullFrame length:(NSUInteger) cullLength atIndex:0];
-		[c setComputePipelineState:w->finish];
-		[c dispatchThreads:MTLSizeMake(2, 1, 1) threadsPerThreadgroup:MTLSizeMake(2, 1, 1)];
-		[c endEncoding];
+		mce_set_compute_bytes(c, cullFrame, (NSUInteger) cullLength, 0);
+		mce_set_compute_buffer(c, sections, 0, 1);
+		mce_set_compute_buffer(c, recs, 0, 2);
+		mce_set_compute_buffer(c, args, 0, 3);
+		mce_set_compute_buffer(c, lists, 0, 4);
+		[mce_raw(c) setComputePipelineState:w->reset];
+		mce_dispatch_threads(c, MTLSizeMake(4, 1, 1), MTLSizeMake(4, 1, 1));
+		mce_memory_barrier(c, MTLBarrierScopeBuffers);
+		mce_set_compute_bytes(c, cull, (NSUInteger) cullBytes, 0);
+		[mce_raw(c) setComputePipelineState:pso];
+		mce_dispatch_threads(c, MTLSizeMake((NSUInteger) recCap, 1, 1), MTLSizeMake(64, 1, 1));
+		mce_memory_barrier(c, MTLBarrierScopeBuffers);
+		mce_set_compute_bytes(c, cullFrame, (NSUInteger) cullLength, 0);
+		[mce_raw(c) setComputePipelineState:w->finish];
+		mce_dispatch_threads(c, MTLSizeMake(2, 1, 1), MTLSizeMake(2, 1, 1));
+		mce_end_encoder(c);
 	}
 	return 1;
 }
@@ -2315,10 +2315,10 @@ int mcs_shadow_pass(Own *w, Enc *enc, int k, int slice, const void *frame, int f
 		rp.depthAttachment.loadAction = MTLLoadActionClear;
 		rp.depthAttachment.clearDepth = 1.0;
 		rp.depthAttachment.storeAction = MTLStoreActionStore;
-		id<MTLRenderCommandEncoder> r = [mc_pre(enc) renderCommandEncoderWithDescriptor:rp];
-		r.label = [NSString stringWithFormat:@"shade shadow c%d", slice];
-		[r setViewport:(MTLViewport) {0, 0, (double) sh.res, (double) sh.res, 0, 1}];
-		[r setDepthClipMode:MTLDepthClipModeClamp];
+		id<MTLRenderCommandEncoder> r = [mce_new_render_encoder(mc_pre(enc), rp) autorelease];
+		[mce_raw(r) setLabel:[NSString stringWithFormat:@"shade shadow c%d", slice]];
+		[mce_raw(r) setViewport:(MTLViewport) {0, 0, (double) sh.res, (double) sh.res, 0, 1}];
+		[mce_raw(r) setDepthClipMode:MTLDepthClipModeClamp];
 		Enc fake;
 		memset(&fake, 0, sizeof fake);
 		fake.ctx = enc->ctx;
@@ -2333,7 +2333,7 @@ int mcs_shadow_pass(Own *w, Enc *enc, int k, int slice, const void *frame, int f
 			int rc = mco_draw(w, &fake, kinds[layer], d, frameLength, arena, sections, recs, lists, args, layer * 20, u, atlas, atlasSampler, light, lightSampler, nil, err, errCap);
 			if (rc < 0) result = -1;
 		}
-		[r endEncoding];
+		mce_end_encoder(r);
 	}
 	return result;
 }
@@ -2373,10 +2373,10 @@ static struct {
 } vol;
 
 static void blFree(void) {
-	for (int i = 0; i < 2; i++) { [bl.src[i] release]; bl.src[i] = nil; }
-	for (int i = 0; i < 4; i++) { [bl.lv[i] release]; bl.lv[i] = nil; }
-	for (int i = 0; i < 3; i++) { [bl.ut[i] release]; bl.ut[i] = nil; }
-	for (int i = 0; i < 2; i++) { [bl.gl[i] release]; bl.gl[i] = nil; }
+	for (int i = 0; i < 2; i++) { mce_release(bl.src[i]); bl.src[i] = nil; }
+	for (int i = 0; i < 4; i++) { mce_release(bl.lv[i]); bl.lv[i] = nil; }
+	for (int i = 0; i < 3; i++) { mce_release(bl.ut[i]); bl.ut[i] = nil; }
+	for (int i = 0; i < 2; i++) { mce_release(bl.gl[i]); bl.gl[i] = nil; }
 }
 
 // the glare texture this frame's water draws write (the post pass of this frame, which advances bl.frame, comes after them)
@@ -2388,7 +2388,7 @@ static id<MTLTexture> blTex(Own *w, MTLPixelFormat pf, NSUInteger tw, NSUInteger
 	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:tw height:th mipmapped:NO];
 	d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
 	d.storageMode = MTLStorageModePrivate;
-	id<MTLTexture> t = [w->ctx->device newTextureWithDescriptor:d];
+	id<MTLTexture> t = [w->ctx->device newTextureWithDescriptor:d]; mce_make_resident(t);
 	t.label = label;
 	return t;
 }
@@ -2423,13 +2423,13 @@ static int blEnsure(Own *w, Enc *enc) {
 	mc_pre_end_encoders(enc);
 	id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];
 	c.label = @"shade bloom clear";
-	[c setComputePipelineState:bl.clear];
+	[mce_raw(c) setComputePipelineState:bl.clear];
 	id<MTLTexture> all[11] = {bl.src[0], bl.src[1], bl.lv[0], bl.lv[1], bl.lv[2], bl.lv[3], bl.ut[0], bl.ut[1], bl.ut[2], bl.gl[0], bl.gl[1]};
 	for (int i = 0; i < 11; i++) {
-		[c setTexture:all[i] atIndex:0];
-		[c dispatchThreads:MTLSizeMake(all[i].width, all[i].height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+		mce_set_compute_texture(c, all[i], 0);
+		mce_dispatch_threads(c, MTLSizeMake(all[i].width, all[i].height, 1), MTLSizeMake(16, 8, 1));
 	}
-	[c endEncoding];
+	mce_end_encoder(c);
 	return 1;
 }
 
@@ -2441,38 +2441,38 @@ static void blChain(Own *w, Enc *enc, id<MTLTexture> prev, id<MTLTexture> glareR
 	id<MTLTexture> in = prev;
 	uint32_t one = 1, zero = 0;
 	// the glare texture this frame's water will write is cleared first (this runs in the pre buffer, before the world pass)
-	[c setComputePipelineState:bl.clear];
-	[c setTexture:glareClear atIndex:0];
-	[c dispatchThreads:MTLSizeMake(glareClear.width, glareClear.height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
-	[c setComputePipelineState:bl.down];
-	[c setTexture:glareRead atIndex:2];
+	[mce_raw(c) setComputePipelineState:bl.clear];
+	mce_set_compute_texture(c, glareClear, 0);
+	mce_dispatch_threads(c, MTLSizeMake(glareClear.width, glareClear.height, 1), MTLSizeMake(16, 8, 1));
+	[mce_raw(c) setComputePipelineState:bl.down];
+	mce_set_compute_texture(c, glareRead, 2);
 	for (int i = 0; i < 4; i++) {
-		[c setTexture:in atIndex:0];
-		[c setTexture:bl.lv[i] atIndex:1];
-		[c setBytes:(i == 0 ? &one : &zero) length:4 atIndex:1];
+		mce_set_compute_texture(c, in, 0);
+		mce_set_compute_texture(c, bl.lv[i], 1);
+		mce_set_compute_bytes(c, (i == 0 ? &one : &zero), 4, 1);
 		float gg = i == 0 ? glareGain : 0.0f;
-		[c setBytes:&gg length:4 atIndex:2];
-		[c dispatchThreads:MTLSizeMake(bl.lv[i].width, bl.lv[i].height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+		mce_set_compute_bytes(c, &gg, 4, 2);
+		mce_dispatch_threads(c, MTLSizeMake(bl.lv[i].width, bl.lv[i].height, 1), MTLSizeMake(16, 8, 1));
 		in = bl.lv[i];
 	}
-	[c setComputePipelineState:bl.up];
-	[c setBytes:params length:(NSUInteger) length atIndex:0];
-	[c setTexture:prev atIndex:2];
+	[mce_raw(c) setComputePipelineState:bl.up];
+	mce_set_compute_bytes(c, params, (NSUInteger) length, 0);
+	mce_set_compute_texture(c, prev, 2);
 	for (int i = 3; i > 0; i--) {
-		[c setTexture:(i == 3 ? bl.lv[3] : bl.ut[i]) atIndex:0];
-		[c setTexture:bl.lv[i - 1] atIndex:1];
-		[c setTexture:bl.ut[i - 1] atIndex:3];
-		[c setBytes:(i == 1 ? &one : &zero) length:4 atIndex:1];
-		[c dispatchThreads:MTLSizeMake(bl.lv[i - 1].width, bl.lv[i - 1].height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+		mce_set_compute_texture(c, (i == 3 ? bl.lv[3] : bl.ut[i]), 0);
+		mce_set_compute_texture(c, bl.lv[i - 1], 1);
+		mce_set_compute_texture(c, bl.ut[i - 1], 3);
+		mce_set_compute_bytes(c, (i == 1 ? &one : &zero), 4, 1);
+		mce_dispatch_threads(c, MTLSizeMake(bl.lv[i - 1].width, bl.lv[i - 1].height, 1), MTLSizeMake(16, 8, 1));
 	}
 	// and the glare texture just read is cleared too: whichever of the two the water writes next starts empty whatever the order of frames and passes
 	// (a missed clear left old glare in it, which the bloom then added every frame: bright trails of the river's glare across the terrain)
 	if (glareRead != glareClear) {
-		[c setComputePipelineState:bl.clear];
-		[c setTexture:glareRead atIndex:0];
-		[c dispatchThreads:MTLSizeMake(glareRead.width, glareRead.height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+		[mce_raw(c) setComputePipelineState:bl.clear];
+		mce_set_compute_texture(c, glareRead, 0);
+		mce_dispatch_threads(c, MTLSizeMake(glareRead.width, glareRead.height, 1), MTLSizeMake(16, 8, 1));
 	}
-	[c endEncoding];
+	mce_end_encoder(c);
 }
 
 // This frame's volumetric request: a VolFrame (terrain.metal; length 0: none this frame), hist 1: the previous frame also asked (its scene copy is this frame's source).
@@ -2493,8 +2493,8 @@ static int volMarch(Own *w, Enc *enc, id<MTLTexture> src) {
 	if (!pso) return 0;
 	NSUInteger qw = ((NSUInteger) enc->width + 3) / 4, qh = ((NSUInteger) enc->height + 3) / 4;
 	if (!vol.out || vol.w != qw || vol.h != qh) {
-		[vol.out release];
-		[vol.dist release];
+		mce_release(vol.out);
+		mce_release(vol.dist);
 		vol.out = blTex(w, MTLPixelFormatRGBA16Float, qw, qh, @"shade volumetric light");
 		vol.dist = blTex(w, MTLPixelFormatR16Float, qw, qh, @"shade volumetric distance");
 		vol.w = qw;
@@ -2504,15 +2504,15 @@ static int volMarch(Own *w, Enc *enc, id<MTLTexture> src) {
 	mc_pre_end_encoders(enc);
 	id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];
 	c.label = @"shade volumetric";
-	[c setComputePipelineState:pso];
-	[c setTexture:src atIndex:0];
-	[c setTexture:sh.cur atIndex:1];
-	[c setTexture:vol.out atIndex:2];
-	[c setTexture:vol.dist atIndex:3];
-	[c setBytes:vol.frame length:128 atIndex:0];
-	[c setBytes:sh.frame length:(NSUInteger) sh.frameLen atIndex:1];
-	[c dispatchThreads:MTLSizeMake(qw, qh, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
-	[c endEncoding];
+	[mce_raw(c) setComputePipelineState:pso];
+	mce_set_compute_texture(c, src, 0);
+	mce_set_compute_texture(c, sh.cur, 1);
+	mce_set_compute_texture(c, vol.out, 2);
+	mce_set_compute_texture(c, vol.dist, 3);
+	mce_set_compute_bytes(c, vol.frame, 128, 0);
+	mce_set_compute_bytes(c, sh.frame, (NSUInteger) sh.frameLen, 1);
+	mce_dispatch_threads(c, MTLSizeMake(qw, qh, 1), MTLSizeMake(16, 8, 1));
+	mce_end_encoder(c);
 	return 1;
 }
 
@@ -2529,7 +2529,7 @@ static int fgEnsure(Own *w, Enc *enc) {
 	NSUInteger W = (NSUInteger) enc->width, H = (NSUInteger) enc->height;
 	if (fg.failed) return 0;
 	if (fg.src && fg.w == W && fg.h == H) return 1;
-	[fg.src release]; [fg.d[0] release]; [fg.d[1] release]; [fg.up release];
+	mce_release(fg.src); mce_release(fg.d[0]); mce_release(fg.d[1]); mce_release(fg.up);
 	fg.src = fg.d[0] = fg.d[1] = fg.up = nil;
 	fg.w = W;
 	fg.h = H;
@@ -2546,13 +2546,13 @@ static int fgEnsure(Own *w, Enc *enc) {
 	mc_pre_end_encoders(enc);
 	id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];
 	c.label = @"shade fog clear";
-	[c setComputePipelineState:fg.clear];
+	[mce_raw(c) setComputePipelineState:fg.clear];
 	id<MTLTexture> all[4] = {fg.src, fg.d[0], fg.d[1], fg.up};
 	for (int i = 0; i < 4; i++) {
-		[c setTexture:all[i] atIndex:0];
-		[c dispatchThreads:MTLSizeMake(all[i].width, all[i].height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+		mce_set_compute_texture(c, all[i], 0);
+		mce_dispatch_threads(c, MTLSizeMake(all[i].width, all[i].height, 1), MTLSizeMake(16, 8, 1));
 	}
-	[c endEncoding];
+	mce_end_encoder(c);
 	return 1;
 }
 
@@ -2562,24 +2562,24 @@ static void fgChain(Own *w, Enc *enc) {
 	c.label = @"shade fog blur";
 	uint32_t zero = 0;
 	float gz = 0.0f;
-	[c setComputePipelineState:fg.down];
+	[mce_raw(c) setComputePipelineState:fg.down];
 	id<MTLTexture> in = fg.src;
 	for (int i = 0; i < 2; i++) {
-		[c setTexture:in atIndex:0];
-		[c setTexture:fg.d[i] atIndex:1];
-		[c setBytes:&zero length:4 atIndex:1];
+		mce_set_compute_texture(c, in, 0);
+		mce_set_compute_texture(c, fg.d[i], 1);
+		mce_set_compute_bytes(c, &zero, 4, 1);
 		// (bloom_down's water glare input, track water: off here, but bound so the arguments are complete)
-		[c setTexture:fg.src atIndex:2];
-		[c setBytes:&gz length:4 atIndex:2];
-		[c dispatchThreads:MTLSizeMake(fg.d[i].width, fg.d[i].height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+		mce_set_compute_texture(c, fg.src, 2);
+		mce_set_compute_bytes(c, &gz, 4, 2);
+		mce_dispatch_threads(c, MTLSizeMake(fg.d[i].width, fg.d[i].height, 1), MTLSizeMake(16, 8, 1));
 		in = fg.d[i];
 	}
-	[c setComputePipelineState:fg.upk];
-	[c setTexture:fg.d[1] atIndex:0];
-	[c setTexture:fg.d[0] atIndex:1];
-	[c setTexture:fg.up atIndex:3];
-	[c dispatchThreads:MTLSizeMake(fg.up.width, fg.up.height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
-	[c endEncoding];
+	[mce_raw(c) setComputePipelineState:fg.upk];
+	mce_set_compute_texture(c, fg.d[1], 0);
+	mce_set_compute_texture(c, fg.d[0], 1);
+	mce_set_compute_texture(c, fg.up, 3);
+	mce_dispatch_threads(c, MTLSizeMake(fg.up.width, fg.up.height, 1), MTLSizeMake(16, 8, 1));
+	mce_end_encoder(c);
 }
 
 int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int length, char *err, int errCap) {
@@ -2603,7 +2603,7 @@ int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int le
 		NSUInteger tw = ((NSUInteger) enc->width + 1) / 2, th = ((NSUInteger) enc->height + 1) / 2;
 		if (!wat.tile[0] || wat.tile[0].width != tw || wat.tile[0].height != th) {
 			for (int i = 0; i < 2; i++) {
-				[wat.tile[i] release];
+				mce_release(wat.tile[i]);
 				wat.tile[i] = blTex(w, MTLPixelFormatRGBA16Float, tw, th, [NSString stringWithFormat:@"shade water tile scene %d", i]);
 			}
 			wat.tileLast = nil;
@@ -2611,7 +2611,7 @@ int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int le
 		if (wat.tile[0] && wat.tile[1]) sceneOut = wat.tile[wat.tileFrame++ & 1];
 	}
 	pbuf[40] = sceneOut ? 1.0f : 0.0f;
-	if (sceneOut) [r setFragmentTexture:sceneOut atIndex:2];
+	if (sceneOut) mce_set_fragment_texture(r, sceneOut, 2);
 	if (volWant && sceneOut && vol.hist && vol.prev && vol.prev.width == sceneOut.width && vol.prev.height == sceneOut.height && volMarch(w, enc, vol.prev)) {
 		pbuf[48] = 1.0f;
 		pbuf[49] = 1.0f / (float) vol.w;
@@ -2619,8 +2619,8 @@ int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int le
 		pbuf[52] = 1.0f;
 		pbuf[53] = ((const float *) vol.frame)[15];  // (VolFrame.p0.w: the march's maximum distance)
 		pbuf[54] = ((const float *) vol.frame)[18];  // (VolFrame.p1.z: the strength over the sky)
-		[r setFragmentTexture:vol.out atIndex:3];
-		[r setFragmentTexture:vol.dist atIndex:4];
+		mce_set_fragment_texture(r, vol.out, 3);
+		mce_set_fragment_texture(r, vol.dist, 4);
 	}
 	{
 		id<MTLTexture> np = volWant ? [sceneOut retain] : nil;  // (retained: the tile ring may be reallocated)
@@ -2630,12 +2630,12 @@ int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int le
 	if (bloom) {
 		unsigned f = bl.frame++;
 		if (pbuf[35] < 0.5f) blChain(w, enc, bl.src[(f + 1) & 1], bl.gl[(f + 1) & 1], bl.gl[f & 1], pbuf[46], params, length);  // (pbuf[35]: probe shaders.bloom.chain off, a measurement)
-		[r setFragmentTexture:bl.ut[0] atIndex:0];
-		[r setFragmentTexture:bl.src[f & 1] atIndex:1];
+		mce_set_fragment_texture(r, bl.ut[0], 0);
+		mce_set_fragment_texture(r, bl.src[f & 1], 1);
 		if (fog) {
 			fgChain(w, enc);
-			[r setFragmentTexture:fg.up atIndex:5];
-			[r setFragmentTexture:fg.src atIndex:6];
+			mce_set_fragment_texture(r, fg.up, 5);
+			mce_set_fragment_texture(r, fg.src, 6);
 		}
 	}
 	// the grade table (PostFrame.gr2.x, float 64, asked for by OwnLight): post_fs's colour maths baked into 33^3 in the pre command buffer, from this frame's block
@@ -2649,7 +2649,7 @@ int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int le
 			d.width = d.height = d.depth = 33;
 			d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
 			d.storageMode = MTLStorageModePrivate;
-			gradeLut = [w->ctx->device newTextureWithDescriptor:d];
+			gradeLut = [w->ctx->device newTextureWithDescriptor:d]; mce_make_resident(gradeLut);
 			[d release];
 			gradeLut.label = @"shade grade table";
 		}
@@ -2657,12 +2657,12 @@ int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int le
 			mc_pre_end_encoders(enc);
 			id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];
 			c.label = @"shade grade table";
-			[c setComputePipelineState:gradePso];
-			[c setBytes:pbuf length:288 atIndex:0];
-			[c setTexture:gradeLut atIndex:0];
-			[c dispatchThreads:MTLSizeMake(33, 33, 33) threadsPerThreadgroup:MTLSizeMake(4, 4, 4)];
-			[c endEncoding];
-			[r setFragmentTexture:gradeLut atIndex:7];
+			[mce_raw(c) setComputePipelineState:gradePso];
+			mce_set_compute_bytes(c, pbuf, 288, 0);
+			mce_set_compute_texture(c, gradeLut, 0);
+			mce_dispatch_threads(c, MTLSizeMake(33, 33, 33), MTLSizeMake(4, 4, 4));
+			mce_end_encoder(c);
+			mce_set_fragment_texture(r, gradeLut, 7);
 		} else {
 			pbuf[64] = 0.0f;
 		}
@@ -2704,17 +2704,17 @@ int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int le
 			dd.depthWriteEnabled = NO;
 			post.always = [w->ctx->device newDepthStencilStateWithDescriptor:dd];
 		}
-		[r pushDebugGroup:@"shade post"];
-		[r setRenderPipelineState:pso];
-		[r setDepthStencilState:post.always];
-		[r setCullMode:MTLCullModeNone];
-		[r setTriangleFillMode:MTLTriangleFillModeFill];
-		[r setDepthBias:0 slopeScale:0 clamp:0];
-		[r setViewport:(MTLViewport) {0, 0, (double) enc->width, (double) enc->height, 0, 1}];
-		[r setScissorRect:(MTLScissorRect) {0, 0, (NSUInteger) enc->width, (NSUInteger) enc->height}];
-		[r setFragmentBytes:params length:(NSUInteger) length atIndex:0];
-		[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-		[r popDebugGroup];
+		[mce_raw(r) pushDebugGroup:@"shade post"];
+		[mce_raw(r) setRenderPipelineState:pso];
+		[mce_raw(r) setDepthStencilState:post.always];
+		[mce_raw(r) setCullMode:MTLCullModeNone];
+		[mce_raw(r) setTriangleFillMode:MTLTriangleFillModeFill];
+		[mce_raw(r) setDepthBias:0 slopeScale:0 clamp:0];
+		[mce_raw(r) setViewport:(MTLViewport) {0, 0, (double) enc->width, (double) enc->height, 0, 1}];
+		[mce_raw(r) setScissorRect:(MTLScissorRect) {0, 0, (NSUInteger) enc->width, (NSUInteger) enc->height}];
+		mce_set_fragment_bytes(r, params, (NSUInteger) length, 0);
+		[mce_raw(r) drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		[mce_raw(r) popDebugGroup];
 		w->lastPso = nil;
 	}
 	if (sceneOut) {
@@ -2731,18 +2731,18 @@ int mcs_sky_init(Own *w, int lw, int lh, const uint8_t *noise, int size) {
 	if (sk.lut[0] && sk.lw == lw && sk.lh == lh) return 1;
 	@autoreleasepool {
 		for (int i = 0; i < SKY_RING; i++) {
-			[sk.lut[i] release];
+			mce_release(sk.lut[i]);
 			sk.lut[i] = nil;
 			MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:(NSUInteger) lw height:(NSUInteger) lh mipmapped:NO];
 			d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
 			d.storageMode = MTLStorageModePrivate;
-			sk.lut[i] = [w->ctx->device newTextureWithDescriptor:d];
+			sk.lut[i] = [w->ctx->device newTextureWithDescriptor:d]; mce_make_resident(sk.lut[i]);
 			if (!sk.lut[i]) return 0;
 			sk.lut[i].label = [NSString stringWithFormat:@"shade sky table %d", i];
 		}
 		for (int i = 0; i < SKY_RING; i++) {
 			if (!sk.sh[i]) {
-				sk.sh[i] = [w->ctx->device newBufferWithLength:144 options:MTLResourceStorageModePrivate];
+				sk.sh[i] = [w->ctx->device newBufferWithLength:144 options:MTLResourceStorageModePrivate]; mce_make_resident(sk.sh[i]);
 				if (!sk.sh[i]) return 0;
 				sk.sh[i].label = @"shade sky SH";
 			}
@@ -2755,7 +2755,7 @@ int mcs_sky_init(Own *w, int lw, int lh, const uint8_t *noise, int size) {
 			MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Unorm width:(NSUInteger) size height:(NSUInteger) size mipmapped:NO];
 			d.usage = MTLTextureUsageShaderRead;
 			d.storageMode = MTLStorageModeShared;
-			sk.noise = [w->ctx->device newTextureWithDescriptor:d];
+			sk.noise = [w->ctx->device newTextureWithDescriptor:d]; mce_make_resident(sk.noise);
 			if (!sk.noise) return 0;
 			sk.noise.label = @"shade cloud noise";
 			[sk.noise replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger) size, (NSUInteger) size) mipmapLevel:0 withBytes:noise bytesPerRow:(NSUInteger) size * 8];
@@ -2777,16 +2777,16 @@ int mcs_sky_lut(Own *w, Enc *enc, int k, const void *p, int length, int compute)
 			MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:32 height:32 mipmapped:NO];
 			d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
 			d.storageMode = MTLStorageModePrivate;
-			sk.ms = [w->ctx->device newTextureWithDescriptor:d];
+			sk.ms = [w->ctx->device newTextureWithDescriptor:d]; mce_make_resident(sk.ms);
 			if (!sk.ms) return 0;
 			sk.ms.label = @"shade sky multiple scattering table";
 			mc_pre_end_encoders(enc);
 			id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];
 			c.label = @"shade sky ms table";
-			[c setComputePipelineState:mp];
-			[c setTexture:sk.ms atIndex:0];
-			[c dispatchThreads:MTLSizeMake(32, 32, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-			[c endEncoding];
+			[mce_raw(c) setComputePipelineState:mp];
+			mce_set_compute_texture(c, sk.ms, 0);
+			mce_dispatch_threads(c, MTLSizeMake(32, 32, 1), MTLSizeMake(8, 8, 1));
+			mce_end_encoder(c);
 		}
 	}
 	if (!compute) {
@@ -2797,12 +2797,12 @@ int mcs_sky_lut(Own *w, Enc *enc, int k, const void *p, int length, int compute)
 	@autoreleasepool {
 		id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];
 		c.label = @"shade sky table";
-		[c setComputePipelineState:pso];
-		[c setBytes:p length:(NSUInteger) length atIndex:0];
-		[c setTexture:t atIndex:0];
-		[c setTexture:sk.ms atIndex:1];
-		[c dispatchThreads:MTLSizeMake((NSUInteger) sk.lw, (NSUInteger) sk.lh, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
-		[c endEncoding];
+		[mce_raw(c) setComputePipelineState:pso];
+		mce_set_compute_bytes(c, p, (NSUInteger) length, 0);
+		mce_set_compute_texture(c, t, 0);
+		mce_set_compute_texture(c, sk.ms, 1);
+		mce_dispatch_threads(c, MTLSizeMake((NSUInteger) sk.lw, (NSUInteger) sk.lh, 1), MTLSizeMake(16, 8, 1));
+		mce_end_encoder(c);
 	}
 	sk.cur = t;
 	return 1;
@@ -2820,12 +2820,12 @@ int mcs_sky_sh(Own *w, Enc *enc, int k, const void *p, int length, int compute) 
 		@autoreleasepool {
 			id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];
 			c.label = @"shade sky SH";
-			[c setComputePipelineState:pso];
-			[c setBytes:p length:(NSUInteger) length atIndex:0];
-			[c setBuffer:b offset:0 atIndex:1];
-			[c setTexture:t atIndex:0];
-			[c dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-			[c endEncoding];
+			[mce_raw(c) setComputePipelineState:pso];
+			mce_set_compute_bytes(c, p, (NSUInteger) length, 0);
+			mce_set_compute_buffer(c, b, 0, 1);
+			mce_set_compute_texture(c, t, 0);
+			mce_dispatch_threadgroups(c, MTLSizeMake(1, 1, 1), MTLSizeMake(256, 1, 1));
+			mce_end_encoder(c);
 		}
 	}
 	sk.shCur = b;
@@ -2874,19 +2874,19 @@ int mcs_sky_draw(Own *w, Enc *enc, const void *params, int length, char *err, in
 			dd.depthWriteEnabled = YES;
 			sk.depthState = [w->ctx->device newDepthStencilStateWithDescriptor:dd];
 		}
-		[r pushDebugGroup:@"shade sky dome"];
-		[r setRenderPipelineState:pso];
-		[r setDepthStencilState:sk.depthState];
-		[r setCullMode:MTLCullModeNone];
-		[r setTriangleFillMode:MTLTriangleFillModeFill];
-		[r setDepthBias:0 slopeScale:0 clamp:0];
-		[r setViewport:(MTLViewport) {0, 0, (double) enc->width, (double) enc->height, 0, 1}];
-		[r setScissorRect:(MTLScissorRect) {0, 0, (NSUInteger) enc->width, (NSUInteger) enc->height}];
-		[r setFragmentBytes:params length:(NSUInteger) length atIndex:0];
-		[r setFragmentTexture:sk.cur atIndex:0];
-		if (sk.cloudCur) [r setFragmentTexture:sk.cloudCur atIndex:2];
-		[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-		[r popDebugGroup];
+		[mce_raw(r) pushDebugGroup:@"shade sky dome"];
+		[mce_raw(r) setRenderPipelineState:pso];
+		[mce_raw(r) setDepthStencilState:sk.depthState];
+		[mce_raw(r) setCullMode:MTLCullModeNone];
+		[mce_raw(r) setTriangleFillMode:MTLTriangleFillModeFill];
+		[mce_raw(r) setDepthBias:0 slopeScale:0 clamp:0];
+		[mce_raw(r) setViewport:(MTLViewport) {0, 0, (double) enc->width, (double) enc->height, 0, 1}];
+		[mce_raw(r) setScissorRect:(MTLScissorRect) {0, 0, (NSUInteger) enc->width, (NSUInteger) enc->height}];
+		mce_set_fragment_bytes(r, params, (NSUInteger) length, 0);
+		mce_set_fragment_texture(r, sk.cur, 0);
+		if (sk.cloudCur) mce_set_fragment_texture(r, sk.cloudCur, 2);
+		[mce_raw(r) drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		[mce_raw(r) popDebugGroup];
 		w->lastPso = nil;
 	}
 	return 1;
@@ -2902,19 +2902,19 @@ int mcs_sky_cov(Own *w, Enc *enc, const void *params, int length) {
 			MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG16Float width:512 height:512 mipmapped:NO];
 			d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
 			d.storageMode = MTLStorageModePrivate;
-			sk.cov = [w->ctx->device newTextureWithDescriptor:d];
+			sk.cov = [w->ctx->device newTextureWithDescriptor:d]; mce_make_resident(sk.cov);
 			if (!sk.cov) return 0;
 			sk.cov.label = @"shade cloud coverage";
 		}
 		mc_pre_end_encoders(enc);
 		id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];
 		c.label = @"shade cloud coverage";
-		[c setComputePipelineState:pso];
-		[c setBytes:params length:(NSUInteger) length atIndex:0];
-		[c setTexture:sk.cov atIndex:0];
-		[c setTexture:sk.noise atIndex:1];
-		[c dispatchThreads:MTLSizeMake(512, 512, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
-		[c endEncoding];
+		[mce_raw(c) setComputePipelineState:pso];
+		mce_set_compute_bytes(c, params, (NSUInteger) length, 0);
+		mce_set_compute_texture(c, sk.cov, 0);
+		mce_set_compute_texture(c, sk.noise, 1);
+		mce_dispatch_threads(c, MTLSizeMake(512, 512, 1), MTLSizeMake(16, 16, 1));
+		mce_end_encoder(c);
 	}
 	return 1;
 }
@@ -2926,18 +2926,18 @@ int mcs_sky_clouds(Own *w, Enc *enc, int k, const void *params, int length, int 
 	@autoreleasepool {
 		if (sk.cw != tw || sk.ch != th || !sk.cloud[0]) {
 			for (int i = 0; i < SKY_RING; i++) {
-				[sk.cloud[i] release];
+				mce_release(sk.cloud[i]);
 				MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:(NSUInteger) tw height:(NSUInteger) th mipmapped:NO];
 				d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
 				d.storageMode = MTLStorageModePrivate;
-				sk.cloud[i] = [w->ctx->device newTextureWithDescriptor:d];
+				sk.cloud[i] = [w->ctx->device newTextureWithDescriptor:d]; mce_make_resident(sk.cloud[i]);
 				if (!sk.cloud[i]) return -1;
 				sk.cloud[i].label = [NSString stringWithFormat:@"shade clouds %d", i];
-				[sk.age[i] release];
+				mce_release(sk.age[i]);
 				d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:(NSUInteger) tw height:(NSUInteger) th mipmapped:NO];
 				d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
 				d.storageMode = MTLStorageModePrivate;
-				sk.age[i] = [w->ctx->device newTextureWithDescriptor:d];
+				sk.age[i] = [w->ctx->device newTextureWithDescriptor:d]; mce_make_resident(sk.age[i]);
 				if (!sk.age[i]) return -1;
 				sk.age[i].label = [NSString stringWithFormat:@"shade clouds age %d", i];
 			}
@@ -2975,19 +2975,19 @@ int mcs_sky_clouds(Own *w, Enc *enc, int k, const void *params, int length, int 
 		rp.colorAttachments[1].texture = sk.age[k % SKY_RING];
 		rp.colorAttachments[1].loadAction = MTLLoadActionDontCare;
 		rp.colorAttachments[1].storeAction = MTLStoreActionStore;
-		id<MTLRenderCommandEncoder> r = [mc_pre(enc) renderCommandEncoderWithDescriptor:rp];
-		r.label = @"shade clouds";
-		[r setRenderPipelineState:sk.cloudPso];
-		[r setViewport:(MTLViewport) {0, 0, (double) tw, (double) th, 0, 1}];
-		[r setFragmentBytes:params length:(NSUInteger) length atIndex:0];
-		[r setFragmentTexture:sk.cur atIndex:0];
-		if (sk.noise) [r setFragmentTexture:sk.noise atIndex:1];
+		id<MTLRenderCommandEncoder> r = [mce_new_render_encoder(mc_pre(enc), rp) autorelease];
+		[mce_raw(r) setLabel:@"shade clouds"];
+		[mce_raw(r) setRenderPipelineState:sk.cloudPso];
+		[mce_raw(r) setViewport:(MTLViewport) {0, 0, (double) tw, (double) th, 0, 1}];
+		mce_set_fragment_bytes(r, params, (NSUInteger) length, 0);
+		mce_set_fragment_texture(r, sk.cur, 0);
+		if (sk.noise) mce_set_fragment_texture(r, sk.noise, 1);
 		id<MTLTexture> prevAge = sk.cloudCur && sk.cloudCur != t ? sk.age[sk.cloudIdx] : sk.age[k % SKY_RING];
-		[r setFragmentTexture:sk.cov ? sk.cov : sk.noise atIndex:4];  // (the coverage map, SkyFrame.cloudM0.y bit 0 says whether to use it)
-		[r setFragmentTexture:prevAge atIndex:5];
-		[r setFragmentTexture:(sk.cloudCur && sk.cloudCur != t ? sk.cloudCur : t) atIndex:3];  // (the previous frame's target: temporal clouds; SkyFrame.cloudT.y says whether to use it)
-		[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-		[r endEncoding];
+		mce_set_fragment_texture(r, sk.cov ? sk.cov : sk.noise, 4);  // (the coverage map, SkyFrame.cloudM0.y bit 0 says whether to use it)
+		mce_set_fragment_texture(r, prevAge, 5);
+		mce_set_fragment_texture(r, (sk.cloudCur && sk.cloudCur != t ? sk.cloudCur : t), 3);  // (the previous frame's target: temporal clouds; SkyFrame.cloudT.y says whether to use it)
+		[mce_raw(r) drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		mce_end_encoder(r);
 		sk.cloudCur = t;
 		sk.cloudIdx = k % SKY_RING;
 	}
@@ -3012,17 +3012,17 @@ void mcs_water_frame(Own *w, const void *bytes, int length) {
 			MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
 			d.usage = MTLTextureUsageShaderRead;
 			d.storageMode = MTLStorageModePrivate;
-			wat.dummyCol = [w->ctx->device newTextureWithDescriptor:d];
+			wat.dummyCol = [w->ctx->device newTextureWithDescriptor:d]; mce_make_resident(wat.dummyCol);
 			wat.dummyCol.label = @"shade water dummy colour";
 			d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float width:1 height:1 mipmapped:NO];
 			d.usage = MTLTextureUsageShaderRead;
 			d.storageMode = MTLStorageModePrivate;
-			wat.dummyDepth = [w->ctx->device newTextureWithDescriptor:d];
+			wat.dummyDepth = [w->ctx->device newTextureWithDescriptor:d]; mce_make_resident(wat.dummyDepth);
 			wat.dummyDepth.label = @"shade water dummy depth";
 			d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:1 height:1 mipmapped:NO];
 			d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
 			d.storageMode = MTLStorageModePrivate;
-			wat.dummyGlare = [w->ctx->device newTextureWithDescriptor:d];
+			wat.dummyGlare = [w->ctx->device newTextureWithDescriptor:d]; mce_make_resident(wat.dummyGlare);
 			wat.dummyGlare.label = @"shade water dummy glare";
 		}
 	}
@@ -3032,11 +3032,11 @@ void mcs_water_frame(Own *w, const void *bytes, int length) {
 static id<MTLTexture> watCopyTex(Own *w, id<MTLTexture> *slot, MTLPixelFormat fmt, NSUInteger tw, NSUInteger th, NSString *label) {
 	id<MTLTexture> t = *slot;
 	if (t && t.width == tw && t.height == th && t.pixelFormat == fmt) return t;
-	[t release];
+	mce_release(t);
 	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:tw height:th mipmapped:NO];
 	d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
 	d.storageMode = MTLStorageModePrivate;
-	t = [w->ctx->device newTextureWithDescriptor:d];
+	t = [w->ctx->device newTextureWithDescriptor:d]; mce_make_resident(t);
 	t.label = label;
 	*slot = t;
 	return t;
@@ -3081,13 +3081,13 @@ int mcs_water_split(Own *w, Enc *enc, id<MTLTexture> target, int copy) {
 		id<MTLTexture> cc = watCopyTex(w, &wat.copyCol, cf, tw, th, @"shade water scene colour");
 		id<MTLTexture> cd = watCopyTex(w, &wat.copyDepth, MTLPixelFormatR32Float, tw, th, @"shade water scene depth");
 		id<MTLComputeCommandEncoder> c = mc_render_suspend(enc);
-		[c setComputePipelineState:pso];
-		[c setTexture:col atIndex:0];
-		[c setTexture:dep atIndex:1];
-		[c setTexture:cc atIndex:2];
-		[c setTexture:cd atIndex:3];
-		[c setBytes:&scale length:4 atIndex:0];
-		[c dispatchThreads:MTLSizeMake(tw, th, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+		[mce_raw(c) setComputePipelineState:pso];
+		mce_set_compute_texture(c, col, 0);
+		mce_set_compute_texture(c, dep, 1);
+		mce_set_compute_texture(c, cc, 2);
+		mce_set_compute_texture(c, cd, 3);
+		mce_set_compute_bytes(c, &scale, 4, 0);
+		mce_dispatch_threads(c, MTLSizeMake(tw, th, 1), MTLSizeMake(16, 8, 1));
 		mc_render_resume(enc, c);
 		wat.scene = cc;
 		wat.depth = cd;
