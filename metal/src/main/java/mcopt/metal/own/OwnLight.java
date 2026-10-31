@@ -160,12 +160,15 @@ public final class OwnLight {
 		// bloom: a little more in the dark of dusk and night (the glow of the sun and the moon), none of the shafts in rain or under water
 		float lowSun = 1.0f - Math.max(0f, Math.min(1f, (el - 0.05f) / 0.55f));  // 1 at the horizon, 0 high
 		float up = Math.max(0f, Math.min(1f, (el + 0.05f) / 0.12f));             // 0 with the sun well below the horizon
-		float shaft = SHAFTS * up * (0.35f + 0.65f * lowSun) * (1 - Math.min(1, rain) * 0.9f) * (water ? 0f : 1f);
+		float shaft = SHAFTS * up * (0.35f + 0.65f * lowSun) * (1 - Math.min(1, rain) * 0.9f) * (water ? (OwnWater.UW_SHAFTS && OwnProbe.bool("shaders.water.uwshafts", true) ? OwnWater.UW_SHAFT * up : 0f) : 1f);
 		float[] sc = OwnSky.sunTrans;
 		float m = Math.max(1e-3f, Math.max(sc[0], Math.max(sc[1], sc[2])));
 		b.put(BLOOM * (1.0f - 0.45f * Math.min(1, rain))).put(shaft).put(BLOOM_THR).put(bloomOn ? 1f : 0f);
 		b.put(sc[0] / m).put(sc[1] / m).put(sc[2] / m).put(1.0f);
 		b.put(1.0f / w).put(1.0f / h).put((float) w / h).put(OwnProbe.bool("shaders.bloom.chain", true) ? 0f : 1f);
 		b.put(OwnSky.sunScreen[0]).put(OwnSky.sunScreen[1]).put(OwnSky.sunScreen[2]).put(Float.parseFloat(System.getProperty("mcopt.shaders.bloom.debug", "0")));
+		b.put(0f).put(0f).put(0f).put(0f);  // ws (set natively)
+		// track water (PostFrame.uw): under water, the shaft noise's time, the HDR glare's gain into the bloom
+		b.put(water && OwnWater.UW_SHAFTS ? 1f : 0f).put((float) ((System.nanoTime() * 1e-9) % 4096.0)).put(OwnWater.hdrOn() ? OwnWater.GLARE_BLOOM : 0f).put(0f);
 	}
 }

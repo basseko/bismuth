@@ -72,7 +72,25 @@ public final class OwnWater {
 		String[] p = s.split(",");
 		return new float[] {Float.parseFloat(p[0]), Float.parseFloat(p[1]), Float.parseFloat(p[2])};
 	}
-	private static final int FRAME_BYTES = 336;
+	private static final int FRAME_BYTES = 448;
+	/** Track water sub-flags (each its own -Dmcopt.shaders.water.<name>=false and OwnProbe key shaders.water.<name>). */
+	static final boolean GLARE_ON = ON && !"false".equals(System.getProperty("mcopt.shaders.water.glare")),
+		REFRACT_ON = ON && !"false".equals(System.getProperty("mcopt.shaders.water.refract")),
+		SHORE_ON = ON && !"false".equals(System.getProperty("mcopt.shaders.water.shore")),
+		UW_SCATTER_ON = ON && !"false".equals(System.getProperty("mcopt.shaders.water.uwscatter")),
+		UW_SHAFTS = ON && !"false".equals(System.getProperty("mcopt.shaders.water.uwshafts"));
+	static final float GLARE_GAIN = prop("mcopt.shaders.water.glare.gain", 10.0f), GLARE_BLOOM = prop("mcopt.shaders.water.glare.bloom", 1.0f),
+		GLARE_ROUGH = prop("mcopt.shaders.water.glare.rough", 0.3f), GLARE_SWELL = prop("mcopt.shaders.water.glare.swell", 0.2f),
+		REFRACT_W = prop("mcopt.shaders.water.refract.weight", 0.4f), SHORE_GAIN = prop("mcopt.shaders.water.shore.gain", 0.5f),
+		UW_SCAT_GAIN = prop("mcopt.shaders.water.uwscatter.gain", 1.0f), UW_MS = prop("mcopt.shaders.water.uwscatter.ms", 0.5f),
+		UW_SKY = prop("mcopt.shaders.water.uwscatter.sky", 1.0f), UW_SHAFT = prop("mcopt.shaders.water.uwshafts.gain", 1.0f);
+	/** The camera's depth below the water surface this frame (blocks), found by scanning up the water column. */
+	private static float uwDepth;
+
+	/** The HDR side channel is written this frame (the glare model on and the bloom chain there to read it). */
+	static boolean hdrOn() {
+		return GLARE_ON && OwnPost.BLOOM_ON && OwnProbe.bool("shaders.water.glare", true) && TILE && frameOn;
+	}
 	/** kind bit 10 */
 	static final int K_WATER = 1 << 10;
 
@@ -118,6 +136,7 @@ public final class OwnWater {
 		if (TILE) OwnNative.waterTile(t.shadeOwn(), 1, on ? 1 : 0);
 		if (!on) return;
 		underwater = camera.fogType == FogType.WATER;
+		uwDepth = underwater ? waterDepthAt(camera) : 0f;
 		try {
 			write(t, camera, sky, null, null, false);
 		} catch (RuntimeException | LinkageError e) {
@@ -274,7 +293,30 @@ public final class OwnWater {
 			}
 			put4(b + 304, MEDIUM[0] * MURK, MEDIUM[1] * MURK, MEDIUM[2] * MURK, COPY == 1 ? 0.5f : 1.0f);  // (w: the scene depth copy's pixels per screen pixel)
 			if (TILE && viewPrev != null) put4(b + 320, (float) (camera.pos.x - posPrev.x), (float) (camera.pos.y - posPrev.y), (float) (camera.pos.z - posPrev.z), 0f);
+			// track water (bytes 336-447)
+			int tf = (GLARE_ON && OwnProbe.bool("shaders.water.glare", true) ? 1 : 0) | (hdrOn() ? 2 : 0) | (REFRACT_ON && OwnProbe.bool("shaders.water.refract", true) ? 4 : 0)
+				| (SHORE_ON && OwnProbe.bool("shaders.water.shore", true) ? 8 : 0) | (UW_SCATTER_ON && OwnProbe.bool("shaders.water.uwscatter", true) ? 16 : 0);
+			put4(b + 336, uwDepth, GLARE_GAIN, tf, REFRACT_W);
+			put4(b + 352, UW_SCAT_GAIN, SHORE_GAIN, GLARE_ROUGH, GLARE_SWELL);
+			put4(b + 368, UW_MS, UW_SKY, 0f, 0f);
 			OwnNative.waterFrame(t.shadeOwn(), b, FRAME_BYTES);
+		}
+	}
+
+	/** Blocks from the camera to the top of the water column above it (the lit surface), capped at 64. */
+	private static float waterDepthAt(CameraRenderState camera) {
+		try {
+			net.minecraft.client.multiplayer.ClientLevel level = Minecraft.getInstance().level;
+			if (level == null) return 0f;
+			net.minecraft.core.BlockPos.MutableBlockPos bp = new net.minecraft.core.BlockPos.MutableBlockPos(Math.floor(camera.pos.x), Math.floor(camera.pos.y), Math.floor(camera.pos.z));
+			int n = 0;
+			while (n < 64 && level.getFluidState(bp).is(net.minecraft.tags.FluidTags.WATER)) {
+				bp.move(0, 1, 0);
+				n++;
+			}
+			return Math.max(0f, (float) (bp.getY() - 0.12 - camera.pos.y));
+		} catch (RuntimeException | LinkageError e) {
+			return 0f;
 		}
 	}
 
