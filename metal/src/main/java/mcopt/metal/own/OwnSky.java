@@ -267,7 +267,7 @@ public final class OwnSky {
 	static final float CLOUD_Y0 = Float.parseFloat(System.getProperty("mcopt.shaders.clouds.base", "230"));
 	static final float CLOUD_Y1 = Float.parseFloat(System.getProperty("mcopt.shaders.clouds.top", "340"));
 	static final float CLOUD_COVER = Float.parseFloat(System.getProperty("mcopt.shaders.clouds.cover", "0.55"));
-	static final float CLOUD_SOFT = Float.parseFloat(System.getProperty("mcopt.shaders.clouds.soft", "3.0"));
+	static final float CLOUD_SOFT = Float.parseFloat(System.getProperty("mcopt.shaders.clouds.soft", "2.4"));
 	/** Wind: blocks per tick. */
 	static final float WIND = Float.parseFloat(System.getProperty("mcopt.shaders.clouds.wind", "0.08"));
 	static final int NOISE = 256;
@@ -336,13 +336,18 @@ public final class OwnSky {
 	/** Haze density of this frame (1 / blocks). */
 	static float hazeDensity() {
 		float len = HAZE_CLEAR + (HAZE_RAIN - HAZE_CLEAR) * rain;
-		return 1.0f / (len * (1.0f + MORN_HAZE * morning() * (1.0f - rain)));
+		return 1.0f / (len * (1.0f + MORN_HAZE * morning() * (1.0f - rain) + DUSK_HAZE * dusk() * (1.0f - rain)));
 	}
 
 	/** A clear mid-morning sun (terrain.metal skMorn): 0..1. */
 	static float morning() {
 		return smooth(0.08f, 0.2f, sinEl) * (1.0f - smooth(0.5f, 0.8f, sinEl));
 	}
-	static final float MORN_CLOUD = Float.parseFloat(System.getProperty("mcopt.shaders.sky.mornCloud", "0.25"));
+	static final float MORN_CLOUD = Float.parseFloat(System.getProperty("mcopt.shaders.sky.mornCloud", "0.55"));
+	/** A low sun (sunset, golden hour): the haze thins so that the far land keeps its contrast against the glowing sky (-Dmcopt.shaders.sky.duskHaze, 0 = as before). */
+	static final float DUSK_HAZE = Float.parseFloat(System.getProperty("mcopt.shaders.sky.duskHaze", "1.0"));
+	static float dusk() {
+		return (1.0f - smooth(0.0f, 0.3f, sinEl)) * smooth(-0.08f, 0.02f, sinEl);
+	}
 	static final float MORN_HAZE = Float.parseFloat(System.getProperty("mcopt.shaders.sky.mornHaze", "0.8"));
 }

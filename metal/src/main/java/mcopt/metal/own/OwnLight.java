@@ -31,8 +31,8 @@ public final class OwnLight {
 		{-0.3f, 0.42f, 0.62f, 1f, 0.45f, 0.60f, 1f, 0.45f, 0.6f, 1f, 0.70f, 1.0f, 1.1f, 0.43f, 1.06f, 0.78f, 0.02f, 0.04f, 0.06f, 0, 0, 0, 0.75f, 0.165f, 0.159f, 0.209f},
 		{-0.1f, 0.62f, 0.62f, 1f, 0.8f, 0.6f, 0.45f, 0.7f, 0.7f, 1f, 0.85f, 0.94f, 1f, 0.95f, 1.12f, 0.85f, 0.005f, 0.035f, 0.06f, 0, 0, 0, 0.75f, 0.1f, 0.11f, 0.2f},
 		{-0.02f, 0.85f, 0.65f, 0.85f, 1f, 0.42f, 0.18f, 0.9f, 0.72f, 0.82f, 1f, 0.95f, 1.12f, 1.25f, 1f, 0.75f, 0.02f, 0.01f, 0.04f, 0, 0, 0, 0.75f, 0.35f, 0.28f, 0.38f},
-		{0.05f, 1f, 0.7f, 0.46f, 1f, 0.5f, 0.2f, 1f, 0.8f, 0.62f, 1.05f, 0.9f, 1.2f, 1.4f, 1.1f, 0.62f, 0.02f, 0.008f, 0.025f, 0, 0, 0, 0.75f, 0.5f, 0.38f, 0.36f},
-		{0.14f, 1f, 0.72f, 0.5f, 1f, 0.56f, 0.26f, 1f, 0.82f, 0.66f, 1f, 0.9f, 1.15f, 1.4f, 1.08f, 0.62f, 0.02f, 0.012f, 0.025f, 0, 0, 0, 0.75f, 0.46f, 0.4f, 0.41f},
+		{0.05f, 0.96f, 0.76f, 0.62f, 1f, 0.5f, 0.2f, 0.93f, 0.82f, 0.74f, 1.05f, 0.92f, 1.1f, 1.3f, 1.06f, 0.68f, 0.02f, 0.008f, 0.025f, 0, 0, 0, 0.75f, 0.5f, 0.38f, 0.36f},
+		{0.14f, 0.97f, 0.8f, 0.66f, 1f, 0.56f, 0.26f, 0.95f, 0.84f, 0.76f, 1f, 0.92f, 1.1f, 1.32f, 1.06f, 0.66f, 0.02f, 0.012f, 0.025f, 0, 0, 0, 0.75f, 0.46f, 0.4f, 0.41f},
 		{0.3f, 1f, 0.85f, 0.68f, 1f, 0.75f, 0.52f, 0.96f, 0.88f, 0.82f, 0.92f, 0.98f, 1f, 1.28f, 0.98f, 0.68f, 0.015f, 0.015f, 0.03f, 0, 0, 0, 0.75f, 0.45f, 0.43f, 0.47f},
 		{0.47f, 0.95f, 0.93f, 1f, 1f, 0.88f, 0.74f, 0.92f, 0.94f, 1f, 0.8f, 1.0f, 0.85f, 1.2f, 0.92f, 0.72f, 0.012f, 0.012f, 0.025f, 0, 0, 0, 0.75f, 0.217f, 0.398f, 0.814f},
 		{0.85f, 0.86f, 0.93f, 1f, 1f, 0.95f, 0.88f, 0.88f, 0.94f, 1f, 0.82f, 0.96f, 1.05f, 0.78f, 1.04f, 1.1f, 0, 0.005f, 0.03f, 0, 0, 0, 0.75f, 0.386f, 0.5f, 0.754f},
@@ -142,7 +142,7 @@ public final class OwnLight {
 
 	/** Bloom (-Dmcopt.shaders.bloom=0 off; 1 is the default strength) and light shafts (-Dmcopt.shaders.shafts, the same). */
 	static final float BLOOM = Float.parseFloat(System.getProperty("mcopt.shaders.bloom", "1"));
-	static final float SHAFTS = Float.parseFloat(System.getProperty("mcopt.shaders.shafts", "1.7"));
+	static final float SHAFTS = Float.parseFloat(System.getProperty("mcopt.shaders.shafts", "1.3"));
 	static final float BLOOM_THR = Float.parseFloat(System.getProperty("mcopt.shaders.bloom.threshold", "0.84"));
 
 	/** Writes the PostFrame (terrain.metal) of this frame: 10 float4 (160 bytes). */
