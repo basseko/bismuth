@@ -3,6 +3,6 @@
 	"package": "mcopt.metal.mixin.shaders",
 	"plugin": "mcopt.metal.mixin.shaders.ShadeMixinPlugin",
 	"compatibilityLevel": "JAVA_25",
-	"client": ["ShadePostMixin", "ShadeLightmapMixin", "ShadeSkyMixin", "ShadeFogMixin", "ShadeWeatherMixin", "ShadeSkyDomeMixin", "ShadeCloudMixin"],
+	"client": ["ShadePostMixin", "ShadeLightmapMixin", "ShadeSkyMixin", "ShadeFogMixin", "ShadeWeatherMixin", "ShadeSkyDomeMixin", "ShadeCloudMixin", "ShadeHandMixin"],
 	"injectors": { "defaultRequire": 1 }
 }

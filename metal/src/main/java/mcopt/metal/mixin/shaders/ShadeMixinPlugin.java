@@ -31,6 +31,7 @@ public final class ShadeMixinPlugin implements IMixinConfigPlugin {
 		if (mixinClassName.endsWith(".ShadeLightmapMixin")) return ENABLED && !"false".equals(System.getProperty("mcopt.shaders.light"));
 		if (mixinClassName.endsWith(".ShadePostMixin")) return ENABLED && !"false".equals(System.getProperty("mcopt.shaders.grade"));
 		if (mixinClassName.endsWith(".ShadeWaterFogMixin") || mixinClassName.endsWith(".ShadeWaterOverlayMixin")) return ENABLED && !"false".equals(System.getProperty("mcopt.shaders.water"));
+		if (mixinClassName.endsWith(".ShadeHandMixin")) return ENABLED && !"false".equals(System.getProperty("mcopt.shaders.entities"));
 		return ENABLED;
 	}
 
