@@ -146,6 +146,24 @@ static struct {
 	float biasC, biasS;               // the shadow draws' depth bias (constant units, slope scale)
 } sh;
 
+// the sky (milestone 3): the sky-view table ring (written by sky_lut in the pre command buffer, read by the dome and the shaded terrain at texture 25) and the cloud noise
+#define SKY_RING 4
+static struct {
+	id<MTLTexture> lut[SKY_RING];
+	int lw, lh;
+	id<MTLTexture> cur;               // this frame's table
+	id<MTLTexture> noise;             // the cloud noise (RGBA8, tileable, bound at the dome's fragment texture 1)
+	id<MTLComputePipelineState> lutPso;
+	id<MTLRenderPipelineState> dome[4];
+	MTLPixelFormat color[4], depth[4];
+	int n;
+	id<MTLDepthStencilState> depthState;
+	id<MTLTexture> cloud[SKY_RING];   // the cloud layer's small target (RGBA16F), one per ring slot
+	int cw, ch;
+	id<MTLTexture> cloudCur;
+	id<MTLRenderPipelineState> cloudPso;
+} sk;
+
 static void ownErr(NSError *e, const char *what, char *err, int cap) {
 	if (err && cap > 0) snprintf(err, cap, "%s: %s", what, e ? e.description.UTF8String : "unknown error");
 }
@@ -833,6 +851,7 @@ drawCall:
 		// the shaded variant: the frame block, this frame's shadow map, and the lightmap (the fragment stage applies it)
 		[r setFragmentBytes:sh.frame length:(NSUInteger) sh.frameLen atIndex:30];
 		[r setFragmentTexture:sh.cur atIndex:24];
+		[r setFragmentTexture:sk.cur atIndex:25];
 		[r setFragmentTexture:light atIndex:17];
 		[r setFragmentSamplerState:lightSampler atIndex:15];
 	}
@@ -2297,3 +2316,176 @@ int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int le
 	}
 	return 1;
 }
+
+// ---- shaders: the sky (-Dmcopt.shaders; OwnSky): the sky-view table and the dome ----
+
+// The table ring (lw x lh RGBA16F) and the cloud noise (size x size RGBA8 from `noise`, may be NULL). 1 made, 0 failed.
+int mcs_sky_init(Own *w, int lw, int lh, const uint8_t *noise, int size) {
+	if (sk.lut[0] && sk.lw == lw && sk.lh == lh) return 1;
+	@autoreleasepool {
+		for (int i = 0; i < SKY_RING; i++) {
+			[sk.lut[i] release];
+			sk.lut[i] = nil;
+			MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:(NSUInteger) lw height:(NSUInteger) lh mipmapped:NO];
+			d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+			d.storageMode = MTLStorageModePrivate;
+			sk.lut[i] = [w->ctx->device newTextureWithDescriptor:d];
+			if (!sk.lut[i]) return 0;
+			sk.lut[i].label = [NSString stringWithFormat:@"shade sky table %d", i];
+		}
+		sk.lw = lw;
+		sk.lh = lh;
+		sk.cur = sk.lut[0];
+		if (noise && size > 0 && !sk.noise) {
+			MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:(NSUInteger) size height:(NSUInteger) size mipmapped:NO];
+			d.usage = MTLTextureUsageShaderRead;
+			d.storageMode = MTLStorageModeShared;
+			sk.noise = [w->ctx->device newTextureWithDescriptor:d];
+			if (!sk.noise) return 0;
+			sk.noise.label = @"shade cloud noise";
+			[sk.noise replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger) size, (NSUInteger) size) mipmapLevel:0 withBytes:noise bytesPerRow:(NSUInteger) size * 4];
+		}
+	}
+	return 1;
+}
+
+// The table of ring slot k (terrain.metal sky_lut) in the pre command buffer; it is also this frame's table for the draws that read it. p: a SkyLutP.
+int mcs_sky_lut(Own *w, Enc *enc, int k, const void *p, int length, int compute) {
+	id<MTLComputePipelineState> pso = ownLazyKernel(w, &sk.lutPso, "sky_lut");
+	id<MTLTexture> t = sk.lut[k % SKY_RING];
+	if (!pso || !t || length > 64) return 0;
+	if (!compute) {
+		sk.cur = t;  // (this slot already holds the table of the current sun)
+		return 1;
+	}
+	mc_pre_end_encoders(enc);
+	@autoreleasepool {
+		id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];
+		c.label = @"shade sky table";
+		[c setComputePipelineState:pso];
+		[c setBytes:p length:(NSUInteger) length atIndex:0];
+		[c setTexture:t atIndex:0];
+		[c dispatchThreads:MTLSizeMake((NSUInteger) sk.lw, (NSUInteger) sk.lh, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+		[c endEncoding];
+	}
+	sk.cur = t;
+	return 1;
+}
+
+// The dome: one full-screen triangle at the far plane into the open render encoder (the sky pass), opaque, so the terrain drawn after it
+// hides it (and, on a tile GPU, the hidden part is never shaded). params: a SkyFrame. 1 drawn, 0 nothing to do, -1 err set.
+int mcs_sky_draw(Own *w, Enc *enc, const void *params, int length, char *err, int errCap) {
+	id<MTLRenderCommandEncoder> r = enc->render;
+	if (!r || enc->colorCount < 1 || !enc->colors[0] || !sk.cur || length > 512) return 0;
+	MTLPixelFormat cf = enc->colors[0].pixelFormat, df = enc->depth ? enc->depth.pixelFormat : MTLPixelFormatInvalid;
+	id<MTLRenderPipelineState> pso = nil;
+	for (int i = 0; i < sk.n; i++)
+		if (sk.color[i] == cf && sk.depth[i] == df) pso = sk.dome[i];
+	@autoreleasepool {
+		if (!pso) {
+			id<MTLFunction> vs = [[w->library newFunctionWithName:@"sky_vs"] autorelease];
+			id<MTLFunction> fs = [[w->library newFunctionWithName:@"sky_fs"] autorelease];
+			if (!vs || !fs) {
+				if (err && errCap > 0) snprintf(err, errCap, "sky_vs / sky_fs missing from the library");
+				return -1;
+			}
+			MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor new] autorelease];
+			pd.label = @"shade sky dome";
+			pd.vertexFunction = vs;
+			pd.fragmentFunction = fs;
+			pd.colorAttachments[0].pixelFormat = cf;
+			pd.depthAttachmentPixelFormat = df;
+			pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+			NSError *e = nil;
+			pso = [w->ctx->device newRenderPipelineStateWithDescriptor:pd error:&e];
+			if (!pso) {
+				ownErr(e, "shade sky pipeline", err, errCap);
+				return -1;
+			}
+			if (sk.n < 4) {
+				sk.color[sk.n] = cf;
+				sk.depth[sk.n] = df;
+				sk.dome[sk.n++] = pso;
+			}
+		}
+		if (!sk.depthState) {
+			MTLDepthStencilDescriptor *dd = [[MTLDepthStencilDescriptor new] autorelease];
+			dd.depthCompareFunction = MTLCompareFunctionAlways;
+			dd.depthWriteEnabled = YES;
+			sk.depthState = [w->ctx->device newDepthStencilStateWithDescriptor:dd];
+		}
+		[r pushDebugGroup:@"shade sky dome"];
+		[r setRenderPipelineState:pso];
+		[r setDepthStencilState:sk.depthState];
+		[r setCullMode:MTLCullModeNone];
+		[r setTriangleFillMode:MTLTriangleFillModeFill];
+		[r setDepthBias:0 slopeScale:0 clamp:0];
+		[r setViewport:(MTLViewport) {0, 0, (double) enc->width, (double) enc->height, 0, 1}];
+		[r setScissorRect:(MTLScissorRect) {0, 0, (NSUInteger) enc->width, (NSUInteger) enc->height}];
+		[r setFragmentBytes:params length:(NSUInteger) length atIndex:0];
+		[r setFragmentTexture:sk.cur atIndex:0];
+		if (sk.cloudCur) [r setFragmentTexture:sk.cloudCur atIndex:2];
+		[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		[r popDebugGroup];
+		w->lastPso = nil;
+	}
+	return 1;
+}
+
+// The cloud layer (terrain.metal cloud_fs) into ring slot k's small target, a render pass of its own on the pre command buffer (no depth, no
+// dependency on the world): the dome samples it. params: a SkyFrame; w x h: the target's size. 1 drawn, 0 nothing, -1 err set.
+int mcs_sky_clouds(Own *w, Enc *enc, int k, const void *params, int length, int tw, int th, char *err, int errCap) {
+	if (!sk.cur || length > 512) return 0;
+	@autoreleasepool {
+		if (sk.cw != tw || sk.ch != th || !sk.cloud[0]) {
+			for (int i = 0; i < SKY_RING; i++) {
+				[sk.cloud[i] release];
+				MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:(NSUInteger) tw height:(NSUInteger) th mipmapped:NO];
+				d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+				d.storageMode = MTLStorageModePrivate;
+				sk.cloud[i] = [w->ctx->device newTextureWithDescriptor:d];
+				if (!sk.cloud[i]) return -1;
+				sk.cloud[i].label = [NSString stringWithFormat:@"shade clouds %d", i];
+			}
+			sk.cw = tw;
+			sk.ch = th;
+		}
+		if (!sk.cloudPso) {
+			id<MTLFunction> vs = [[w->library newFunctionWithName:@"sky_vs"] autorelease];
+			id<MTLFunction> fs = [[w->library newFunctionWithName:@"cloud_fs"] autorelease];
+			if (!vs || !fs) {
+				if (err && errCap > 0) snprintf(err, errCap, "cloud_fs missing from the library");
+				return -1;
+			}
+			MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor new] autorelease];
+			pd.label = @"shade clouds";
+			pd.vertexFunction = vs;
+			pd.fragmentFunction = fs;
+			pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+			NSError *e = nil;
+			sk.cloudPso = [w->ctx->device newRenderPipelineStateWithDescriptor:pd error:&e];
+			if (!sk.cloudPso) {
+				ownErr(e, "shade clouds pipeline", err, errCap);
+				return -1;
+			}
+		}
+		id<MTLTexture> t = sk.cloud[k % SKY_RING];
+		mc_pre_end_encoders(enc);
+		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+		rp.colorAttachments[0].texture = t;
+		rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+		rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+		id<MTLRenderCommandEncoder> r = [mc_pre(enc) renderCommandEncoderWithDescriptor:rp];
+		r.label = @"shade clouds";
+		[r setRenderPipelineState:sk.cloudPso];
+		[r setViewport:(MTLViewport) {0, 0, (double) tw, (double) th, 0, 1}];
+		[r setFragmentBytes:params length:(NSUInteger) length atIndex:0];
+		[r setFragmentTexture:sk.cur atIndex:0];
+		if (sk.noise) [r setFragmentTexture:sk.noise atIndex:1];
+		[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		[r endEncoding];
+		sk.cloudCur = t;
+	}
+	return 1;
+}
+

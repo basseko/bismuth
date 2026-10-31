@@ -68,6 +68,10 @@ final class OwnNative {
 	private static final MethodHandle SHADE_PASS = OwnShade.ON ? fn("mcs_shadow_pass", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_INT,
 		JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT) : null;
 
+	private static final MethodHandle SKY_INIT = OwnShade.ON ? fn("mcs_sky_init", false, JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_INT) : null;
+	private static final MethodHandle SKY_LUT = OwnShade.ON ? fn("mcs_sky_lut", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT) : null;
+	private static final MethodHandle SKY_CLOUDS = OwnShade.ON ? fn("mcs_sky_clouds", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_INT) : null;
+	private static final MethodHandle SKY_DRAW = OwnShade.ON ? fn("mcs_sky_draw", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT) : null;
 	private static final MethodHandle POST = OwnShade.ON ? fn("mcs_post", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT) : null;
 
 	private OwnNative() {
@@ -81,6 +85,56 @@ final class OwnNative {
 			int r;
 			try {
 				r = (int) POST.invokeExact(own, enc, target, params, length, err, 1024);
+			} catch (Throwable t) {
+				throw rethrow(t);
+			}
+			if (r < 0) throw new IllegalStateException(MemoryUtil.memUTF8(err));
+			return r > 0;
+		}
+	}
+
+	/** The sky table ring and the cloud noise (mcs_sky_init); noise may be 0. */
+	static boolean skyInit(long own, int lw, int lh, long noise, int size) {
+		try {
+			return (int) SKY_INIT.invokeExact(own, lw, lh, noise, size) == 1;
+		} catch (Throwable t) {
+			throw rethrow(t);
+		}
+	}
+
+	/** The sky table of ring slot k, computed in the pre command buffer (mcs_sky_lut). */
+	static boolean skyLut(long own, long enc, int k, long params, int length, boolean compute) {
+		try {
+			return (int) SKY_LUT.invokeExact(own, enc, k, params, length, compute ? 1 : 0) == 1;
+		} catch (Throwable t) {
+			throw rethrow(t);
+		}
+	}
+
+	/** The cloud layer into the small target of ring slot k (mcs_sky_clouds); throws with the native error. */
+	static boolean skyClouds(long own, long enc, int k, long params, int length, int w, int h) {
+		try (MemoryStack stack = MemoryStack.stackPush()) {
+			long err = stack.nmalloc(1, 1024);
+			MemoryUtil.memPutByte(err, (byte) 0);
+			int r;
+			try {
+				r = (int) SKY_CLOUDS.invokeExact(own, enc, k, params, length, w, h, err, 1024);
+			} catch (Throwable t) {
+				throw rethrow(t);
+			}
+			if (r < 0) throw new IllegalStateException(MemoryUtil.memUTF8(err));
+			return r > 0;
+		}
+	}
+
+	/** The sky dome into the open render encoder (mcs_sky_draw); throws with the native error. */
+	static boolean skyDraw(long own, long enc, long params, int length) {
+		try (MemoryStack stack = MemoryStack.stackPush()) {
+			long err = stack.nmalloc(1, 1024);
+			MemoryUtil.memPutByte(err, (byte) 0);
+			int r;
+			try {
+				r = (int) SKY_DRAW.invokeExact(own, enc, params, length, err, 1024);
 			} catch (Throwable t) {
 				throw rethrow(t);
 			}

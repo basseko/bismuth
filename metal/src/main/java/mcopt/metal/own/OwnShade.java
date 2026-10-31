@@ -44,13 +44,15 @@ public final class OwnShade {
 	static final float SUN_AMP = Float.parseFloat(System.getProperty("mcopt.shaders.sunAmp", "0.72"));
 	/** The light-space depth range: blocks toward the light that still cast, and beyond the box's centre plane. */
 	private static final double CASTER = 320.0, BEYOND = 192.0;
-	private static final int FRAME_BYTES = 320, CULL_BYTES = 160, CULLFRAME_BYTES = 144, DRAW_BYTES = OwnTerrain.DRAW_FRAME_BYTES;
+	private static final int FRAME_BYTES = 368, CULL_BYTES = 160, CULLFRAME_BYTES = 144, DRAW_BYTES = OwnTerrain.DRAW_FRAME_BYTES;
 
 	/** This frame draws the shaded terrain variant (set by {@link #frame}; read at the one choke point, OwnNative.draw). */
 	static boolean frameActive;
 	private static boolean said;
 	/** The terrain renderer of the last frame (OwnPost needs its native handles). */
 	static OwnTerrain postOwner;
+	/** The terrain renderer of the last shaded frame, kept (postOwner is consumed by the colour pass each frame): the sky pass of the next frame draws with it. */
+	static OwnTerrain lastOwner;
 
 	// kind bits (mcown.m)
 	static final int K_SHADE = 1 << 8;
@@ -91,6 +93,7 @@ public final class OwnShade {
 		SkyRenderState sky = mc.gameRenderer.gameRenderState().levelRenderState.skyRenderState;
 		if (sky.skybox != DimensionType.Skybox.OVERWORLD || !OwnProbe.bool("shaders", true)) return;
 		postOwner = t;
+		lastOwner = t;
 		OwnLight.update(sky.sunAngle, 1.0f - sky.rainBrightness, camera.fogType == FogType.WATER);
 		if (fat) {
 			if (!said) System.out.println("mcopt-shaders: not with -Dmcopt.own.fat (lists of instances), off");
@@ -156,8 +159,9 @@ public final class OwnShade {
 		Vector3d L = useSun ? sun : moon;
 		float strength = useSun ? sunStr : moonStr;
 		boolean sunOn = strength > 0.01f && OwnProbe.bool("shaders.sun", true);
-		// nothing to add without direct light (night, heavy rain): the plain terrain variants draw, at no cost
-		if (!sunOn && !ALWAYS) return;
+		// nothing to add without direct light (night, heavy rain): the plain terrain variants draw, at no cost (unless the sky's haze needs the shaded variant)
+		boolean haze = OwnSky.hazeActive() && OwnProbe.bool("shaders.haze", true);
+		if (!sunOn && !ALWAYS && !haze) return;
 		float el = (float) L.y;
 		float cr, cg, cb;
 		if (useSun) {
@@ -356,6 +360,18 @@ public final class OwnShade {
 				MemoryUtil.memPutFloat(fb + 288 + c * 4L, useSun ? OwnLight.shade[c] : 0.84f + 0.08f * c);
 				MemoryUtil.memPutFloat(fb + 304 + c * 4L, useSun ? OwnLight.ambient[c] : 0.84f + 0.08f * c);
 			}
+			// the sky's haze: density, strength (0: vanilla's fog colour), the table's exposure; the true sun's direction and the rain
+			if (haze) {
+				MemoryUtil.memPutFloat(fb + 320, OwnSky.hazeDensity());
+				MemoryUtil.memPutFloat(fb + 324, OwnSky.HAZE_STRENGTH);
+				MemoryUtil.memPutFloat(fb + 328, OwnSky.exposure);
+			}
+			MemoryUtil.memPutFloat(fb + 336, OwnSky.sunDir[0]);
+			MemoryUtil.memPutFloat(fb + 340, OwnSky.sunDir[1]);
+			MemoryUtil.memPutFloat(fb + 344, OwnSky.sunDir[2]);
+			MemoryUtil.memPutFloat(fb + 348, OwnSky.rain);
+			for (int c = 0; c < 3; c++) MemoryUtil.memPutFloat(fb + 352 + c * 4L, OwnSky.warmTint[c]);
+			MemoryUtil.memPutFloat(fb + 364, OwnSky.warm);
 			OwnNative.shadeFrame(own, k, fb, FRAME_BYTES, 0f, 0f);
 		}
 		frameActive = true;

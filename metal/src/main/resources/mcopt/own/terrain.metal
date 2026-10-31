@@ -1564,6 +1564,9 @@ struct ShadeFrame {
 	float4 amb;           // x ambient attenuation at full sun and sky light, y filter radius (blocks), z hemisphere ambient strength (0: the vanilla face shade stays), w sky fill
 	float4 shade;         // rgb: the tint of surfaces the sun does not reach (the sky's colour, normalised), w unused
 	float4 fillc;         // rgb: the colour of the sky fill light, w the grade's red / blue gain ratio (water's tint)
+	float4 haze;          // x aerial perspective density (1 / blocks), y haze strength 0..1 (0: vanilla's fog colour), z sky exposure, w height falloff (1 / blocks)
+	float4 sunTrue;       // xyz the true sun direction (the sky look-up table's azimuth origin), w rain
+	float4 skyWarm;       // rgb the sun's colour at the camera (normalised), w how far the sky is pulled toward it (a low sun's aerosol glow)
 };
 #endif
 
@@ -2323,13 +2326,55 @@ static float shShadow(constant ShadeFrame &sf, depth2d_array<float> sm, float3 p
 	}
 	return acc + remaining;  // (outside every cascade: lit)
 }
+
+// ---- sky (milestone 3): the sky-view look-up table is shared by the dome and the terrain's aerial perspective ----
+// The table is indexed by the view's azimuth relative to the sun (u = sin(angle / 2), symmetric) and elevation (v: l = sign(s) sqrt(|s|) of s = sin(e),
+// finer near the horizon), holding the single-scattered radiance (Rayleigh + Mie + ozone) of the sun's light, built by sky_lut each frame.
+constant float SK_SAT = 0.95;
+constexpr sampler skSmp(coord::normalized, filter::linear, address::clamp_to_edge);
+
+static float2 skUvS(float2 hdir, float sinE, float3 sunDir) {
+	float lv = length(hdir), ls = length(sunDir.xz);
+	float c = (lv > 1e-4 && ls > 1e-4) ? clamp(dot(hdir, sunDir.xz) / (lv * ls), -1.0, 1.0) : 1.0;
+	return float2(sqrt((1.0 - c) * 0.5), sign(sinE) * sqrt(abs(sinE)) * 0.5 + 0.5);
+}
+
+// (elevation e in radians, for the callers that have it)
+static float2 skUv(float2 hdir, float e, float3 sunDir) {
+	return skUvS(hdir, sin(e), sunDir);
+}
+
+// the table's radiance to a display colour: an exponential exposure curve, then a little desaturation (the atmosphere's aerosols and ground
+// reflection that the single scattering lacks wash the blue out)
+static float3 skTone(float3 c) {
+	float3 d = 1.0 - exp(-c);
+	return mix(float3(dot(d, float3(0.3, 0.59, 0.11))), d, SK_SAT);
+}
+
+// overcast: the sky's colour turns grey and dull in rain
+static float3 skOvercast(float3 sky, float rain) {
+	float lum = dot(sky, float3(0.3, 0.59, 0.11));
+	return mix(sky, float3(lum) * float3(0.86, 0.97, 1.1) * 0.62, rain * 0.9);
+}
+
+// the haze colour toward view direction `dir`: the table's radiance a little above the horizon in that azimuth, tone mapped
+static float3 skWarm(float3 d, float4 warm) {
+	float lum = dot(d, float3(0.3, 0.59, 0.11));
+	return mix(d, min(float3(lum) * warm.rgb * 1.25, 1.0), warm.w);
+}
+
+static float3 skHaze(texture2d<float> lut, float3 dir, float3 sunDir, float exposure, float rain, float4 warm) {
+	float sy = clamp(dir.y, 0.025, 0.29);  // (sin of an elevation of 1.5 to 17 degrees)
+	return skOvercast(skWarm(skTone(lut.sample(skSmp, skUvS(dir.xz, sy, sunDir), level(0.0)).rgb * exposure), warm), rain);
+}
 #endif
 
 fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]], constant Terrain &t [[buffer(23)]], constant Fog &fog [[buffer(24)]],
 	texture2d<float> atlas [[texture(16)]], sampler atlasSampler [[sampler(14)]]
 #ifdef OWN_SHADE
 	, constant ShadeFrame &sf [[buffer(30), function_constant(F_SHADE)]], depth2d_array<float> shadowMap [[texture(24), function_constant(F_SHADE)]],
-	texture2d<float> shLightmap [[texture(17), function_constant(F_SHADE)]], sampler shLmSmp [[sampler(15), function_constant(F_SHADE)]]
+	texture2d<float> shLightmap [[texture(17), function_constant(F_SHADE)]], sampler shLmSmp [[sampler(15), function_constant(F_SHADE)]],
+	texture2d<float> skLut [[texture(25), function_constant(F_SHADE)]]
 #endif
 	) {
 #ifdef OWN_TPROBE
@@ -2390,7 +2435,18 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 		fogValue = F_FV ? in.sphericalVertexDistance : linear_fog_value(in.sphericalVertexDistance, fog.FogEnvironmentalStart, fog.FogEnvironmentalEnd);
 		if (F_RICH && !F_FV) fogValue = max(fogValue, linear_fog_value(in.cylindricalVertexDistance, fog.FogRenderDistanceStart, fog.FogRenderDistanceEnd));
 	}
-	return float4(mix(color.rgb, fog.FogColor.rgb, fogValue * fog.FogColor.a), color.a);
+	float3 fogRgb = fog.FogColor.rgb;
+#ifdef OWN_SHADE
+	if (F_SHADE && sf.haze.y > 0.0) {
+		// aerial perspective (milestone 3): in air the fog's colour is the sky's own colour toward the pixel (the table, the same the dome draws), and an
+		// exponential extinction thickens the haze with distance (the stronger of it and vanilla's linear fog, which still fades the render distance's edge)
+		float dist = length(in.shPos);
+		float3 hz = skHaze(skLut, in.shPos / max(dist, 1e-3), sf.sunTrue.xyz, sf.haze.z, sf.sunTrue.w, sf.skyWarm);
+		fogRgb = mix(fogRgb, hz, sf.haze.y);
+		fogValue = max(fogValue, (1.0 - exp(-dist * sf.haze.x)) * sf.haze.y);
+	}
+#endif
+	return float4(mix(color.rgb, fogRgb, fogValue * fog.FogColor.a), color.a);
 }
 
 // The per-quad path's lists drawn by mesh shading (-Dmcopt.own.frag.qmesh, with -Dmcopt.own.quads): a threadgroup per 32 listed quads
@@ -3677,5 +3733,204 @@ fragment half4 post_fs(PostV in [[stage_in]], half4 dst [[color(0)]], constant P
 	float n = fract(52.9829189 * fract(dot(pp, float2(0.06711056, 0.00583715)))) + fract(52.9829189 * fract(dot(pp.yx + 19.0, float2(0.06711056, 0.00583715)))) - 1.0;
 	o += half(n * (f.la.w * (1.0 / 255.0)));
 	return half4(saturate(o), dst.a);
+}
+
+// ---- sky (milestone 3): the single-scattering sky-view table (compute) and the sky dome ----
+// Public techniques only: Rayleigh and Mie single scattering with an exponential density (Nishita 1993, Bruneton and Neyret 2008), the ozone layer's
+// absorption and a cheap isotropic multiple scattering term (Hillaire 2020), a Cornette-Shanks / Henyey-Greenstein Mie phase.
+struct SkyLutP {
+	float4 sun;    // x sin(sun elevation), y cos, z camera altitude (km), w sun intensity
+	float4 misc;   // x multiple scattering factor
+};
+
+constant float SK_RG = 6360.0, SK_RT = 6420.0;
+constant float3 SK_BR = float3(5.802e-3, 13.558e-3, 33.1e-3);   // Rayleigh scattering (1 / km), scale height 8 km
+constant float SK_BMS = 7.0e-3, SK_BME = 7.8e-3;             // Mie scattering and extinction, scale height 1.2 km
+constant float3 SK_OZ = float3(0.650e-3, 1.881e-3, 0.085e-3);   // ozone absorption
+
+static float skHit(float3 o, float3 d, float r) {
+	float b = dot(o, d), c = dot(o, o) - r * r, disc = b * b - c;
+	if (disc < 0.0) return -1.0;
+	float q = sqrt(disc), t = -b - q;
+	return t < 0.0 ? -b + q : t;
+}
+
+static float3 skExtinction(float h, thread float &dr, thread float &dm) {
+	h = max(h, 0.0);
+	dr = exp(-h * 0.125);
+	dm = exp(-h * 0.8333333);
+	float doz = max(0.0, 1.0 - abs(h - 25.0) * 0.0666667);
+	return SK_BR * dr + SK_BME * dm + SK_OZ * doz;
+}
+
+static float3 skOptical(float3 p, float3 d, float len, int n) {
+	float3 tau = float3(0.0);
+	float dt = len / float(n);
+	for (int i = 0; i < n; i++) {
+		float dr, dm;
+		tau += skExtinction(length(p + d * ((float(i) + 0.5) * dt)) - SK_RG, dr, dm) * dt;
+	}
+	return tau;
+}
+
+kernel void sky_lut(texture2d<float, access::write> out [[texture(0)]], constant SkyLutP &P [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+	uint W = out.get_width(), H = out.get_height();
+	if (gid.x >= W || gid.y >= H) return;
+	float u = (float(gid.x) + 0.5) / float(W), v = (float(gid.y) + 0.5) / float(H);
+	float phi = 2.0 * asin(u), l = v * 2.0 - 1.0;
+	float sE = sign(l) * l * l, cE = sqrt(max(1.0 - sE * sE, 0.0));
+	float3 V = float3(cE * cos(phi), sE, cE * sin(phi));
+	float3 S = float3(P.sun.y, P.sun.x, 0.0);
+	float3 o = float3(0.0, SK_RG + P.sun.z, 0.0);
+	float tAtm = skHit(o, V, SK_RT), tG = skHit(o, V, SK_RG);
+	float tMax = (V.y < 0.0 && tG > 0.0) ? tG : tAtm;
+	float cosT = dot(V, S);
+	const float g = 0.8;
+	float phR = 0.05968310 * (1.0 + cosT * cosT);
+	float phM = (1.0 - g * g) / (12.5663706 * pow(1.0 + g * g - 2.0 * g * cosT, 1.5));
+	const int N = 32;
+	float3 tauV = float3(0.0), L = float3(0.0), Lms = float3(0.0);
+	float tPrev = 0.0;
+	for (int i = 0; i < N; i++) {
+		float x1 = float(i + 1) / float(N);
+		float t1 = tMax * x1 * x1, dt = t1 - tPrev, tm = tPrev + 0.5 * dt;
+		tPrev = t1;
+		float3 p = o + V * tm;
+		float dr, dm;
+		float3 ext = skExtinction(length(p) - SK_RG, dr, dm);
+		float3 Tv = exp(-(tauV + 0.5 * ext * dt));
+		tauV += ext * dt;
+		float lenS = skHit(p, S, SK_RT);
+		float3 Ts = exp(-skOptical(p, S, lenS, 6));
+		float3 sc = SK_BR * dr, sm = float3(SK_BMS * dm);
+		float lit = skHit(p, S, SK_RG) > 0.0 ? 0.0 : 1.0;
+		L += Tv * (sc * phR + sm * phM) * Ts * (lit * dt);
+		Lms += Tv * (sc + sm) * Ts * dt;
+	}
+	float3 c = (L + Lms * (0.0795775 * P.misc.x)) * P.sun.w;
+	out.write(float4(c, 1.0), gid);
+}
+
+struct SkyFrame {
+	float4 fwd;       // xyz forward (world)
+	float4 right;     // xyz right x tan(half fov x)
+	float4 up;        // xyz up x tan(half fov y)
+	float4 sun;       // xyz the true sun direction, w the sun disc's cosine of its angular radius
+	float4 sunCol;    // rgb the sun disc's colour (the sun's light after the atmosphere), w rain 0..1
+	float4 night;     // rgb the night sky's zenith colour, w the night amount 0..1
+	float4 nightH;    // rgb the night sky's horizon colour, w the exposure of the table
+	float4 cloudA;    // x base height (world y), y top height, z coverage 0..1, w density
+	float4 cloudB;    // x wind offset x (blocks), y wind offset z, z camera x (world), w camera z
+	float4 cloudC;    // x camera y (world), y time, z cloud softness, w unused
+	float4 cloudSun;  // rgb the sunlight colour on the clouds, w the sun's elevation (sine)
+	float4 cloudAmb;  // rgb the ambient (sky) light colour on the clouds
+};
+
+
+struct SkyV {
+	float4 pos [[position]];
+	float2 ndc;
+};
+
+// ---- clouds: a lit height-field slab marched in the dome (milestone 3) ----
+constexpr sampler skNoise(coord::normalized, filter::linear, address::repeat);
+
+static float skCloudDensity(texture2d<float> nz, float3 p, constant SkyFrame &f, float hf, float lod) {
+	float2 uv = (p.xz + f.cloudB.xy) * (1.0 / 1500.0);
+	float4 n = nz.sample(skNoise, uv, level(0.0));
+	float4 m = nz.sample(skNoise, uv * 3.3 + 0.37, level(0.0));
+	float shape = n.r * 0.7 + n.g * 0.3 - (1.0 - f.cloudA.z);
+	float detail = (m.r - 0.5) * 0.4 * (1.0 - 0.5 * hf) * lod;
+	float d = saturate((shape + detail) * f.cloudC.z);
+	float prof = smoothstep(0.0, 0.18, hf) * smoothstep(1.0, 0.5, hf);
+	return d * prof * f.cloudA.w;
+}
+
+static float skHg(float c, float g) {
+	return (1.0 - g * g) / (12.566 * pow(1.0 + g * g - 2.0 * g * c, 1.5));
+}
+
+// premultiplied colour and coverage of the cloud layer along dir
+static float4 skClouds(texture2d<float> nz, float3 dir, constant SkyFrame &f, float3 sunDir, float3 ambCol, float2 pix) {
+	float y0 = f.cloudA.x, y1 = f.cloudA.y, cy = f.cloudC.x;
+	float fade = smoothstep(0.02, 0.34, dir.y) * (1.0 - smoothstep(y0 - 30.0, y0 + 10.0, cy));
+	if (fade <= 0.0) return float4(0.0);
+	float t0 = max(y0 - cy, 1.0) / dir.y, t1 = (y1 - cy) / dir.y;
+	const int N = 6;
+	float dt = (t1 - t0) / float(N);
+	float lod = 1.0 - smoothstep(600.0, 2500.0, t0);  // the fine detail fades out with distance (it would alias to streaks near the horizon)
+	float jit = fract(52.9829189 * fract(dot(pix, float2(0.06711056, 0.00583715))));
+	float cosS = dot(dir, sunDir);
+	float hgF = skHg(cosS, 0.62);  // the forward lobe: silver linings toward the sun
+	float3 sunC = f.cloudSun.rgb;
+	float T = 1.0;
+	float3 col = float3(0.0);
+	for (int i = 0; i < N; i++) {
+		float t = t0 + (float(i) + jit) * dt;
+		float3 p = float3(f.cloudB.z + dir.x * t, cy + dir.y * t, f.cloudB.w + dir.z * t);
+		float hf = (p.y - y0) / (y1 - y0);
+		float d = skCloudDensity(nz, p, f, hf, lod);
+		if (d > 0.002) {
+			// the sunlight that reaches the point: two samples toward the sun
+			float l1 = skCloudDensity(nz, p + sunDir * 70.0, f, saturate(hf + sunDir.y * 0.5), lod);
+			float l2 = skCloudDensity(nz, p + sunDir * 210.0, f, saturate(hf + sunDir.y * 1.2), lod);
+			float lightT = exp(-(l1 * 70.0 + l2 * 140.0) * 0.045);
+			float3 c = sunC * (lightT * (0.62 + 1.9 * hgF)) + ambCol * (0.38 + 0.62 * hf);
+			c = mix(c, float3(0.50, 0.55, 0.58) * (0.8 + 0.2 * hf), f.sunCol.w * 0.9);  // overcast: even grey light
+			float a = 1.0 - exp(-d * dt * 0.05);
+			col += T * a * c;
+			T *= 1.0 - a;
+		}
+	}
+	return float4(col * fade, (1.0 - T) * fade);
+}
+
+vertex SkyV sky_vs(uint vid [[vertex_id]]) {
+	SkyV o;
+	float2 p = float2(float((vid << 1) & 2) * 2.0 - 1.0, float(vid & 2) * 2.0 - 1.0);
+	o.pos = float4(p, 0.0, 1.0);  // z 0: the far plane of the game's reversed Z
+	o.ndc = p;
+	return o;
+}
+
+// the cloud layer into a small target (a quarter of the screen's pixels: clouds are soft), premultiplied colour and coverage
+fragment float4 cloud_fs(SkyV in [[stage_in]], constant SkyFrame &f [[buffer(0)]], texture2d<float> lut [[texture(0)]], texture2d<float> noise [[texture(1)]]) {
+	float3 dir = normalize(f.fwd.xyz + f.right.xyz * in.ndc.x - f.up.xyz * in.ndc.y);
+	float3 S = f.sun.xyz;
+	float exposure = f.nightH.w;
+	float3 amb = (0.5 + 0.5 * skTone(lut.sample(skSmp, skUvS(float2(0.0, 1.0), 0.93, S), level(0.0)).rgb * exposure)) * f.cloudAmb.rgb * 0.85;
+	return skClouds(noise, dir, f, S, amb, in.pos.xy);
+}
+
+fragment float4 sky_fs(SkyV in [[stage_in]], constant SkyFrame &f [[buffer(0)]], texture2d<float> lut [[texture(0)]], texture2d<float> cloudTex [[texture(2)]]) {
+	float3 dir = normalize(f.fwd.xyz + f.right.xyz * in.ndc.x - f.up.xyz * in.ndc.y);  // (the game's view is flipped in y: its viewport / projection convention)
+	float3 S = f.sun.xyz;
+	float e = dir.y;  // (sin of the elevation)
+	float exposure = f.nightH.w;
+	float3 rad = lut.sample(skSmp, skUvS(dir.xz, max(e, 0.012), S), level(0.0)).rgb * exposure;
+	// the sun: a disc with a soft edge and a glow (the table's aureole is too coarse for the core)
+	float cs = dot(dir, S);
+	float rain = f.sunCol.w;
+	float visible = (1.0 - rain) * smoothstep(-0.02, 0.03, S.y);
+	float disc = smoothstep(f.sun.w - 0.00045, f.sun.w + 0.00030, cs);
+	float ang = sqrt(max(2.0 * (1.0 - cs), 0.0));
+	float glow = 0.55 * exp(-ang * 14.0) + 0.16 * exp(-ang * 4.5) + 0.05 * exp(-ang * 1.4);
+	float3 sunTerm = f.sunCol.rgb * ((disc * 60.0 + glow * 5.0) * visible) * smoothstep(-0.03, 0.05, e);
+	// clouds: the small target, bilinear (it was drawn by cloud_fs, with the sunlight and the zenith as light)
+	float4 cl = float4(0.0);
+	if (f.cloudA.w > 0.0) cl = cloudTex.sample(skSmp, float2(in.ndc.x * 0.5 + 0.5, 0.5 - in.ndc.y * 0.5), level(0.0));
+	float3 c = rad + sunTerm * (1.0 - 0.7 * cl.a);
+	float3 sky = skWarm(skTone(c), float4(f.sunCol.rgb / max(max(f.sunCol.r, f.sunCol.g), max(f.sunCol.b, 1e-3)), f.cloudAmb.w));
+	// night: a faint blue gradient where the sun's light has faded
+	float3 nightC = mix(f.nightH.rgb, f.night.rgb, saturate(e * 2.5)) * f.night.w;
+	sky = sky + nightC * (1.0 - sky);
+	// overcast: the sky's colour turns grey and dull
+	if (rain > 0.0) sky = skOvercast(sky, rain);
+	sky = sky * (1.0 - cl.a) + cl.rgb;
+	// a triangular dither of one 8-bit step: the colour grade after this stretches the gradient's steps
+	float2 pp = in.pos.xy;
+	float n = fract(52.9829189 * fract(dot(pp, float2(0.06711056, 0.00583715)))) + fract(52.9829189 * fract(dot(pp.yx + 19.0, float2(0.06711056, 0.00583715)))) - 1.0;
+	sky += n * (1.0 / 255.0);
+	return float4(sky, 1.0);
 }
 #endif
