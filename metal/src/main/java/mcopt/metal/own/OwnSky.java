@@ -309,8 +309,20 @@ public final class OwnSky {
 				cloudWind[1] = time * WIND * 0.3;
 				boolean covOk = false;
 				if (wantMap) {
-					MemoryUtil.memPutFloat(p + 260, 0f);
-					covOk = OwnNative.skyCov(own, enc, p, PARAM_BYTES);
+					// the coverage map changes slowly (the wind moves it ~1.6 blocks a second; it is centred on the camera): rebuilt every 4th frame, or at once when
+					// the camera has moved a block since (an error of under a block on a layer 230+ blocks up), the history was broken, or it was never built
+					double moved = Math.abs(cam.pos.x - covPos[0]) + Math.abs(cam.pos.y - covPos[1]) + Math.abs(cam.pos.z - covPos[2]);
+					if (!covBuilt || moved > 1.0 || ++covAge >= COV_EVERY || !cloudsBefore) {
+						MemoryUtil.memPutFloat(p + 260, 0f);
+						covOk = OwnNative.skyCov(own, enc, p, PARAM_BYTES);
+						covBuilt = covOk;
+						covAge = 0;
+						covPos[0] = cam.pos.x;
+						covPos[1] = cam.pos.y;
+						covPos[2] = cam.pos.z;
+					} else {
+						covOk = true;
+					}
 				}
 				shape &= covOk;
 				MemoryUtil.memPutFloat(p + 260, (shape ? 1f : 0f) + (accum ? 2f : 0f));
@@ -366,6 +378,11 @@ public final class OwnSky {
 	static final int NOISE = 256;
 	/** The cloud target is the screen divided by this in each direction. */
 	static final int CLOUD_DIV = Integer.getInteger("mcopt.shaders.clouds.div", 6);
+	/** The cloud coverage map is rebuilt at most every this many frames while the camera stands (-Dmcopt.shaders.clouds.mapEvery; 1 every frame). */
+	static final int COV_EVERY = Math.max(1, Integer.getInteger("mcopt.shaders.clouds.mapEvery", 4));
+	private static final double[] covPos = new double[3];
+	private static int covAge;
+	private static boolean covBuilt;
 	/** Temporal clouds: one pixel of each 2 x 2 marched per frame, the others reprojected from the previous frame (-Dmcopt.shaders.clouds.temporal=false: all marched). */
 	static final boolean TEMPORAL = !"false".equals(System.getProperty("mcopt.shaders.clouds.temporal"));
 	/** The previous cloud frame: its view (fwd, right, up as xyz triples), target size, camera position, whether clouds were drawn. */

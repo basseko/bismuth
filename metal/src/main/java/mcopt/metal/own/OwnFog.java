@@ -89,7 +89,12 @@ final class OwnFog {
 		float h = HALO * glow * (1f - 0.9f * rain) * smooth(-0.08f, 0.06f, sinEl);
 		for (int i = 0; i < 3; i++) v[8 + i] = h * OwnSky.warmTint[i];
 		v[11] = 0f;
-		v[12] = v[13] = v[14] = 0f;
+		// fogD.xyz: the frame's twilight tint x gain (terrain.metal skfTint, which depends on the sun alone: the terrain's fog reads it instead of
+		// recomputing it per pixel)
+		float bh = Math.max(0f, Math.min(1f, ((float) Math.exp(-190.0 * (sinEl + 0.09604) * (sinEl + 0.09604)) - 0.05f) / 0.95f));
+		float pk = smooth(0.05f, 0.17f, sinEl) * (1f - smooth(0.40f, 0.60f, sinEl));
+		float[] tt = {1.05f * 1.2f, 0.84f * 1.2f, 0.93f * 1.2f}, tb = {0.95f, 0.80f, 1.0f};
+		for (int i = 0; i < 3; i++) v[12 + i] = (1f + (tt[i] - 1f) * pk * pk) * (1f + (tb[i] - 1f) * bh) * (1f + 2f * bh) * GAIN;
 		v[15] = GAIN;
 	}
 

@@ -2592,6 +2592,35 @@ int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int le
 			[r setFragmentTexture:fg.src atIndex:6];
 		}
 	}
+	// the grade table (PostFrame.gr2.x, float 64, asked for by OwnLight): post_fs's colour maths baked into 33^3 in the pre command buffer, from this frame's block
+	if (pbuf[64] > 0.5f) {
+		static id<MTLTexture> gradeLut;
+		static id<MTLComputePipelineState> gradePso;
+		if (!gradeLut) {
+			MTLTextureDescriptor *d = [MTLTextureDescriptor new];
+			d.textureType = MTLTextureType3D;
+			d.pixelFormat = MTLPixelFormatRGBA16Float;
+			d.width = d.height = d.depth = 33;
+			d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+			d.storageMode = MTLStorageModePrivate;
+			gradeLut = [w->ctx->device newTextureWithDescriptor:d];
+			[d release];
+			gradeLut.label = @"shade grade table";
+		}
+		if (gradeLut && ownLazyKernel(w, &gradePso, "grade_lut")) {
+			mc_pre_end_encoders(enc);
+			id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];
+			c.label = @"shade grade table";
+			[c setComputePipelineState:gradePso];
+			[c setBytes:pbuf length:288 atIndex:0];
+			[c setTexture:gradeLut atIndex:0];
+			[c dispatchThreads:MTLSizeMake(33, 33, 33) threadsPerThreadgroup:MTLSizeMake(4, 4, 4)];
+			[c endEncoding];
+			[r setFragmentTexture:gradeLut atIndex:7];
+		} else {
+			pbuf[64] = 0.0f;
+		}
+	}
 	MTLPixelFormat cf = enc->colors[0].pixelFormat, df = enc->depth ? enc->depth.pixelFormat : MTLPixelFormatInvalid;
 	id<MTLRenderPipelineState> pso = nil;
 	for (int i = 0; i < post.n; i++)

@@ -28,6 +28,8 @@ public final class OwnVolume {
 	static final float LIGHT = prop("mcopt.shaders.volumetric.light", 0.55f), AMBIENT = prop("mcopt.shaders.volumetric.ambient", 0.08f);
 	/** Extra density at a low sun, in forests. */
 	static final float LOW_SUN = prop("mcopt.shaders.volumetric.lowSun", 1.0f), FOREST = prop("mcopt.shaders.volumetric.forest", 0.8f);
+	/** Also march under a high sun over open land, where it is invisible. */
+	static final boolean NOON = Boolean.getBoolean("mcopt.shaders.volumetric.noon");
 	/** The screen-space shafts (bloom_up) keep this fraction of their strength while the volumetric light is on. */
 	static final float SHAFT_KEEP = prop("mcopt.shaders.volumetric.shafts", 0.25f);
 	/** The composite's strength over the sky pixels (the dome has its own atmosphere). */
@@ -89,6 +91,12 @@ public final class OwnVolume {
 					target = 0f;
 				}
 				forest += (target - forest) * 0.15f;
+			}
+			// a high sun: the shafts are too faint to see (the analytic fog covers the haze), so the march is skipped (-Dmcopt.shaders.volumetric.noon=true keeps it)
+			if (!NOON && sun && lowSun < 0.05f) {
+				lastOn = false;
+				OwnNative.volFrame(t.shadeOwn(), 0, 0, 0);
+				return false;
 			}
 			float dens = DENSITY * (1.0f + LOW_SUN * lowSun * (sun ? 1f : 0f)) * (1.0f + FOREST * forest);
 			float[] tint = OwnSky.sunTrans;

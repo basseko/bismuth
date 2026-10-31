@@ -1582,7 +1582,7 @@ struct ShadeFrame {
 	float4 fogA;          // x camera height above the Rayleigh layer's base (blocks), y above the Mie layer's, z 1: the analytic fog is on, w the dome's ray length (render distance)
 	float4 fogB;          // rgb Rayleigh extinction (1 / block at the layer's base), w Mie extinction
 	float4 fogC;          // rgb the sun's light colour for the Mie halo (phase x this), w unused
-	float4 fogD;          // rgb unused, w the display gain of the linear sky radiance
+	float4 fogD;          // rgb the twilight tint x the display gain (skfTint on the CPU, for the terrain's fog), w the display gain of the linear sky radiance
 	float4 fol0;          // 432 foliage track: x flags (1 foliage transmission, 2 variable penumbra, 4 distant foliage takes the skylight test, 8 leaves take the up ambient, 16 no far cascade (skylight test beyond), 32 distance-scaled bias and leak fix), y distance where distant foliage starts to skip the map, z where it fully does, w the transmission's absorption per block
 	float4 fol1;          // 448 x leaf transmission, y leaf sheen, z plant transmission, w plant sheen
 	float4 fol2;          // 464 x penumbra blocks per block of blocker distance, y its maximum (blocks, radius), zw unused
@@ -2669,6 +2669,17 @@ static float skfPhase(float c) {
 	return s * (1.0 / 1.875);
 }
 
+// the terrain's fog colour (linear), per pixel: as skfHaze with the frame's tint x gain from the CPU (tg = fogD.xyz) and the phase's four octaves folded into
+// three lobes (the later octaves are nearly isotropic): a fraction of the ALU of skfHaze, which the dome keeps
+static float3 skfHazeT(texture2d<float> lut, float3 dir, float3 sunDir, float exposure, float4 C, float3 tg, float wM) {
+	float sy = clamp(dir.y, 0.025, 0.29);
+	float3 c = lut.sample(skSmp, skUvS(dir.xz, sy, sunDir), level(0.0)).rgb * (exposure * tg);
+	float lum = dot(c, float3(0.3, 0.59, 0.11));
+	float cs = dot(dir, sunDir);
+	float ph = 0.533 * (0.7 * skfHG(cs, 0.5) + 0.3 * skfHG(cs, -0.2)) + 0.467 * (0.7 * skfHG(cs, 0.25) + 0.3);
+	return max(mix(float3(lum), c, 1.1), 0.0) + C.rgb * (wM * ph);
+}
+
 // the fog's colour (linear) toward dir: the table's sky a little above the horizon in that azimuth, plus the sun's Mie halo
 static float3 skfHaze(texture2d<float> lut, float3 dir, float3 sunDir, float exposure, float4 C, float gain, float wM) {
 	float sy = clamp(dir.y, 0.025, 0.29);
@@ -3316,7 +3327,8 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 			float wM;
 			float3 T = skfT(sf.fogA, sf.fogB, dir.y, dist, wM);
 			if (any(T < 0.996) || fogValue > 0.004) {
-				float3 hz = skOvercast(skfDisp(skfHaze(skLut, dir, sf.sunTrue.xyz, sf.haze.z, sf.fogC, sf.fogD.w, wM)), sf.sunTrue.w);
+				float3 hz = skfDisp(skfHazeT(skLut, dir, sf.sunTrue.xyz, sf.haze.z, sf.fogC, sf.fogD.xyz, wM));
+				if (sf.sunTrue.w > 0.0) hz = skOvercast(hz, sf.sunTrue.w);
 				color.rgb = mix(color.rgb, hz, 1.0 - T);
 				fogRgb = hz;  // (vanilla's render distance fade goes to the same colour)
 			}
@@ -4612,7 +4624,8 @@ struct PostFrame {
 	float4 vol1;    // 208: x composite strength, y the march's maximum distance (blocks), z the strength over the sky, w 0
 	float4 gr0;     // (grade track, 224) x log-space contrast about mid grey (1 off), y orange saturation boost, z teal saturation boost, w gain() S-curve exponent - 1 (0 off)
 	float4 gr1;     // x Purkinje intensity (light level below which the rod shift is half; 0 off), y bloomy fog strength (0 off: the blur is not bound), z fog density (1/blocks), w 1 under water
-	float4 gr2, gr3;  // spare
+	float4 gr2;     // x 1: the grade table is bound (gradeLut, texture 7; mcs_post sets it), yzw spare
+	float4 gr3;     // spare
 };
 
 struct PostV {
@@ -4705,6 +4718,14 @@ static half3 volComposite(half3 lin, texture2d<float> volTex, texture2d<float> v
 	int2 i0 = int2(floor(q)), mx = int2(volTex.get_width() - 1, volTex.get_height() - 1);
 	float4 acc = float4(0.0);
 	float ws = 0.0;
+	// (the common case: the quarter-size distance around the pixel matches its own, so the plain bilinear result is right: two samples instead of eight reads)
+	constexpr sampler vs(filter::linear, address::clamp_to_edge);
+	float2 uv = pp * float2(f.vol0.y, f.vol0.z) * 0.25;
+	float dl = volDist.sample(vs, uv).r;
+	if (abs(dl - dc) < 0.04 * dc + 0.25) {
+		acc = volTex.sample(vs, uv);
+		ws = 1.0;
+	} else
 	for (int k = 0; k < 4; k++) {
 		int2 c = clamp(i0 + int2(k & 1, k >> 1), int2(0), mx);
 		float bw = ((k & 1) != 0 ? fr.x : 1.0 - fr.x) * ((k >> 1) != 0 ? fr.y : 1.0 - fr.y);
@@ -4770,13 +4791,37 @@ static half grFogWeight(float code, float strength, float dens, bool water) {
 }
 
 
+// The colour maths of post_fs from the exposed linear colour to the graded display colour: Purkinje, log contrast, the tone curve, lift, the saturation /
+// contrast matrix, hue boosts, gain(). It depends on the colour alone, so grade_lut bakes it into a 33^3 table each frame (one trilinear sample per pixel
+// instead of the logs and exps); post_fs runs it directly when the table is not there.
+constant float GL_MAX = 2.0;  // (the table's range of linear input: e = sqrt(lin / GL_MAX))
+
+static half3 postGrade(half3 lin, constant PostFrame &f) {
+	if (f.gr1.x > 0.0) lin = grPurkinje(lin, half(f.gr1.x));
+	if (f.gr0.x != 1.0) lin = grLogContrast(lin, half(f.gr0.x));
+	half3 mapped = (lin * (2.51h * lin + 0.03h)) / (lin * (2.43h * lin + 0.59h) + 0.14h);
+	half3 g = sqrt(mix(min(lin, 1.0h), saturate(mapped), half(f.gk.w)));
+	g = g * half3(f.la.rgb) + half3(f.lb.rgb);
+	half3 o = half3(dot(half3(f.m0.xyz), g) + half(f.m0.w), dot(half3(f.m1.xyz), g) + half(f.m1.w), dot(half3(f.m2.xyz), g) + half(f.m2.w));
+	if (f.gr0.y != 0.0 || f.gr0.z != 0.0) o = grHues(o, half(f.gr0.y), half(f.gr0.z));
+	if (f.gr0.w != 0.0) o = grGain(o, half(1.0 + f.gr0.w));
+	return o;
+}
+
+kernel void grade_lut(constant PostFrame &f [[buffer(0)]], texture3d<half, access::write> lut [[texture(0)]], uint3 gid [[thread_position_in_grid]]) {
+	if (any(gid >= 33u)) return;
+	float3 e = float3(gid) * (1.0 / 32.0);
+	lut.write(half4(postGrade(half3(e * e * GL_MAX), f), 1.0h), gid);
+}
+
 // The tone curve is Narkowicz's fit of the ACES filmic curve (public; 2015). Half precision: the target is 8 bits.
 // Bloom and light shafts (milestone 6): this pass also WRITES a half-resolution source texture (bright-pass colour + sky mask; a 2x2 quad average,
 // one write per quad) that compute kernels blur and march in the next frame's pre command buffer (bloom_down / bloom_up); this pass ADDS the
 // result of the previous frame (bloomTex, a quarter-resolution RGBA16F: bloom in rgb, shaft strength in a). One frame of lag, no pass split.
 fragment half4 post_fs(PostV in [[stage_in]], half4 dst [[color(0)]], constant PostFrame &f [[buffer(0)]], texture2d<half> bloomTex [[texture(0)]],
 	texture2d<half, access::write> bloomSrc [[texture(1)]], texture2d<float, access::write> sceneSrc [[texture(2)]], texture2d<float> volTex [[texture(3)]],
-	texture2d<float> volDist [[texture(4)]], texture2d<half> fogTex [[texture(5)]], texture2d<half, access::write> fogSrc [[texture(6)]], uint lane [[thread_index_in_quadgroup]]) {
+	texture2d<float> volDist [[texture(4)]], texture2d<half> fogTex [[texture(5)]], texture2d<half, access::write> fogSrc [[texture(6)]], texture3d<half> gradeLut [[texture(7)]],
+	uint lane [[thread_index_in_quadgroup]]) {
 	if (f.ws.x > 0.5) {
 		// tile water's scene for the next frame (OwnWater.TILE, half size): the colour before the grade (a quad mean) and the quad's nearest distance from the
 		// alpha code (the sky and unknown: far)
@@ -4792,14 +4837,13 @@ fragment half4 post_fs(PostV in [[stage_in]], half4 dst [[color(0)]], constant P
 	// display -> linear with gamma 2 (a multiply instead of a pow), expose and balance, tone curve, back with a square root
 	half3 lin = dst.rgb * dst.rgb * half3(f.gk.rgb);
 	if (f.vol0.x > 0.5) lin = volComposite(lin, volTex, volDist, f, float(dst.a), in.pos.xy);
-	if (f.gr1.x > 0.0) lin = grPurkinje(lin, half(f.gr1.x));
-	if (f.gr0.x != 1.0) lin = grLogContrast(lin, half(f.gr0.x));
-	half3 mapped = (lin * (2.51h * lin + 0.03h)) / (lin * (2.43h * lin + 0.59h) + 0.14h);
-	half3 g = sqrt(mix(min(lin, 1.0h), saturate(mapped), half(f.gk.w)));
-	g = g * half3(f.la.rgb) + half3(f.lb.rgb);
-	half3 o = half3(dot(half3(f.m0.xyz), g) + half(f.m0.w), dot(half3(f.m1.xyz), g) + half(f.m1.w), dot(half3(f.m2.xyz), g) + half(f.m2.w));
-	if (f.gr0.y != 0.0 || f.gr0.z != 0.0) o = grHues(o, half(f.gr0.y), half(f.gr0.z));
-	if (f.gr0.w != 0.0) o = grGain(o, half(1.0 + f.gr0.w));
+	half3 o;
+	if (f.gr2.x > 0.5) {
+		constexpr sampler gs(filter::linear, address::clamp_to_edge);
+		o = gradeLut.sample(gs, float3(sqrt(min(float3(lin), GL_MAX) * (1.0 / GL_MAX))) * (32.0 / 33.0) + 0.5 / 33.0).rgb;
+	} else {
+		o = postGrade(lin, f);
+	}
 	float2 pp = in.pos.xy;
 	if (f.bl.w > 0.5) {
 		// the source for the next frame: the bright part of THIS picture before the bloom is added (else it feeds on itself) and the sky mask, averaged over the quad

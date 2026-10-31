@@ -211,5 +211,10 @@ public final class OwnLight {
 			else fogK = 0.45f * FOG * Math.min(1f, rain);
 		}
 		b.put(pk).put(fogK).put(fogD).put(water ? 1f : 0f);
+		// gr2.x: ask for the grade table (mcs_post bakes post_fs's colour maths into 33^3 and clears this if it cannot); -Dmcopt.shaders.grade.lut=false, probe shaders.grade.lut
+		b.put(GRADE_LUT && OwnProbe.bool("shaders.grade.lut", true) ? 1f : 0f).put(0f).put(0f).put(0f);
 	}
+
+	/** post_fs's colour maths baked into a 3D table once per frame (one sample per pixel instead of the logs and exps). */
+	static final boolean GRADE_LUT = !"false".equals(System.getProperty("mcopt.shaders.grade.lut"));
 }
