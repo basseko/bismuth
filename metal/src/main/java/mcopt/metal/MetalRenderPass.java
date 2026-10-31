@@ -47,6 +47,7 @@ final class MetalRenderPass implements RenderPassBackend {
 	private @Nullable MetalPipeline recording;
 	/** The frontend's index buffer, restored after MetalTerrain draws with its own. */
 	private long indexHandle;
+	private @Nullable MetalBuffer indexBuf;
 	private int indexInt;
 	/** What the frontend set in the encoder besides uniforms, for MetalTerrain.OCC to put back after it splits the pass. */
 	private final int[] scissor = new int[4];
@@ -56,6 +57,8 @@ final class MetalRenderPass implements RenderPassBackend {
 	/** Shaders milestone 5 (EntityShade.CAST): what each uniform slot is bound to now (buffer or texture handle, offset, sampler), for recording casters. */
 	private final long @Nullable [] capH = EntityShade.CAST ? new long[MAX_UNIFORMS] : null, capO = EntityShade.CAST ? new long[MAX_UNIFORMS] : null,
 		capT = EntityShade.CAST ? new long[MAX_UNIFORMS] : null, capS = EntityShade.CAST ? new long[MAX_UNIFORMS] : null;
+	/** The MetalBuffer behind each capH entry (null for textures), to check the blit hazard at the replay. */
+	private final @Nullable MetalBuffer[] capB = EntityShade.CAST ? new MetalBuffer[MAX_UNIFORMS] : null;
 
 	private final boolean hasDepth;
 	/** Shaderpack runtime: draws this pass's pipelines with its own (see MetalHooks); null on the backend's own path. */
@@ -254,7 +257,8 @@ final class MetalRenderPass implements RenderPassBackend {
 
 	@Override
 	public void setIndexBuffer(GpuBuffer indexBuffer, IndexType indexType) {
-		this.indexHandle = this.encoder.use(indexBuffer).handle;
+		this.indexBuf = this.encoder.use(indexBuffer);
+		this.indexHandle = this.indexBuf.handle;
 		this.indexInt = indexType == IndexType.INT ? 1 : 0;
 		Native.index(this.enc, this.indexHandle, this.indexInt);
 	}
@@ -275,6 +279,9 @@ final class MetalRenderPass implements RenderPassBackend {
 		d.handle = Arrays.copyOf(this.capH, n);
 		d.offset = Arrays.copyOf(this.capO, n);
 		d.texture = Arrays.copyOf(this.capT, n);
+		d.buf = Arrays.copyOf(this.capB, n);
+		d.vbuf = encoder.use(vb.buffer());
+		d.ibuf = this.indexBuf;
 		d.sampler = Arrays.copyOf(this.capS, n);
 		d.vertex = encoder.use(vb.buffer()).handle;
 		d.vertexOffset = vb.offset();
@@ -320,9 +327,11 @@ final class MetalRenderPass implements RenderPassBackend {
 		switch (uniform.type()) {
 			case UNIFORM_BUFFER -> {
 				GpuBufferSlice slice = (GpuBufferSlice) value;
-				long handle = this.encoder.use(slice.buffer()).handle;
+				MetalBuffer mb = this.encoder.use(slice.buffer());
+				long handle = mb.handle;
 				Native.buffer(this.enc, i, handle, slice.offset());
 				if (EntityShade.CAST) {
+					this.capB[i] = mb;
 					this.capH[i] = handle;
 					this.capO[i] = slice.offset();
 					this.capT[i] = 0;
@@ -333,6 +342,7 @@ final class MetalRenderPass implements RenderPassBackend {
 				Native.texture(this.enc, i, ((MetalTexture.View) ts.view()).handle, ((MetalSampler) ts.sampler()).handle());
 				if (EntityShade.CAST) {
 					this.capH[i] = 0;
+					this.capB[i] = null;
 					this.capT[i] = ((MetalTexture.View) ts.view()).handle;
 					this.capS[i] = ((MetalSampler) ts.sampler()).handle();
 				}

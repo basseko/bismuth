@@ -53,7 +53,8 @@ public final class EntityShade {
 	private static boolean haveView;
 	private static final List<Draw> draws = new ArrayList<>();
 	private static boolean failed, said;
-	private static long frames, castedFrames, castedDraws;
+	private static long frames, castedFrames, castedDraws, skippedDraws, recordedDraws;
+	private static final boolean LOG = Boolean.getBoolean("mcopt.shaders.log");
 
 	private EntityShade() {
 	}
@@ -146,14 +147,25 @@ public final class EntityShade {
 	static final class Draw {
 		MetalPipeline p;
 		long[] handle, offset, texture, sampler;
+		MetalBuffer[] buf;
+		MetalBuffer vbuf, ibuf;
 		long vertex, vertexOffset, index;
 		int indexInt, count, instances, first, base, firstInstance;
 	}
 
 	/** Before the frame's commit: replays the recorded casters into cascade 0 of this frame's shadow map (pre command buffer). */
-	static void flush(long enc) {
+	static void flush(long enc, long submit) {
 		if (draws.isEmpty()) return;
 		try {
+			// The replay runs in the pre command buffer, before the main one. A buffer a GPU copy (blit, encoded in the main stream) fills in this submit
+			// still holds the previous contents at that point (stale vertices, indices or uniforms), so the draws reading one are dropped: a missing
+			// shadow for a frame is better than a lagging or garbage one. Buffers the CPU writes (maps, memcpy, renamed memory) are already final.
+			recordedDraws += draws.size();
+			int before = draws.size();
+			draws.removeIf(d -> stale(d, submit));
+			skippedDraws += before - draws.size();
+			if (LOG && frames % 300 == 0) System.out.println("mcopt-shaders: " + stats());
+			if (draws.isEmpty()) return;
 			replay(enc);
 		} catch (RuntimeException e) {
 			fail("cast", e);
@@ -161,6 +173,16 @@ public final class EntityShade {
 			draws.clear();
 			castActive = false;
 		}
+	}
+
+	/** The draw reads a buffer that a blit of this submit writes. */
+	private static boolean stale(Draw d, long submit) {
+		if (d.vbuf.blitSubmit == submit || d.ibuf != null && d.ibuf.blitSubmit == submit) return true;
+		MetalBuffer[] b = d.buf;
+		for (int i = 0; i < b.length; i++) {
+			if (b[i] != null && b[i].blitSubmit == submit && d.handle[i] != 0) return true;
+		}
+		return false;
 	}
 
 	private static void replay(long enc) {
@@ -312,6 +334,6 @@ public final class EntityShade {
 
 	/** Statistics line for -Dmcopt.shaders.log. */
 	public static String stats() {
-		return "entity shadows: " + castedFrames + " frames, " + castedDraws + " draws";
+		return "entity shadows: " + castedFrames + " frames, " + castedDraws + " draws replayed, " + skippedDraws + " of " + recordedDraws + " recorded skipped (blit hazard)";
 	}
 }

@@ -15,6 +15,8 @@ class MetalBuffer extends BaseGpuBuffer {
 	long handle, address;
 	/** Submit index of the last command that touched this buffer on the GPU; see MetalEncoder.idle. */
 	long lastUse = -1;
+	/** Submit index of the last GPU copy (blit) into this buffer; EntityShade's pre-command-buffer replay must not read a buffer a blit of the same submit fills (the blit runs after it). */
+	long blitSubmit = -1;
 	/** One of Sodium's arena buffers (its terrain geometry), with MetalTerrain on: GPU copies into it go to the pre command buffer. */
 	boolean arena;
 	private final MetalEncoder encoder;

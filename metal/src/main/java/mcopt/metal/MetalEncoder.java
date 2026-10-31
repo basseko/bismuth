@@ -148,6 +148,11 @@ final class MetalEncoder implements CommandEncoderBackend {
 		System.out.println(line);
 	}
 
+	/** The submit being recorded (EntityShade: a replay in the pre command buffer compares it with MetalBuffer.blitSubmit). */
+	long currentSubmit() {
+		return this.submitIndex;
+	}
+
 	/** Marks a buffer as referenced by the submit being recorded. Every GPU reference to a buffer must go through here. */
 	MetalBuffer use(GpuBuffer buffer) {
 		MetalBuffer b = (MetalBuffer) buffer;
@@ -207,7 +212,7 @@ final class MetalEncoder implements CommandEncoderBackend {
 		long cmd;
 		try {
 			if (GPU_TIMES) GpuTimes.submit(this.submitIndex, this.encoderIndex);
-			if (EntityShade.CAST) EntityShade.flush(this.enc);  // (shaders: the frame's entity casters into the shadow map, in the pre command buffer)
+			if (EntityShade.CAST) EntityShade.flush(this.enc, this.submitIndex);  // (shaders: the frame's entity casters into the shadow map, in the pre command buffer)
 			cmd = Native.encCommit(this.enc);
 		} finally {
 			MetalEvents.end(commitEvent);
@@ -632,6 +637,7 @@ final class MetalEncoder implements CommandEncoderBackend {
 
 	/** In a frame that splits, Sodium geometry copied before its culling waits for the split (see MetalTerrain.hold); the rest goes in order. */
 	private void blitBuffer(MetalBuffer src, long srcOffset, MetalBuffer dst, long dstOffset, long size) {
+		dst.blitSubmit = this.submitIndex;
 		if (dst.arena && this.terrain.split && !this.terrain.culledThisFrame()) {
 			this.terrain.hold(src, srcOffset, dst, dstOffset, size);
 		} else {
