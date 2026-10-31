@@ -91,6 +91,7 @@ enum { MCE_KIND_RENDER = 1, MCE_KIND_SERIAL, MCE_KIND_CONCURRENT, MCE_KIND_BLIT 
 	id cmd;
 	id sync;  // MceSync, the record the resource map points at
 	id waits[16];
+	unsigned long waitStages[16];  // MTLStages each fence was waited for
 	int nwaits;
 	int tsIndex;  // MCE_PASSTIME: its start timestamp's index in the command buffer's heap (-1 none)
 	int merged;  // its real encoder is shared with the previous compute encoder(s) of the command buffer
