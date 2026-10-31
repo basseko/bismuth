@@ -2470,15 +2470,84 @@ static int volMarch(Own *w, Enc *enc, id<MTLTexture> src) {
 	return 1;
 }
 
+// Bloomy fog (grade track): an UNTHRESHOLDED quarter-resolution source (post_fs writes it, texture 6), blurred in the pre command buffer to 1/8 (texture 5 of
+// post_fs next frame). Only allocated and run while the fog is on (rain, under water). src: 1/4, d[0]: 1/8, d[1]: 1/16, up: 1/8.
+static struct {
+	id<MTLTexture> src, d[2], up;
+	NSUInteger w, h;
+	id<MTLComputePipelineState> down, upk, clear;
+	int failed;
+} fg;
+
+static int fgEnsure(Own *w, Enc *enc) {
+	NSUInteger W = (NSUInteger) enc->width, H = (NSUInteger) enc->height;
+	if (fg.failed) return 0;
+	if (fg.src && fg.w == W && fg.h == H) return 1;
+	[fg.src release]; [fg.d[0] release]; [fg.d[1] release]; [fg.up release];
+	fg.src = fg.d[0] = fg.d[1] = fg.up = nil;
+	fg.w = W;
+	fg.h = H;
+	if (!ownLazyKernel(w, &fg.down, "bloom_down") || !ownLazyKernel(w, &fg.upk, "fog_up") || !ownLazyKernel(w, &fg.clear, "bloom_clear")) {
+		fg.failed = 1;
+		return 0;
+	}
+	NSUInteger qw = (W + 3) / 4, qh = (H + 3) / 4;
+	fg.src = blTex(w, MTLPixelFormatRGBA8Unorm, qw, qh, @"shade fog src");
+	fg.d[0] = blTex(w, MTLPixelFormatRGBA16Float, (qw + 1) / 2, (qh + 1) / 2, @"shade fog 1/8");
+	fg.d[1] = blTex(w, MTLPixelFormatRGBA16Float, (qw + 3) / 4, (qh + 3) / 4, @"shade fog 1/16");
+	fg.up = blTex(w, MTLPixelFormatRGBA16Float, (qw + 1) / 2, (qh + 1) / 2, @"shade fog up");
+	if (!fg.src || !fg.d[0] || !fg.d[1] || !fg.up) { fg.failed = 1; return 0; }
+	mc_pre_end_encoders(enc);
+	id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];
+	c.label = @"shade fog clear";
+	[c setComputePipelineState:fg.clear];
+	id<MTLTexture> all[4] = {fg.src, fg.d[0], fg.d[1], fg.up};
+	for (int i = 0; i < 4; i++) {
+		[c setTexture:all[i] atIndex:0];
+		[c dispatchThreads:MTLSizeMake(all[i].width, all[i].height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+	}
+	[c endEncoding];
+	return 1;
+}
+
+static void fgChain(Own *w, Enc *enc) {
+	mc_pre_end_encoders(enc);
+	id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];
+	c.label = @"shade fog blur";
+	uint32_t zero = 0;
+	float gz = 0.0f;
+	[c setComputePipelineState:fg.down];
+	id<MTLTexture> in = fg.src;
+	for (int i = 0; i < 2; i++) {
+		[c setTexture:in atIndex:0];
+		[c setTexture:fg.d[i] atIndex:1];
+		[c setBytes:&zero length:4 atIndex:1];
+		// (bloom_down's water glare input, track water: off here, but bound so the arguments are complete)
+		[c setTexture:fg.src atIndex:2];
+		[c setBytes:&gz length:4 atIndex:2];
+		[c dispatchThreads:MTLSizeMake(fg.d[i].width, fg.d[i].height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+		in = fg.d[i];
+	}
+	[c setComputePipelineState:fg.upk];
+	[c setTexture:fg.d[1] atIndex:0];
+	[c setTexture:fg.d[0] atIndex:1];
+	[c setTexture:fg.up atIndex:3];
+	[c dispatchThreads:MTLSizeMake(fg.up.width, fg.up.height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+	[c endEncoding];
+}
+
 int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int length, char *err, int errCap) {
 	id<MTLRenderCommandEncoder> r = enc->render;
-	if (!r || enc->colorCount != 1 || !enc->colors[0] || enc->colors[0] != target || length > 256) return 0;
-	float pbuf[64];
+	if (!r || enc->colorCount != 1 || !enc->colors[0] || enc->colors[0] != target || length > 288) return 0;
+	float pbuf[72];
 	memset(pbuf, 0, sizeof pbuf);
 	memcpy(pbuf, params, (size_t) length);
 	int bloom = length >= 160 && pbuf[27] > 0.5f && blEnsure(w, enc);
 	if (length >= 160 && !bloom) pbuf[27] = 0.0f;  // (the shader must not touch textures that are not bound)
-	if (length < 224) length = 224;  // (PostFrame.ws is set here; uw 176 the water track's, vol0 / vol1 192 the volumetric light's; zeros up to 223)
+	// bloomy fog (PostFrame.gr1.y, float 61): needs the bloom block; else off (post_fs textures 5 / 6 stay unbound)
+	int fog = bloom && length >= 248 && pbuf[61] > 0.0f && fgEnsure(w, enc);
+	if (length >= 248 && !fog) pbuf[61] = 0.0f;
+	if (length < 288) length = 288;  // (PostFrame: ws 160 set here; uw 176 the water track's, vol0 / vol1 192 the volumetric light's (set here), gr0..gr3 224 the grade track's)
 	params = pbuf;
 	// tile water: the scene copy for the next frame's water (half size; a new size starts without one)
 	id<MTLTexture> sceneOut = nil;
@@ -2517,6 +2586,11 @@ int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int le
 		if (pbuf[35] < 0.5f) blChain(w, enc, bl.src[(f + 1) & 1], bl.gl[(f + 1) & 1], bl.gl[f & 1], pbuf[46], params, length);  // (pbuf[35]: probe shaders.bloom.chain off, a measurement)
 		[r setFragmentTexture:bl.ut[0] atIndex:0];
 		[r setFragmentTexture:bl.src[f & 1] atIndex:1];
+		if (fog) {
+			fgChain(w, enc);
+			[r setFragmentTexture:fg.up atIndex:5];
+			[r setFragmentTexture:fg.src atIndex:6];
+		}
 	}
 	MTLPixelFormat cf = enc->colors[0].pixelFormat, df = enc->depth ? enc->depth.pixelFormat : MTLPixelFormatInvalid;
 	id<MTLRenderPipelineState> pso = nil;

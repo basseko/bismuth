@@ -23,7 +23,7 @@ import org.lwjgl.system.MemoryUtil;
 public final class OwnPost {
 	private static boolean failed, said, splitSaid;
 	/** PostFrame's size (terrain.metal). */
-	static final int BYTES = 192;
+	static final int BYTES = 288;
 	/** -Dmcopt.shaders.bloom=0 turns bloom and the light shafts off for good (and the extra texture writes of the pass with them). */
 	static final boolean BLOOM_ON = OwnLight.BLOOM > 0 || OwnLight.SHAFTS > 0;
 

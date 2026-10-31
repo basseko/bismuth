@@ -28,14 +28,14 @@ public final class OwnLight {
 	 */
 	private static final float[][] TABLE = {
 		// el     ambient               sun                   shade tint            expo  contr sat   gain                 lift                    split              tone  sky
-		{-0.3f, 0.42f, 0.62f, 1f, 0.45f, 0.60f, 1f, 0.45f, 0.6f, 1f, 0.70f, 1.0f, 1.1f, 0.43f, 1.06f, 0.78f, 0.02f, 0.04f, 0.06f, 0, 0, 0, 0.75f, 0.165f, 0.159f, 0.209f},
+		{-0.3f, 0.42f, 0.62f, 1f, 0.45f, 0.60f, 1f, 0.45f, 0.6f, 1f, 0.70f, 1.0f, 1.3f, 0.43f, 1.06f, 0.78f, 0.02f, 0.04f, 0.06f, 0, 0, 0, 0.75f, 0.165f, 0.159f, 0.209f},
 		{-0.1f, 0.62f, 0.62f, 1f, 0.8f, 0.6f, 0.45f, 0.7f, 0.7f, 1f, 0.85f, 0.94f, 1f, 0.95f, 1.12f, 0.85f, 0.005f, 0.035f, 0.06f, 0, 0, 0, 0.75f, 0.1f, 0.11f, 0.2f},
 		{-0.02f, 0.85f, 0.65f, 0.85f, 1f, 0.42f, 0.18f, 0.9f, 0.72f, 0.82f, 1f, 0.95f, 1.12f, 1.25f, 1f, 0.75f, 0.02f, 0.01f, 0.04f, 0, 0, 0, 0.75f, 0.35f, 0.28f, 0.38f},
-		{0.05f, 0.96f, 0.76f, 0.62f, 1f, 0.5f, 0.2f, 0.93f, 0.82f, 0.74f, 1.05f, 0.92f, 1.1f, 1.3f, 1.06f, 0.68f, 0.02f, 0.008f, 0.025f, 0, 0, 0, 0.75f, 0.5f, 0.38f, 0.36f},
-		{0.14f, 0.97f, 0.8f, 0.66f, 1f, 0.56f, 0.26f, 0.95f, 0.84f, 0.76f, 1f, 0.92f, 1.1f, 1.32f, 1.06f, 0.66f, 0.02f, 0.012f, 0.025f, 0, 0, 0, 0.75f, 0.46f, 0.4f, 0.41f},
+		{0.05f, 0.96f, 0.76f, 0.62f, 1f, 0.5f, 0.2f, 0.93f, 0.82f, 0.74f, 1.15f, 0.92f, 1.1f, 1.3f, 1.06f, 0.68f, 0.02f, 0.008f, 0.025f, 0, 0, 0, 0.75f, 0.5f, 0.38f, 0.36f},
+		{0.14f, 0.97f, 0.8f, 0.66f, 1f, 0.56f, 0.26f, 0.95f, 0.84f, 0.76f, 1.08f, 0.92f, 1.1f, 1.32f, 1.06f, 0.66f, 0.02f, 0.012f, 0.025f, 0, 0, 0, 0.75f, 0.46f, 0.4f, 0.41f},
 		{0.3f, 1f, 0.85f, 0.68f, 1f, 0.75f, 0.52f, 0.96f, 0.88f, 0.82f, 0.92f, 0.98f, 1f, 1.28f, 0.98f, 0.68f, 0.015f, 0.015f, 0.03f, 0, 0, 0, 0.75f, 0.45f, 0.43f, 0.47f},
-		{0.47f, 0.95f, 0.93f, 1f, 1f, 0.88f, 0.74f, 0.92f, 0.94f, 1f, 0.8f, 1.0f, 0.85f, 1.2f, 0.92f, 0.72f, 0.012f, 0.012f, 0.025f, 0, 0, 0, 0.75f, 0.217f, 0.398f, 0.814f},
-		{0.85f, 0.86f, 0.93f, 1f, 1f, 0.95f, 0.88f, 0.88f, 0.94f, 1f, 0.82f, 0.96f, 1.05f, 0.78f, 1.04f, 1.1f, 0, 0.005f, 0.03f, 0, 0, 0, 0.75f, 0.386f, 0.5f, 0.754f},
+		{0.47f, 0.95f, 0.93f, 1f, 1f, 0.88f, 0.74f, 0.92f, 0.94f, 1f, 0.8f, 1.0f, 0.85f, 1.2f, 0.92f, 0.72f, 0.022f, 0.026f, 0.04f, 0, 0, 0, 0.75f, 0.217f, 0.398f, 0.814f},
+		{0.85f, 0.86f, 0.93f, 1f, 1f, 0.95f, 0.88f, 0.88f, 0.94f, 1f, 0.82f, 0.96f, 1.05f, 0.78f, 1.04f, 1.1f, 0.012f, 0.018f, 0.04f, 0, 0, 0, 0.75f, 0.386f, 0.5f, 0.754f},
 	};
 
 	/** The horizon / fog colour's tint per row (multiplies vanilla's fog colour, which is also the sky disc's horizon): warm at low sun, lighter at noon, bluer at night. */
@@ -89,7 +89,7 @@ public final class OwnLight {
 			}
 			grade[SAT] *= 1 - 0.55f * r;
 			grade[CONTRAST] *= 1 - 0.1f * r;
-			grade[EXPO] *= 1 + 0.07f * r;
+			grade[EXPO] *= 1 - 0.3f * r;  // BSL's rain is darker than the table's (sky 85 vs 111 of 255)
 			grade[GAIN] += (0.78f - grade[GAIN]) * r * 0.8f;
 			grade[GAIN + 1] += (1.22f - grade[GAIN + 1]) * r * 0.8f;
 			grade[GAIN + 2] += (1.16f - grade[GAIN + 2]) * r * 0.8f;
@@ -98,7 +98,7 @@ public final class OwnLight {
 			grade[LIFT + 2] = Math.max(grade[LIFT + 2], 0.06f * r);
 		}
 		if (inWater) {
-			grade[EXPO] *= 0.76f;
+			grade[EXPO] *= 0.68f;
 			grade[CONTRAST] *= 1.08f;
 			grade[SAT] *= 0.85f;
 			grade[GAIN] *= 0.9f;
@@ -145,13 +145,38 @@ public final class OwnLight {
 	static final float SHAFTS = Float.parseFloat(System.getProperty("mcopt.shaders.shafts", "1.3"));
 	static final float BLOOM_THR = Float.parseFloat(System.getProperty("mcopt.shaders.bloom.threshold", "0.84"));
 
-	/** Writes the PostFrame (terrain.metal) of this frame: 10 float4 (160 bytes). */
+	/**
+	 * Grade polish (-Dmcopt.shaders.grade.log / .hue / .gain / .purkinje: strengths, 0 off, 1 default; -Dmcopt.shaders.bloomyfog: strength of the glow in rain and under water).
+	 * Each is also an OwnProbe key (shaders.grade.log, shaders.grade.hue, shaders.grade.gain, shaders.grade.purkinje, shaders.bloomyfog: booleans, on = the configured strength).
+	 */
+	static final float GR_LOG = Float.parseFloat(System.getProperty("mcopt.shaders.grade.log", "1"));
+	static final float GR_HUE = Float.parseFloat(System.getProperty("mcopt.shaders.grade.hue", "1"));
+	static final float GR_GAIN = Float.parseFloat(System.getProperty("mcopt.shaders.grade.gain", "1"));
+	static final float GR_PK = Float.parseFloat(System.getProperty("mcopt.shaders.grade.purkinje", "1"));
+	static final float FOG = Float.parseFloat(System.getProperty("mcopt.shaders.bloomyfog", "1"));
+	/** The share of the table's contrast done in log space about 0.18 (the rest stays the display-space matrix). */
+	static final float LOG_SHARE = Float.parseFloat(System.getProperty("mcopt.shaders.grade.logShare", "0.35"));
+	/** What is left of the table's contrast in the display-space matrix while the log contrast is on (BSL has less overall contrast than the table gave; the log curve is the stronger one in the darks). */
+	static final float DISP_SHARE = Float.parseFloat(System.getProperty("mcopt.shaders.grade.dispShare", "0.45"));
+	static final float HUE_ORANGE = Float.parseFloat(System.getProperty("mcopt.shaders.grade.orange", "0.12"));
+	static final float HUE_TEAL = Float.parseFloat(System.getProperty("mcopt.shaders.grade.teal", "0.18"));
+	/** True when any of the bloomy fog's inputs can matter: PostFrame.gr1.y > 0 turns the unthresholded chain on (OwnPost). */
+	static boolean fogActive() {
+		return FOG > 0 && (rain > 0.02f || water) && OwnProbe.bool("shaders.bloomyfog", true);
+	}
+
+	/** Writes the PostFrame (terrain.metal) of this frame: 10 float4 (160 bytes), then the grade track's float4s at byte 224. */
 	static void postFrame(java.nio.FloatBuffer b, boolean nop, int w, int h, boolean bloomOn) {
 		float e = grade[EXPO], sat = grade[SAT], ct = grade[CONTRAST];
 		b.put(grade[GAIN] * e).put(grade[GAIN + 1] * e).put(grade[GAIN + 2] * e).put(grade[TONE]);
 		b.put(1 - grade[LIFT]).put(1 - grade[LIFT + 1]).put(1 - grade[LIFT + 2]).put(1.0f);
 		b.put(grade[LIFT]).put(grade[LIFT + 1]).put(grade[LIFT + 2]).put(nop ? 1f : 0f);
 		// saturation about the luma, then contrast about mid grey, as one matrix: ct * (sat * g + (1 - sat) * luma(g)) + 0.5 * (1 - ct)
+		float lc = 1.0f;
+		if (GR_LOG > 0 && OwnProbe.bool("shaders.grade.log", true)) {
+			lc = 1 + (ct - 1) * LOG_SHARE * GR_LOG;
+			ct = 1 + (ct - 1) * DISP_SHARE;
+		}
 		float[] luma = {0.2126f, 0.7152f, 0.0722f};
 		for (int i = 0; i < 3; i++) {
 			for (int j = 0; j < 3; j++) b.put(ct * ((i == j ? sat : 0) + (1 - sat) * luma[j]));
@@ -170,5 +195,21 @@ public final class OwnLight {
 		b.put(0f).put(0f).put(0f).put(0f);  // ws (set natively)
 		// track water (PostFrame.uw): under water, the shaft noise's time, the HDR glare's gain into the bloom
 		b.put(water && OwnWater.UW_SHAFTS ? 1f : 0f).put((float) ((System.nanoTime() * 1e-9) % 4096.0)).put(OwnWater.hdrOn() ? OwnWater.GLARE_BLOOM : 0f).put(0f);
+		// bytes 192 .. 223 belong to the volumetric track (set natively, untouched here); 224: gr0, gr1
+		b.position(56);
+		boolean hue = GR_HUE > 0 && OwnProbe.bool("shaders.grade.hue", true);
+		boolean gn = GR_GAIN > 0 && OwnProbe.bool("shaders.grade.gain", true);
+		b.put(lc).put(hue ? HUE_ORANGE * GR_HUE : 0f).put(hue ? HUE_TEAL * GR_HUE : 0f).put(gn ? 0.05f * GR_GAIN : 0f);
+		// Purkinje: rods take over when the sun is well below the horizon (Photon: none in daylight; smoothstep(-0.12, -0.06) of the sun's height)
+		float nt = Math.max(0f, Math.min(1f, (el + 0.02f) / -0.10f));
+		nt = nt * nt * (3 - 2 * nt);
+		float pk = GR_PK > 0 && OwnProbe.bool("shaders.grade.purkinje", true) ? 0.05f * GR_PK * nt : 0f;
+		// bloomy fog: rain a thin haze with distance, under water a denser one (the weight goes by the square root there)
+		float fogK = 0f, fogD = 0.025f;
+		if (fogActive()) {
+			if (water) { fogK = 0.5f * FOG; fogD = 0.08f; }
+			else fogK = 0.45f * FOG * Math.min(1f, rain);
+		}
+		b.put(pk).put(fogK).put(fogD).put(water ? 1f : 0f);
 	}
 }

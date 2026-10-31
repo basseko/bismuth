@@ -4610,6 +4610,9 @@ struct PostFrame {
 	float4 uw;      // 176 track water: x 1 the camera is under water (shafts through the water), y shaft noise time (seconds, mod 4096), z the HDR glare's gain into the bloom, w spare
 	float4 vol0;    // 192: x 1: the volumetric light result is bound (volTex, volDist), y 1/quarter width, z 1/quarter height, w 0
 	float4 vol1;    // 208: x composite strength, y the march's maximum distance (blocks), z the strength over the sky, w 0
+	float4 gr0;     // (grade track, 224) x log-space contrast about mid grey (1 off), y orange saturation boost, z teal saturation boost, w gain() S-curve exponent - 1 (0 off)
+	float4 gr1;     // x Purkinje intensity (light level below which the rod shift is half; 0 off), y bloomy fog strength (0 off: the blur is not bound), z fog density (1/blocks), w 1 under water
+	float4 gr2, gr3;  // spare
 };
 
 struct PostV {
@@ -4717,13 +4720,63 @@ static half3 volComposite(half3 lin, texture2d<float> volTex, texture2d<float> v
 	return lin * half(T) + half3(ins * s) * half3(f.gk.rgb);
 }
 
+// ---- grade polish (grade track): log-space contrast, Purkinje shift, hue-isolated saturation, gain() S-curve, bloomy fog weight ----
+// Log contrast about mid grey 0.18 in linear light before the tone curve (the idea of Photon's grade_input, c19_color_grading.fsh; own code).
+static half3 grLogContrast(half3 lin, half k) {
+	const half L = -2.4739h;  // log2(0.18)
+	half3 x = log2(lin + 1e-4h);
+	return max(exp2(k * (x - L) + L) - 1e-4h, 0.0h);
+}
+
+// Purkinje shift (rod vision: blue-shifted, desaturated darks): the scotopic response of the linear colour, blended in below `i`.
+// The method is the one of Photon's purkinje_shift.glsl (the diva-portal.org reference there); weights and tint here are a plain rec.709 approximation.
+static half3 grPurkinje(half3 lin, half i) {
+	half s = dot(lin, half3(0.05h, 0.55h, 0.40h));
+	return mix(lin, s * half3(0.865h, 1.15h, 1.32h), exp2(-s / i));
+}
+
+// saturation boosts isolated to orange (hue 30 deg) and teal (210 deg) on the display colour: the chroma about the lightness scales as HSL saturation does
+static half3 grHues(half3 c, half bo, half bt) {
+	half mx = max(c.r, max(c.g, c.b)), mn = min(c.r, min(c.g, c.b));
+	half d = max(mx - mn, 1.0h / 255.0h);
+	half h6 = c.r >= mx ? (c.g - c.b) / d : (c.g >= mx ? 2.0h + (c.b - c.r) / d : 4.0h + (c.r - c.g) / d);  // hue in sixths of a turn x 6 (-1 .. 5)
+	h6 = h6 < 0.0h ? h6 + 6.0h : h6;
+	half dO = abs(h6 - 0.5h), dT = abs(h6 - 3.5h);
+	dO = min(dO, 6.0h - dO);
+	half wO = saturate(1.0h - dO * 1.5h), wT = saturate(1.0h - dT * 1.7h);
+	wO *= wO * (3.0h - 2.0h * wO);
+	wT *= wT * (3.0h - 2.0h * wT);
+	half sc = 1.0h + bo * wO + bt * wT;
+	half l = 0.5h * (mx + mn);
+	return saturate(l + (c - l) * sc);
+}
+
+// Photon's gain(): a gentle S-curve about 0.5 (display space), exponent k > 1 deepens the darks and brightens the lights
+// (adapted from Photon Shaders (c) Benjamin Stott, Photon licence)
+static half3 grGain(half3 x, half k) {
+	half3 lo = select(x, 1.0h - x, x >= 0.5h);
+	half3 a = 0.5h * exp2(k * log2(max(2.0h * lo, 1e-4h)));
+	return select(a, 1.0h - a, x >= 0.5h);
+}
+
+// the weight of the blurred picture in the fog: 1 - T for T the transmittance over the pixel's distance (its alpha code; the sky is far, unknown (entities, hand) 24 blocks).
+// Rain: a thin haze (linear in 1 - T); under water: the square root of it, so the glow sets in near the camera (Photon c19_color_grading.fsh, "bloomy fog").
+static half grFogWeight(float code, float strength, float dens, bool water) {
+	float d = shDDecode(code);
+	d = d < 0.0 ? 24.0 : d;
+	float t = exp2(-d * dens);
+	float w = 1.0 - t;
+	return half(strength * (water ? sqrt(w) : w));
+}
+
+
 // The tone curve is Narkowicz's fit of the ACES filmic curve (public; 2015). Half precision: the target is 8 bits.
 // Bloom and light shafts (milestone 6): this pass also WRITES a half-resolution source texture (bright-pass colour + sky mask; a 2x2 quad average,
 // one write per quad) that compute kernels blur and march in the next frame's pre command buffer (bloom_down / bloom_up); this pass ADDS the
 // result of the previous frame (bloomTex, a quarter-resolution RGBA16F: bloom in rgb, shaft strength in a). One frame of lag, no pass split.
 fragment half4 post_fs(PostV in [[stage_in]], half4 dst [[color(0)]], constant PostFrame &f [[buffer(0)]], texture2d<half> bloomTex [[texture(0)]],
 	texture2d<half, access::write> bloomSrc [[texture(1)]], texture2d<float, access::write> sceneSrc [[texture(2)]], texture2d<float> volTex [[texture(3)]],
-	texture2d<float> volDist [[texture(4)]], uint lane [[thread_index_in_quadgroup]]) {
+	texture2d<float> volDist [[texture(4)]], texture2d<half> fogTex [[texture(5)]], texture2d<half, access::write> fogSrc [[texture(6)]], uint lane [[thread_index_in_quadgroup]]) {
 	if (f.ws.x > 0.5) {
 		// tile water's scene for the next frame (OwnWater.TILE, half size): the colour before the grade (a quad mean) and the quad's nearest distance from the
 		// alpha code (the sky and unknown: far)
@@ -4739,10 +4792,14 @@ fragment half4 post_fs(PostV in [[stage_in]], half4 dst [[color(0)]], constant P
 	// display -> linear with gamma 2 (a multiply instead of a pow), expose and balance, tone curve, back with a square root
 	half3 lin = dst.rgb * dst.rgb * half3(f.gk.rgb);
 	if (f.vol0.x > 0.5) lin = volComposite(lin, volTex, volDist, f, float(dst.a), in.pos.xy);
+	if (f.gr1.x > 0.0) lin = grPurkinje(lin, half(f.gr1.x));
+	if (f.gr0.x != 1.0) lin = grLogContrast(lin, half(f.gr0.x));
 	half3 mapped = (lin * (2.51h * lin + 0.03h)) / (lin * (2.43h * lin + 0.59h) + 0.14h);
 	half3 g = sqrt(mix(min(lin, 1.0h), saturate(mapped), half(f.gk.w)));
 	g = g * half3(f.la.rgb) + half3(f.lb.rgb);
 	half3 o = half3(dot(half3(f.m0.xyz), g) + half(f.m0.w), dot(half3(f.m1.xyz), g) + half(f.m1.w), dot(half3(f.m2.xyz), g) + half(f.m2.w));
+	if (f.gr0.y != 0.0 || f.gr0.z != 0.0) o = grHues(o, half(f.gr0.y), half(f.gr0.z));
+	if (f.gr0.w != 0.0) o = grGain(o, half(1.0 + f.gr0.w));
 	float2 pp = in.pos.xy;
 	if (f.bl.w > 0.5) {
 		// the source for the next frame: the bright part of THIS picture before the bloom is added (else it feeds on itself) and the sky mask, averaged over the quad
@@ -4753,6 +4810,15 @@ fragment half4 post_fs(PostV in [[stage_in]], half4 dst [[color(0)]], constant P
 		v += quad_shuffle_xor(v, 1);
 		v += quad_shuffle_xor(v, 2);
 		if (lane == 0) bloomSrc.write(v * 0.25h, uint2(pp) >> 1);
+		half fogW = 0.0h;
+		if (f.gr1.y > 0.0) {
+			// bloomy fog: the UNTHRESHOLDED picture (graded, before the bloom) goes to a quarter-resolution source (one quad in four writes its mean: the chain
+			// blurs it anyway) that fog_down / fog_up blur in the next frame's pre command buffer; the weight here is 1 - T of the fog in front of this pixel
+			half3 q = o + quad_shuffle_xor(o, 1);  // (the shuffles outside the branch: every lane of the quad takes part)
+			q += quad_shuffle_xor(q, 2);
+			if (lane == 0 && all(((uint2(pp) >> 1) & 1u) == uint2(0))) fogSrc.write(half4(q * 0.25h, 1.0h), uint2(pp) >> 2);
+			fogW = grFogWeight(float(dst.a), f.gr1.y, f.gr1.z, f.gr1.w > 0.5);
+		}
 		// the previous frame's bloom and shafts (bilinear), added in linear light
 		constexpr sampler bs(filter::linear, address::clamp_to_edge);
 		half4 bt = bloomTex.sample(bs, pp * f.sz.xy);
@@ -4763,6 +4829,7 @@ fragment half4 post_fs(PostV in [[stage_in]], half4 dst [[color(0)]], constant P
 		half3 lo = o * o;
 		lo = lo + bt.rgb * half(f.bl.x) + sh * (1.0h - min(lo, 1.0h) * 0.85h);
 		o = sqrt(max(lo, 0.0h));
+		if (fogW > 0.0h) o = mix(o, saturate(fogTex.sample(bs, pp * f.sz.xy).rgb), fogW);
 		if (f.sun.w > 0.5) return half4(f.sun.w < 1.5 ? saturate(bt.rgb) : (f.sun.w < 2.5 ? half3(bt.a) : saturate(bt.rgb * 0.1h)), 1.0h);
 	}
 	// interleaved-gradient noise as a dither, so the stretched dark steps do not band
@@ -4809,6 +4876,17 @@ kernel void bloom_down(texture2d<float> src [[texture(0)]], texture2d<float, acc
 		r = (d + e + j + k) * 0.125 + (a + b + g + h) * 0.03125 + (b + c + h + i) * 0.03125 + (g + h + l + m) * 0.03125 + (h + i + m + n) * 0.03125;
 	}
 	dst.write(float4(r, 1.0), gid);
+}
+
+// bloomy fog (grade track): the unthresholded quarter-resolution source goes down two levels (13-tap), then back up: fog_up mixes the bigger level with a tent of the smaller one
+kernel void fog_up(texture2d<float> lowT [[texture(0)]], texture2d<float> highT [[texture(1)]], texture2d<float, access::write> outT [[texture(3)]], uint2 gid [[thread_position_in_grid]]) {
+	uint W = highT.get_width(), H = highT.get_height();
+	if (gid.x >= W || gid.y >= H) return;
+	float2 uv = (float2(gid) + 0.5) / float2(W, H), t = 1.0 / float2(lowT.get_width(), lowT.get_height());
+	float3 s = lowT.sample(blS, uv).rgb * 0.25;
+	s += (lowT.sample(blS, uv + t * float2(-1, 0)).rgb + lowT.sample(blS, uv + t * float2(1, 0)).rgb + lowT.sample(blS, uv + t * float2(0, -1)).rgb + lowT.sample(blS, uv + t * float2(0, 1)).rgb) * 0.125;
+	s += (lowT.sample(blS, uv + t * float2(-1, -1)).rgb + lowT.sample(blS, uv + t * float2(1, -1)).rgb + lowT.sample(blS, uv + t * float2(-1, 1)).rgb + lowT.sample(blS, uv + t * float2(1, 1)).rgb) * 0.0625;
+	outT.write(float4(mix(highT.sample(blS, uv).rgb, s, 0.6), 1.0), gid);
 }
 
 // big += weight * tent(small); mode 1: the shafts too (big is the last level, `srcTex` the half-resolution source whose alpha is the sky mask)
