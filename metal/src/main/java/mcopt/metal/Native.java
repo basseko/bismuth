@@ -26,6 +26,9 @@ final class Native {
 	private static final SymbolLookup LIB = SymbolLookup.libraryLookup(extract(), Arena.global());
 
 	private static final MethodHandle CREATE = fn("mc_create", false, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT);
+	/** -Dmcopt.metal4=true: the Metal 4 backend (mce.m); read once, before the device is made. Default: Metal 3, unchanged. */
+	static final boolean METAL4 = Boolean.getBoolean("mcopt.metal4");
+	private static final MethodHandle METAL4_ENABLE = fn("mce_enable", false, JAVA_INT, JAVA_INT);
 	private static final MethodHandle MAX_BUFFER_LENGTH = fn("mc_max_buffer_length", true, JAVA_LONG, JAVA_LONG);
 	private static final MethodHandle RELEASE = fn("mc_release", false, null, JAVA_LONG);
 	private static final MethodHandle BUFFER_NEW = fn("mc_buffer_new", false, JAVA_LONG, JAVA_LONG, JAVA_LONG);
@@ -145,7 +148,7 @@ final class Native {
 
 	// The wrappers below exist only to turn invokeExact's Throwable into unchecked exceptions.
 
-	static long create(long name, int nameCap, long err, int errCap) { try { long c = (long) CREATE.invokeExact(name, nameCap, err, errCap); if (FrameCapture.ON) FrameCapture.Own.ctx = c; return c; } catch (Throwable t) { throw rethrow(t); } }
+	static long create(long name, int nameCap, long err, int errCap) { try { if (METAL4) { int on = (int) METAL4_ENABLE.invokeExact(1); } long c = (long) CREATE.invokeExact(name, nameCap, err, errCap); if (FrameCapture.ON) FrameCapture.Own.ctx = c; return c; } catch (Throwable t) { throw rethrow(t); } }
 	static long maxBufferLength(long ctx) { try { return (long) MAX_BUFFER_LENGTH.invokeExact(ctx); } catch (Throwable t) { throw rethrow(t); } }
 	static void release(long obj) { try { RELEASE.invokeExact(obj); } catch (Throwable t) { throw rethrow(t); } }
 	static long bufferNew(long ctx, long size) { try { return (long) BUFFER_NEW.invokeExact(ctx, size); } catch (Throwable t) { throw rethrow(t); } }

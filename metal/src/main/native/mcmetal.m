@@ -3,6 +3,7 @@
 // Built without ARC so ownership is explicit. Hot encoder calls allocate nothing, so they need no autorelease pool.
 #include <stdatomic.h>
 #import "mcmetal.h"
+#import "mce.h"
 #import <CoreVideo/CoreVideo.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CABase.h>
@@ -61,6 +62,8 @@ Ctx *mc_create(char *name, int nameCap, char *err, int errCap) {
 		Ctx *ctx = calloc(1, sizeof(Ctx));
 		ctx->device = device;
 		ctx->queue = [device newCommandQueueWithMaxCommandBufferCount:64];
+		mce_init(ctx);  // -Dmcopt.metal4=true: the Metal 4 queue and the layer's pools (mce.m); otherwise nothing
+		if (mce_metal4) sd.supportArgumentBuffers = YES;  // bound through argument tables
 		ctx->builtins = lib;
 		ctx->present = present;
 		ctx->presentSampler = [device newSamplerStateWithDescriptor:sd];
@@ -69,6 +72,7 @@ Ctx *mc_create(char *name, int nameCap, char *err, int errCap) {
 		dd.depthWriteEnabled = YES;
 		ctx->depthWrite = [device newDepthStencilStateWithDescriptor:dd];
 		ctx->fanIndices = [device newBufferWithLength:(FAN_MAX_VERTICES - 2) * 3 * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+		mce_make_resident(ctx->fanIndices);
 		uint32_t *fan = ctx->fanIndices.contents;
 		for (uint32_t k = 0; k < FAN_MAX_VERTICES - 2; k++) {
 			fan[k * 3] = 0;
@@ -82,7 +86,15 @@ Ctx *mc_create(char *name, int nameCap, char *err, int errCap) {
 
 uint64_t mc_max_buffer_length(Ctx *ctx) { return ctx->device.maxBufferLength; }
 static int poolRelease(id obj);
+// Today's release, at once. Metal 4 calls it (mce.m) once the GPU finished every frame that could still use obj.
+void mc_release_now(id obj) {
+	if (!poolRelease(obj)) [obj release];
+}
 void mc_release(id obj) {
+	if (mce_metal4) {  // MTL4 command buffers retain nothing: evict and release after the GPU is done with it
+		if (obj) mce4_release(obj);
+		return;
+	}
 	if (!poolRelease(obj)) [obj release];
 }
 
@@ -161,6 +173,7 @@ int mc_pool_add(Ctx *ctx, uint64_t size, int delayMs) {
 		}
 		if (residentSet) {
 			[ctx->queue addResidencySet:residentSet];
+			mce4_add_queue_set(residentSet);  // (Metal 4: its queue carries it too; nothing otherwise)
 			[residentSet requestResidency];
 		}
 	});
@@ -233,7 +246,10 @@ int mc_texture_resident(Ctx *ctx, id<MTLTexture> texture, int add) {
 			d.label = @"mcopt animation frames";
 			animSet = [ctx->device newResidencySetWithDescriptor:d error:nil];
 		}
-		if (animSet) [ctx->queue addResidencySet:animSet];
+		if (animSet) {
+			[ctx->queue addResidencySet:animSet];
+			mce4_add_queue_set(animSet);
+		}
 	});
 	if (!animSet || !texture) return 0;
 	if (add) [animSet addAllocation:texture];
@@ -268,7 +284,13 @@ static int poolRelease(id obj) {
 
 uint64_t mc_buffer_length(id<MTLBuffer> buffer) { return buffer.length; }
 
+static id<MTLBuffer> bufferNew(Ctx *ctx, uint64_t size);
 id<MTLBuffer> mc_buffer_new(Ctx *ctx, uint64_t size) {
+	id<MTLBuffer> b = bufferNew(ctx, size);
+	mce_make_resident(b);  // (Metal 4 only)
+	return b;
+}
+static id<MTLBuffer> bufferNew(Ctx *ctx, uint64_t size) {
 	// Whole-buffer uniform bindings read the MSL struct's 16-byte-aligned size: allocate a multiple of 16 (zeros past the
 	// caller's size, which the Java side keeps as the buffer's logical size).
 	size = (size + 15) & ~(uint64_t) 15;
@@ -292,6 +314,18 @@ id<MTLBuffer> mc_buffer_new(Ctx *ctx, uint64_t size) {
 id<MTLBuffer> mc_buffer_private(Ctx *ctx, id<MTLBuffer> src, uint64_t size) {
 	@autoreleasepool {
 		id<MTLBuffer> dst = [ctx->device newBufferWithLength:size options:MTLResourceStorageModePrivate];
+		if (mce_metal4) {
+			mce_make_resident(dst);
+			id cb = mce_new_cmd(ctx);
+			id b = mce_new_blit_encoder(cb);
+			mce_copy_buffer(b, src, 0, dst, 0, size);
+			mce_end_encoder(b);
+			[b release];
+			mce_cmd_commit(cb);
+			mce_cmd_wait(cb);
+			[cb release];
+			return dst;
+		}
 		id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
 		id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
 		[b copyFromBuffer:src sourceOffset:0 toBuffer:dst destinationOffset:0 size:size];
@@ -315,14 +349,18 @@ id<MTLTexture> mc_texture_new(Ctx *ctx, int format, int width, int height, int l
 		d.usage = (MTLTextureUsage) usage;
 		d.storageMode = MTLStorageModePrivate;
 		(void) layers;  // cubes carry their 6 faces implicitly; arrays aren't used by the game yet
-		return [ctx->device newTextureWithDescriptor:d];
+		id<MTLTexture> t = [ctx->device newTextureWithDescriptor:d];
+		mce_make_resident(t);  // (Metal 4 only)
+		return t;
 	}
 }
 
 id<MTLTexture> mc_texture_view(id<MTLTexture> texture, int baseMip, int mips) {
 	NSUInteger slices = texture.textureType == MTLTextureTypeCube ? 6 : 1;
-	return [texture newTextureViewWithPixelFormat:texture.pixelFormat textureType:texture.textureType
+	id<MTLTexture> v = [texture newTextureViewWithPixelFormat:texture.pixelFormat textureType:texture.textureType
 		levels:NSMakeRange(baseMip, mips) slices:NSMakeRange(0, slices)];
+	mce_make_resident(v);  // (Metal 4 only)
+	return v;
 }
 
 id<MTLTexture> mc_texture_buffer(Ctx *ctx, id<MTLBuffer> buffer, int format, uint64_t offset, uint64_t length, int texelSize) {
@@ -330,7 +368,9 @@ id<MTLTexture> mc_texture_buffer(Ctx *ctx, id<MTLBuffer> buffer, int format, uin
 		NSUInteger texels = length / texelSize;
 		MTLTextureDescriptor *d = [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:(MTLPixelFormat) format
 			width:texels resourceOptions:MTLResourceStorageModeShared usage:MTLTextureUsageShaderRead];
-		return [buffer newTextureWithDescriptor:d offset:offset bytesPerRow:texels * texelSize];
+		id<MTLTexture> t = [buffer newTextureWithDescriptor:d offset:offset bytesPerRow:texels * texelSize];
+		mce_make_resident(t);  // (Metal 4 only)
+		return t;
 	}
 }
 
@@ -348,6 +388,7 @@ id<MTLSamplerState> mc_sampler_new(Ctx *ctx, int addressU, int addressV, int min
 		d.mipFilter = (MTLSamplerMipFilter) mipFilter;
 		d.maxAnisotropy = anisotropy;
 		d.lodMaxClamp = maxLod;
+		if (mce_metal4) d.supportArgumentBuffers = YES;  // bound through argument tables
 		return [ctx->device newSamplerStateWithDescriptor:d];
 	}
 }
@@ -463,7 +504,7 @@ static id<MTLCommandBuffer> cmd(Enc *enc) {
 	}
 	if (!enc->cmd) {
 		@autoreleasepool {
-			enc->cmd = [[enc->ctx->queue commandBuffer] retain];
+			enc->cmd = mce_metal4 ? mce4_new_cmd(enc->ctx) : [[enc->ctx->queue commandBuffer] retain];
 			encCounters[0]++;
 		}
 	}
@@ -472,7 +513,7 @@ static id<MTLCommandBuffer> cmd(Enc *enc) {
 
 static void endBlit(Enc *enc) {
 	if (enc->blit) {
-		[enc->blit endEncoding];
+		mce_end_encoder(enc->blit);
 		[enc->blit release];
 		enc->blit = nil;
 	}
@@ -771,6 +812,7 @@ void mc_gpucount_label(const char *name) { snprintf(gcLabel, sizeof gcLabel, "%s
 
 void mc_gpucount_enable(const char *path, int every, int groups) {
 	if (gcOn) return;
+	if (mce_metal4) { mce_log_once("-Dmcopt.metal.gpuCount is off under Metal 4"); return; }
 	gcEvery = every > 0 ? every : 1;
 	gcGroups = groups;
 	gcOut = fopen(path && *path ? path : "gpucount.jsonl", "a");
@@ -792,16 +834,16 @@ static void endRender(Enc *enc) {
 	}
 	for (int i = 0; i < enc->colorCount; i++) {
 		// Memoryless attachments (the native shading pipeline's G-buffer) have nothing to store.
-		if (enc->colors[i]) [enc->render setColorStoreAction:(enc->dead >> i & 1) || enc->colors[i].storageMode == MTLStorageModeMemoryless
+		if (enc->colors[i]) [mce_raw(enc->render) setColorStoreAction:(enc->dead >> i & 1) || enc->colors[i].storageMode == MTLStorageModeMemoryless
 			? MTLStoreActionDontCare : MTLStoreActionStore atIndex:i];
 	}
-	if (enc->depth) [enc->render setDepthStoreAction:(enc->dead & DEAD_DEPTH) ? MTLStoreActionDontCare : MTLStoreActionStore];
+	if (enc->depth) [mce_raw(enc->render) setDepthStoreAction:(enc->dead & DEAD_DEPTH) ? MTLStoreActionDontCare : MTLStoreActionStore];
 	if (enc->renderGroup >= 0 && enc->renderGroup < 512 && enc->sampleInfo[enc->renderGroup][0]) {
 		size_t len = strlen(enc->sampleInfo[enc->renderGroup]);
 		snprintf(enc->sampleInfo[enc->renderGroup] + len, 48 - len, " S%d]", enc->colors[0] ? ((enc->dead & 1) ? 0 : 1) : 1);
 	}
 	enc->renderGroup = -1;
-	[enc->render endEncoding];
+	mce_end_encoder(enc->render);
 	if (gcOn) gcAfterEnd(enc->render);  // -Dmcopt.metal.gpuCount: the indirect draws' arguments, copied back
 	[enc->render release];
 	enc->render = nil;
@@ -822,7 +864,7 @@ static id<MTLBlitCommandEncoder> blit(Enc *enc) {
 		encCounters[2]++;
 		endRender(enc);
 		@autoreleasepool {
-			enc->blit = [[cmd(enc) blitCommandEncoder] retain];
+			enc->blit = mce_new_blit_encoder(cmd(enc));
 		}
 	}
 	return enc->blit;
@@ -842,12 +884,12 @@ id<MTLCommandBuffer> mc_frame_cmd(Enc *enc) {
 
 void mc_pre_end_encoders(Enc *enc) {
 	if (enc->preBlit) {
-		[enc->preBlit endEncoding];
+		mce_end_encoder(enc->preBlit);
 		[enc->preBlit release];
 		enc->preBlit = nil;
 	}
 	if (enc->preCompute) {
-		[enc->preCompute endEncoding];
+		mce_end_encoder(enc->preCompute);
 		[enc->preCompute release];
 		enc->preCompute = nil;
 	}
@@ -862,6 +904,7 @@ int mc_last_compute_group(void) {
 id<MTLComputeCommandEncoder> mc_profiled_compute(Enc *enc, id<MTLCommandBuffer> c, MTLDispatchType type) {
 	@autoreleasepool {
 		lastComputeGroup = -1;
+		if (mce_metal4) return mce4_new_compute_encoder(c, type);  // (never profiled: enc->samples is nil under Metal 4)
 		if (enc->samples && enc->sampleCount + 4 <= (int) enc->samples.sampleCount) {
 			// (as mcs_compute_begin: start and end in the "vertex" slots of the encoder's group of 4)
 			MTLComputePassDescriptor *d = [MTLComputePassDescriptor computePassDescriptor];
@@ -886,6 +929,7 @@ id<MTLComputeCommandEncoder> mc_profiled_compute(Enc *enc, id<MTLCommandBuffer> 
 // A blit encoder on c, timestamped like mc_profiled_compute when the encoder log is on (kind 'B'). Retained: the caller releases it.
 id<MTLBlitCommandEncoder> mc_profiled_blit(Enc *enc, id<MTLCommandBuffer> c) {
 	@autoreleasepool {
+		if (mce_metal4) return mce4_new_blit_encoder(c);
 		if (enc->samples && enc->sampleCount + 4 <= (int) enc->samples.sampleCount) {
 			MTLBlitPassDescriptor *d = [MTLBlitPassDescriptor blitPassDescriptor];
 			d.sampleBufferAttachments[0].sampleBuffer = enc->samples;
@@ -907,7 +951,7 @@ id<MTLBlitCommandEncoder> mc_profiled_blit(Enc *enc, id<MTLCommandBuffer> c) {
 id<MTLCommandBuffer> mc_pre(Enc *enc) {
 	if (!enc->pre) {
 		@autoreleasepool {
-			enc->pre = [[enc->ctx->queue commandBuffer] retain];
+			enc->pre = mce_metal4 ? mce4_new_cmd(enc->ctx) : [[enc->ctx->queue commandBuffer] retain];
 			encCounters[1]++;
 		}
 	}
@@ -927,7 +971,7 @@ static id<MTLBlitCommandEncoder> preBlit(Enc *enc) {
 	if (!enc->preBlit) {
 		mc_pre_end_encoders(enc);
 		@autoreleasepool {
-			enc->preBlit = [[mc_pre(enc) blitCommandEncoder] retain];
+			enc->preBlit = mce_new_blit_encoder(mc_pre(enc));
 		}
 	}
 	return enc->preBlit;
@@ -935,18 +979,37 @@ static id<MTLBlitCommandEncoder> preBlit(Enc *enc) {
 
 void mc_pre_blit_buffer(Enc *enc, id<MTLBuffer> src, uint64_t srcOffset, id<MTLBuffer> dst, uint64_t dstOffset, uint64_t size) {
 	if (diagOn) diagPreBytes += size;
-	[preBlit(enc) copyFromBuffer:src sourceOffset:srcOffset toBuffer:dst destinationOffset:dstOffset size:size];
+	mce_copy_buffer(preBlit(enc), src, srcOffset, dst, dstOffset, size);
 }
 
 void mc_pre_fill(Enc *enc, id<MTLBuffer> buffer, uint64_t offset, uint64_t length, int value) {
-	[preBlit(enc) fillBuffer:buffer range:NSMakeRange(offset, length) value:(uint8_t) value];
+	mce_fill_buffer(preBlit(enc), buffer, NSMakeRange(offset, length), (uint8_t) value);
 }
 
 static void pqSubmit(void);
 
 // Commits everything recorded so far (the pre command buffer first). Returns the retained main command buffer so Java can
 // wait on it (frame pacing, fences); it completes after the pre one.
+// Metal 4: the same order (pre, then the frame's command buffer with its present), then the frame's retirements (mce.m).
+static id<MTLCommandBuffer> commit4(Enc *enc) {
+	if (diagOn) mce_log_once("-Dmcopt.metal.cbdiag command buffer reports are off under Metal 4");
+	if (enc->pre) {
+		mc_pre_end_encoders(enc);
+		mce4_cmd_commit(enc->pre);
+		[enc->pre release];
+		enc->pre = nil;
+	}
+	endBlit(enc);
+	endRender(enc);
+	id<MTLCommandBuffer> c = cmd(enc);
+	mce4_cmd_commit(c);
+	enc->cmd = nil;
+	mce4_frame_end();
+	return c;
+}
+
 id<MTLCommandBuffer> mc_enc_commit(Enc *enc) {
+	if (mce_metal4) return commit4(enc);
 	double t = 0;
 	long n = 0;
 	uint64_t big = 0, preBytes = 0, mainBytes = 0;
@@ -991,13 +1054,13 @@ id<MTLCommandBuffer> mc_enc_commit(Enc *enc) {
 	return c;
 }
 
-void mc_cmd_wait(id<MTLCommandBuffer> c) { [c waitUntilCompleted]; }
-int mc_cmd_done(id<MTLCommandBuffer> c) { return c.status >= MTLCommandBufferStatusCompleted; }
+void mc_cmd_wait(id<MTLCommandBuffer> c) { mce_cmd_wait(c); }
+int mc_cmd_done(id<MTLCommandBuffer> c) { return mce_cmd_done(c); }
 // Nothing recorded since the last commit: no command buffer open (-Dmcopt.cpu.fence).
 int mc_enc_empty(Enc *enc) { return enc->cmd == nil && enc->pre == nil; }
-double mc_cmd_gpu_us(id<MTLCommandBuffer> c) { return (c.GPUEndTime - c.GPUStartTime) * 1e6; }
-double mc_cmd_gpu_end(id<MTLCommandBuffer> c) { return c.GPUEndTime; }
-double mc_cmd_gpu_start(id<MTLCommandBuffer> c) { return c.GPUStartTime; }
+double mc_cmd_gpu_us(id<MTLCommandBuffer> c) { return (mce_cmd_gpu_end(c) - mce_cmd_gpu_start(c)) * 1e6; }
+double mc_cmd_gpu_end(id<MTLCommandBuffer> c) { return mce_cmd_gpu_end(c); }
+double mc_cmd_gpu_start(id<MTLCommandBuffer> c) { return mce_cmd_gpu_start(c); }
 double mc_host_seconds(void) { return CACurrentMediaTime(); }
 // Opt-in cadence probe. Fixed storage; callbacks never enter Java. Callback time is NOT scanout time.
 #define CADENCE_CAPACITY 1048576
@@ -1018,6 +1081,10 @@ uint64_t mc_cadence_presented(int slot) { return __atomic_load_n(&cadencePresent
 static MTLTimestamp profileCpu0, profileGpu0;
 
 int mc_profile_begin(Enc *enc, int maxEncoders) {
+	if (mce_metal4) {  // (MTL4 has counter heaps; not wired up yet)
+		mce_log_once("GPU timestamp profiling is off under Metal 4");
+		return 0;
+	}
 	id<MTLDevice> device = enc->ctx->device;
 	if (![device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) return 0;
 	@autoreleasepool {
@@ -1105,28 +1172,25 @@ void mc_profile_labels(Enc *enc, char *out, int stride, int max) {
 
 void mc_blit_buffer(Enc *enc, id<MTLBuffer> src, uint64_t srcOffset, id<MTLBuffer> dst, uint64_t dstOffset, uint64_t size) {
 	if (diagOn) diagMainBytes += size;
-	[blit(enc) copyFromBuffer:src sourceOffset:srcOffset toBuffer:dst destinationOffset:dstOffset size:size];
+	mce_copy_buffer(blit(enc), src, srcOffset, dst, dstOffset, size);
 }
 
 void mc_blit_fill(Enc *enc, id<MTLBuffer> buffer, uint64_t offset, uint64_t length, int value) {
-	[blit(enc) fillBuffer:buffer range:NSMakeRange(offset, length) value:(uint8_t) value];
+	mce_fill_buffer(blit(enc), buffer, NSMakeRange(offset, length), (uint8_t) value);
 }
 
 void mc_blit_buffer_to_texture(Enc *enc, id<MTLBuffer> src, uint64_t offset, int bytesPerRow, int bytesPerImage,
 	id<MTLTexture> dst, int slice, int mip, int x, int y, int w, int h) {
-	[blit(enc) copyFromBuffer:src sourceOffset:offset sourceBytesPerRow:bytesPerRow sourceBytesPerImage:bytesPerImage
-		sourceSize:MTLSizeMake(w, h, 1) toTexture:dst destinationSlice:slice destinationLevel:mip destinationOrigin:MTLOriginMake(x, y, 0)];
+	mce_copy_buffer_to_texture(blit(enc), src, offset, bytesPerRow, bytesPerImage, MTLSizeMake(w, h, 1), dst, slice, mip, MTLOriginMake(x, y, 0));
 }
 
 void mc_blit_texture_to_buffer(Enc *enc, id<MTLTexture> src, int mip, int x, int y, int w, int h,
 	id<MTLBuffer> dst, uint64_t offset, int bytesPerRow) {
-	[blit(enc) copyFromTexture:src sourceSlice:0 sourceLevel:mip sourceOrigin:MTLOriginMake(x, y, 0) sourceSize:MTLSizeMake(w, h, 1)
-		toBuffer:dst destinationOffset:offset destinationBytesPerRow:bytesPerRow destinationBytesPerImage:(NSUInteger) bytesPerRow * h];
+	mce_copy_texture_to_buffer(blit(enc), src, 0, mip, MTLOriginMake(x, y, 0), MTLSizeMake(w, h, 1), dst, offset, bytesPerRow, (NSUInteger) bytesPerRow * h);
 }
 
 void mc_blit_texture_to_texture(Enc *enc, id<MTLTexture> src, id<MTLTexture> dst, int mip, int dx, int dy, int sx, int sy, int w, int h) {
-	[blit(enc) copyFromTexture:src sourceSlice:0 sourceLevel:mip sourceOrigin:MTLOriginMake(sx, sy, 0) sourceSize:MTLSizeMake(w, h, 1)
-		toTexture:dst destinationSlice:0 destinationLevel:mip destinationOrigin:MTLOriginMake(dx, dy, 0)];
+	mce_copy_texture(blit(enc), src, 0, mip, MTLOriginMake(sx, sy, 0), MTLSizeMake(w, h, 1), dst, 0, mip, MTLOriginMake(dx, dy, 0));
 }
 
 static int sameTargets(Enc *enc, int count, id<MTLTexture> const *colors, const float *clears, id<MTLTexture> depth) {
@@ -1209,14 +1273,15 @@ static void foldDepthClear(Enc *enc, float depthValue, int width, int height) {
 		if (cpuPass) foldKeep(enc, pso);
 		}
 		struct { float color[4]; float depth; float pad[3]; } c = {{0}, depthValue, {0}};
-		[enc->render setRenderPipelineState:pso];
-		[enc->render setDepthStencilState:ctx->depthWrite];
-		[enc->render setCullMode:MTLCullModeNone];
-		[enc->render setTriangleFillMode:MTLTriangleFillModeFill];
-		[enc->render setDepthBias:0 slopeScale:0 clamp:0];
-		[enc->render setScissorRect:(MTLScissorRect) {0, 0, width, height}];
-		[enc->render setVertexBytes:&c length:sizeof c atIndex:0];
-		[enc->render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		id r = mce_raw(enc->render);
+		[r setRenderPipelineState:pso];
+		[r setDepthStencilState:ctx->depthWrite];
+		[r setCullMode:MTLCullModeNone];
+		[r setTriangleFillMode:MTLTriangleFillModeFill];
+		[r setDepthBias:0 slopeScale:0 clamp:0];
+		[r setScissorRect:(MTLScissorRect) {0, 0, width, height}];
+		mce_set_vertex_bytes(enc->render, &c, sizeof c, 0);
+		[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 	}
 	enc->dead &= ~DEAD_DEPTH;
 }
@@ -1236,7 +1301,7 @@ static void openRender(Enc *enc, MTLRenderPassDescriptor *rp) {
 	int counted = gcOn && gcFrame % gcEvery == 0;  // -Dmcopt.metal.gpuCount: see GPU counting above; nothing without the flag
 	if (counted) gcBeforeOpen(enc, rp, cmd(enc));
 	else if (gcOn) rp.visibilityResultBuffer = nil;  // a frame between counted ones (a kept descriptor may still name the buffer)
-	enc->render = [[cmd(enc) renderCommandEncoderWithDescriptor:rp] retain];
+	enc->render = mce_new_render_encoder(cmd(enc), rp);
 	if (renderGroup >= 0 && renderGroup < 512) {
 		enc->sampleEnc[renderGroup] = [enc->render retain];  // (the encoder itself, before any counting wrapper)
 		enc->sampleKind[renderGroup] = 'R';
@@ -1254,8 +1319,8 @@ static void openRender(Enc *enc, MTLRenderPassDescriptor *rp) {
 		if (rp.depthAttachment.texture) rpLogTex("depth", 0, rp.depthAttachment.texture, rpLoad(rp.depthAttachment.loadAction));
 		fflush(stdout);
 	}
-	[enc->render setViewport:(MTLViewport) {0, 0, enc->width, enc->height, 0, 1}];
-	[enc->render setFrontFacingWinding:MTLWindingClockwise];  // vertex Y is flipped to keep GL/Vulkan row order, which mirrors winding too
+	[mce_raw(enc->render) setViewport:(MTLViewport) {0, 0, enc->width, enc->height, 0, 1}];
+	[mce_raw(enc->render) setFrontFacingWinding:MTLWindingClockwise];  // vertex Y is flipped to keep GL/Vulkan row order, which mirrors winding too
 	enc->tlDepthCleared = rp.depthAttachment.texture && rp.depthAttachment.loadAction == MTLLoadActionClear;
 	enc->tlDepthClearValue = (float) rp.depthAttachment.clearDepth;
 	enc->tlDepthWritten = 0;
@@ -1415,6 +1480,7 @@ static id<MTLTexture> ptTexture(Ctx *ctx, MTLPixelFormat format, int w, int h, i
 }
 void mc_pass_test(Enc *enc, int n, int mode) {
 	if (n <= 0) return;
+	if (mce_metal4) { mce_log_once("-Dmcopt.metal.passTest is off under Metal 4"); return; }
 	if (n > 8) n = 8;
 	Ctx *ctx = enc->ctx;
 	@autoreleasepool {
@@ -1482,7 +1548,7 @@ id<MTLComputeCommandEncoder> mc_render_suspend(Enc *enc) {
 }
 
 void mc_render_resume(Enc *enc, id<MTLComputeCommandEncoder> compute) {
-	[compute endEncoding];
+	mce_end_encoder(compute);
 	[compute release];
 	@autoreleasepool {
 		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -1503,7 +1569,7 @@ void mc_render_resume(Enc *enc, id<MTLComputeCommandEncoder> compute) {
 
 void mc_r_pipeline(Enc *enc, id<MTLRenderPipelineState> pso, id<MTLDepthStencilState> depth, int cull, int wireframe,
 	float biasConstant, float biasSlope, int primitive) {
-	id<MTLRenderCommandEncoder> r = enc->render;
+	id<MTLRenderCommandEncoder> r = mce_raw(enc->render);
 	[r setRenderPipelineState:pso];
 	if (depth) [r setDepthStencilState:depth];
 	if (depth && depth.label.length) enc->tlDepthWritten = 1;  // (a writing depth state: mc_depth_state_new labels it)
@@ -1514,12 +1580,12 @@ void mc_r_pipeline(Enc *enc, id<MTLRenderPipelineState> pso, id<MTLDepthStencilS
 }
 
 void mc_r_buffer(Enc *enc, int index, id<MTLBuffer> buffer, uint64_t offset) {
-	[enc->render setVertexBuffer:buffer offset:offset atIndex:index];
-	[enc->render setFragmentBuffer:buffer offset:offset atIndex:index];
+	mce_set_vertex_buffer(enc->render, buffer, offset, index);
+	mce_set_fragment_buffer(enc->render, buffer, offset, index);
 }
 
 void mc_r_vertex_buffer(Enc *enc, int index, id<MTLBuffer> buffer, uint64_t offset) {
-	[enc->render setVertexBuffer:buffer offset:offset atIndex:index];
+	mce_set_vertex_buffer(enc->render, buffer, offset, index);
 }
 
 void mc_r_bytes(Enc *enc, int index, const void *bytes, int length) {
@@ -1534,26 +1600,25 @@ void mc_r_bytes(Enc *enc, int index, const void *bytes, int length) {
 		bytes = tmp;
 		length = padded;
 	}
-	[enc->render setVertexBytes:bytes length:length atIndex:index];
-	[enc->render setFragmentBytes:bytes length:length atIndex:index];
+	mce_set_vertex_fragment_bytes(enc->render, bytes, length, index);
 }
 
 void mc_r_texture(Enc *enc, int index, id<MTLTexture> texture, id<MTLSamplerState> sampler) {
-	[enc->render setVertexTexture:texture atIndex:index];
-	[enc->render setFragmentTexture:texture atIndex:index];
+	mce_set_vertex_texture(enc->render, texture, index);
+	mce_set_fragment_texture(enc->render, texture, index);
 	if (sampler) {
-		[enc->render setVertexSamplerState:sampler atIndex:index];
-		[enc->render setFragmentSamplerState:sampler atIndex:index];
+		mce_set_vertex_sampler(enc->render, sampler, index);
+		mce_set_fragment_sampler(enc->render, sampler, index);
 	}
 }
 
 void mc_r_scissor(Enc *enc, int x, int y, int w, int h) {
-	[enc->render setScissorRect:(MTLScissorRect) {x, y, w, h}];
+	[mce_raw(enc->render) setScissorRect:(MTLScissorRect) {x, y, w, h}];
 }
 
 // A buffer the vertex stage reaches through a GPU address stored in another buffer (bindless) must be made resident.
 void mc_r_use(Enc *enc, id<MTLBuffer> buffer) {
-	[enc->render useResource:buffer usage:MTLResourceUsageRead stages:MTLRenderStageVertex];
+	mce_use_resource_render(enc->render, buffer, MTLResourceUsageRead, MTLRenderStageVertex);
 }
 void mc_r_index(Enc *enc, id<MTLBuffer> buffer, int intIndices) {
 	enc->indexBuffer = buffer;
@@ -1563,8 +1628,8 @@ void mc_r_index(Enc *enc, id<MTLBuffer> buffer, int intIndices) {
 
 static void drawFan(Enc *enc, int firstVertex, int vertexCount, int instances, int firstInstance) {
 	if (vertexCount < 3) return;
-	[enc->render drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:(vertexCount - 2) * 3 indexType:MTLIndexTypeUInt32
-		indexBuffer:enc->ctx->fanIndices indexBufferOffset:0 instanceCount:instances baseVertex:firstVertex baseInstance:firstInstance];
+	mce_draw_indexed_base(enc->render, MTLPrimitiveTypeTriangle, (vertexCount - 2) * 3, MTLIndexTypeUInt32, enc->ctx->fanIndices, 0,
+		instances, firstVertex, firstInstance);
 }
 
 void mc_r_draw(Enc *enc, int vertexCount, int instances, int firstVertex, int firstInstance) {
@@ -1572,7 +1637,7 @@ void mc_r_draw(Enc *enc, int vertexCount, int instances, int firstVertex, int fi
 		drawFan(enc, firstVertex, vertexCount, instances, firstInstance);
 		return;
 	}
-	[enc->render drawPrimitives:enc->primitive vertexStart:firstVertex vertexCount:vertexCount instanceCount:instances baseInstance:firstInstance];
+	[mce_raw(enc->render) drawPrimitives:enc->primitive vertexStart:firstVertex vertexCount:vertexCount instanceCount:instances baseInstance:firstInstance];
 }
 
 void mc_r_draw_indexed(Enc *enc, int indexCount, int instances, int firstIndex, int baseVertex, int firstInstance) {
@@ -1581,59 +1646,57 @@ void mc_r_draw_indexed(Enc *enc, int indexCount, int instances, int firstIndex, 
 		drawFan(enc, baseVertex + firstIndex, indexCount, instances, firstInstance);
 		return;
 	}
-	[enc->render drawIndexedPrimitives:enc->primitive indexCount:indexCount indexType:enc->indexType indexBuffer:enc->indexBuffer
-		indexBufferOffset:(NSUInteger) firstIndex * enc->indexSize instanceCount:instances baseVertex:baseVertex baseInstance:firstInstance];
+	mce_draw_indexed_base(enc->render, enc->primitive, indexCount, enc->indexType, enc->indexBuffer, (NSUInteger) firstIndex * enc->indexSize,
+		instances, baseVertex, firstInstance);
 }
 
 // params: drawCount × {firstIndex, indexCount, vertexOffset} (VkMultiDrawIndexedInfoEXT layout).
 void mc_r_multi_draw_indexed(Enc *enc, const int *params, int drawCount, int instances, int firstInstance) {
 	for (int i = 0; i < drawCount; i++, params += 3) {
-		[enc->render drawIndexedPrimitives:enc->primitive indexCount:params[1] indexType:enc->indexType indexBuffer:enc->indexBuffer
-			indexBufferOffset:(NSUInteger) params[0] * enc->indexSize instanceCount:instances baseVertex:params[2] baseInstance:firstInstance];
+		mce_draw_indexed_base(enc->render, enc->primitive, params[1], enc->indexType, enc->indexBuffer, (NSUInteger) params[0] * enc->indexSize,
+			instances, params[2], firstInstance);
 	}
 }
 
 // GL-style separate arrays: byte offsets into the index buffer, index counts, base vertices.
 void mc_r_multi_draw_indexed_separate(Enc *enc, const uint64_t *offsets, const int *counts, const int *baseVertices, int drawCount) {
 	for (int i = 0; i < drawCount; i++) {
-		[enc->render drawIndexedPrimitives:enc->primitive indexCount:counts[i] indexType:enc->indexType indexBuffer:enc->indexBuffer
-			indexBufferOffset:offsets[i] instanceCount:1 baseVertex:baseVertices[i] baseInstance:0];
+		mce_draw_indexed_base(enc->render, enc->primitive, counts[i], enc->indexType, enc->indexBuffer, offsets[i], 1, baseVertices[i], 0);
 	}
 }
 
 // params: drawCount × {firstVertex, vertexCount} (VkMultiDrawInfoEXT layout).
 void mc_r_multi_draw(Enc *enc, const int *params, int drawCount, int instances, int firstInstance) {
 	for (int i = 0; i < drawCount; i++, params += 2) {
-		[enc->render drawPrimitives:enc->primitive vertexStart:params[0] vertexCount:params[1] instanceCount:instances baseInstance:firstInstance];
+		[mce_raw(enc->render) drawPrimitives:enc->primitive vertexStart:params[0] vertexCount:params[1] instanceCount:instances baseInstance:firstInstance];
 	}
 }
 
 void mc_r_multi_draw_separate(Enc *enc, const int *firsts, const int *counts, int drawCount) {
 	for (int i = 0; i < drawCount; i++) {
-		[enc->render drawPrimitives:enc->primitive vertexStart:firsts[i] vertexCount:counts[i]];
+		[mce_raw(enc->render) drawPrimitives:enc->primitive vertexStart:firsts[i] vertexCount:counts[i]];
 	}
 }
 
 void mc_r_draw_indexed_indirect(Enc *enc, id<MTLBuffer> buffer, uint64_t offset, int drawCount) {
 	for (int i = 0; i < drawCount; i++) {
-		[enc->render drawIndexedPrimitives:enc->primitive indexType:enc->indexType indexBuffer:enc->indexBuffer indexBufferOffset:0
-			indirectBuffer:buffer indirectBufferOffset:offset + (uint64_t) i * 20];
+		mce_draw_indexed_indirect(enc->render, enc->primitive, enc->indexType, enc->indexBuffer, 0, buffer, offset + (uint64_t) i * 20);
 	}
 }
 
 void mc_r_draw_indirect(Enc *enc, id<MTLBuffer> buffer, uint64_t offset, int drawCount) {
 	for (int i = 0; i < drawCount; i++) {
-		[enc->render drawPrimitives:enc->primitive indirectBuffer:buffer indirectBufferOffset:offset + (uint64_t) i * 16];
+		mce_draw_indirect(enc->render, enc->primitive, buffer, offset + (uint64_t) i * 16);
 	}
 }
 
 void mc_r_debug_push(Enc *enc, const char *label) {
 	@autoreleasepool {
-		[enc->render pushDebugGroup:[NSString stringWithUTF8String:label]];
+		[mce_raw(enc->render) pushDebugGroup:[NSString stringWithUTF8String:label]];
 	}
 }
 
-void mc_r_debug_pop(Enc *enc) { [enc->render popDebugGroup]; }
+void mc_r_debug_pop(Enc *enc) { [mce_raw(enc->render) popDebugGroup]; }
 
 // Clears part of a color and/or depth texture by drawing a scissored full-screen triangle (Metal can only clear whole attachments).
 // depth < 0 leaves the depth texture untouched.
@@ -1668,15 +1731,17 @@ void mc_clear_rect(Enc *enc, id<MTLTexture> color, id<MTLTexture> depthTex, floa
 			rp.depthAttachment.loadAction = MTLLoadActionLoad;
 			rp.depthAttachment.storeAction = MTLStoreActionStore;
 		}
-		id<MTLRenderCommandEncoder> re = [cmd(enc) renderCommandEncoderWithDescriptor:rp];
+		id rh = mce_new_render_encoder(cmd(enc), rp);
+		id<MTLRenderCommandEncoder> re = mce_raw(rh);
 		struct { float color[4]; float depth; float pad[3]; } c = {{r, g, b, a}, depth < 0 ? 0 : depth, {0}};
 		[re setRenderPipelineState:pso];
 		[re setDepthStencilState:depth >= 0 ? ctx->depthWrite : ctx->depthKeep];
 		[re setScissorRect:(MTLScissorRect) {x, y, w, h}];
-		[re setVertexBytes:&c length:sizeof c atIndex:0];
-		[re setFragmentBytes:&c length:sizeof c atIndex:0];
+		mce_set_vertex_bytes(rh, &c, sizeof c, 0);
+		mce_set_fragment_bytes(rh, &c, sizeof c, 0);
 		[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-		[re endEncoding];
+		mce_end_encoder(rh);
+		[rh release];
 	}
 }
 
@@ -1691,6 +1756,7 @@ void mc_layer_configure(Ctx *ctx, CAMetalLayer *layer, int width, int height, in
 	layer.displaySyncEnabled = (vsync & 1) != 0;
 	int drawables = (vsync >> 8) & 0xff;
 	layer.maximumDrawableCount = drawables == 2 || drawables == 3 ? drawables : 3;
+	mce4_layer(layer);  // Metal 4: the layer's residency set (its drawables) goes on the queue
 }
 
 // ---- present pacing ----
@@ -1801,16 +1867,18 @@ void mc_present(Enc *enc, id<CAMetalDrawable> drawable, id<MTLTexture> src) {
 		rp.colorAttachments[0].texture = drawable.texture;
 		rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
 		rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-		id<MTLRenderCommandEncoder> r = [cmd(enc) renderCommandEncoderWithDescriptor:rp];
-		[r setRenderPipelineState:enc->ctx->present];
-		[r setFragmentTexture:src atIndex:0];
-		[r setFragmentSamplerState:enc->ctx->presentSampler atIndex:0];
-		[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-		[r endEncoding];
+		id r = mce_new_render_encoder(cmd(enc), rp);
+		[mce_raw(r) setRenderPipelineState:enc->ctx->present];
+		mce_set_fragment_texture(r, src, 0);
+		mce_set_fragment_sampler(r, enc->ctx->presentSampler, 0);
+		[mce_raw(r) drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		mce_end_encoder(r);
+		[r release];
 		double encodedAt = CACurrentMediaTime();
-		[cmd(enc) addCompletedHandler:^(id<MTLCommandBuffer> b) { gpuLatency += (CACurrentMediaTime() - encodedAt - gpuLatency) * 0.1; }];
+		if (mce_metal4) mce4_cmd_on_completed(cmd(enc), ^(double s, double e) { gpuLatency += (CACurrentMediaTime() - encodedAt - gpuLatency) * 0.1; });
+		else [cmd(enc) addCompletedHandler:^(id<MTLCommandBuffer> b) { gpuLatency += (CACurrentMediaTime() - encodedAt - gpuLatency) * 0.1; }];
 		paceWatch(drawable);
-		[cmd(enc) presentDrawable:drawable];
+		mce_cmd_present(cmd(enc), drawable);  // Metal 4: waitForDrawable / commit / signalDrawable / present, at the commit
 	}
 }
 
@@ -1897,6 +1965,11 @@ static void pqEncodePresent(id<CAMetalDrawable> drawable, int slot, uint64_t wai
 }
 
 int mc_present_queued(Enc *enc, id<CAMetalDrawable> drawable, id<MTLTexture> src) {
+	if (mce_metal4) {  // one queue under Metal 4: present with the frame
+		mce_log_once("-Dmcopt.metal.presentQueue: presents go with the frame's command buffer under Metal 4");
+		mc_present(enc, drawable, src);
+		return 1;
+	}
 	int k = pqFill(enc, src);
 	if (k < 0) return 0;
 	if (pqDrawable) {  // a present encoded but not yet submitted (two in one frame): the newer one wins, free the older slot
@@ -1924,6 +1997,16 @@ static uint64_t pqAcq;  // this frame's hand-off, published by pqSubmit after th
 void mc_cadence_present(id<CAMetalDrawable> drawable, int slot);
 
 int mc_present_queued_acquire(Enc *enc, CAMetalLayer *layer, id<MTLTexture> src, long cadence) {
+	if (mce_metal4) {  // one queue under Metal 4: acquire here and present with the frame
+		mce_log_once("-Dmcopt.metal.presentQueue=acquire: the drawable is acquired on the render thread under Metal 4");
+		@autoreleasepool {
+			id<CAMetalDrawable> d = [layer nextDrawable];
+			if (!d) return 0;
+			if (cadence >= 0) mc_cadence_present(d, (int) cadence);
+			mc_present(enc, d, src);
+		}
+		return 1;
+	}
 	int k = pqFill(enc, src);
 	if (k < 0) return 0;
 	if (pqAcq) atomic_store(&pqBusy[pqAcq & 3], 0);  // two presents in one frame: the newer one wins

@@ -3,6 +3,7 @@
 // which the GUI draws over the full-size image as usual. Nothing here runs unless the Java side asks.
 #import <MetalFX/MetalFX.h>
 #import "mcmetal.h"
+#import "mce.h"
 
 static id<MTLFXSpatialScaler> fxScaler;
 static int fxIw, fxIh, fxOw, fxOh;
@@ -10,6 +11,10 @@ static MTLPixelFormat fxFormat;
 
 // 1 if the device can run the spatial scaler.
 int mcfx_supported(Ctx *ctx) {
+	if (mce_metal4) {  // encodeToCommandBuffer: takes a Metal 3 command buffer; MetalFX's MTL4FXSpatialScaler is the Metal 4 way (later)
+		mce_log_once("MetalFX (-Dmcopt.metalfx) is off under Metal 4 for now");
+		return 0;
+	}
 	return [MTLFXSpatialScalerDescriptor supportsDevice:ctx->device] ? 1 : 0;
 }
 
@@ -29,6 +34,7 @@ int mcfx_usage(Ctx *ctx, int out, int w, int h, int ow, int oh) {
 
 // Upscales in (iw x ih, the top-left content) into out (ow x oh). 0 on success, <0 on failure (-1: no scaler, -2: texture usage).
 int mcfx_spatial(Enc *enc, id<MTLTexture> in, id<MTLTexture> out) {
+	if (mce_metal4) return -1;
 	@autoreleasepool {
 		int iw = (int) in.width, ih = (int) in.height, ow = (int) out.width, oh = (int) out.height;
 		if (!fxScaler || iw != fxIw || ih != fxIh || ow != fxOw || oh != fxOh || in.pixelFormat != fxFormat) {
