@@ -1,5 +1,6 @@
 package mcopt.metal.own;
 
+import net.minecraft.client.CloudStatus;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
@@ -64,7 +65,17 @@ public final class OwnSky {
 
 	/** Our clouds replace vanilla's this frame. */
 	public static boolean ownClouds() {
-		return live() && CLOUDS && OwnProbe.bool("shaders.clouds", true);
+		return live() && cloudsWanted();
+	}
+
+	/**
+	 * Clouds are drawn only when vanilla would draw its own: the video option Clouds is not Off and the dimension's cloud colour is visible (alpha > 0;
+	 * vanilla's LevelRenderer tests exactly this), on top of our switches.
+	 */
+	private static boolean cloudsWanted() {
+		if (!CLOUDS || !OwnProbe.bool("shaders.clouds", true)) return false;
+		var gs = Minecraft.getInstance().gameRenderer.gameRenderState();
+		return gs.optionsRenderState.cloudStatus != CloudStatus.OFF && ((gs.levelRenderState.cloudColor >>> 24) > 0);
 	}
 
 	/** The shaded terrain applies the haze this frame: the dome drew and the camera is in air. */
@@ -186,7 +197,7 @@ public final class OwnSky {
 			if (LOG && (frameNo++ % 600) == 0) System.out.println("mcopt-shaders: sky fwd " + (-view.m02()) + " " + (-view.m12()) + " " + (-view.m22()) + " tan " + tx + " " + ty + " proj " + proj + " view " + view + " sun " + sunDir[1]);
 			float night = 1.0f - smooth(-0.32f, -0.05f, sinEl);
 			// clouds
-			boolean clouds = CLOUDS && OwnProbe.bool("shaders.clouds", true);
+			boolean clouds = cloudsWanted();
 			float cover = CLOUD_COVER + (1.0f - CLOUD_COVER) * rain * 0.9f;
 			MemoryUtil.memPutFloat(p + 112, CLOUD_Y0);
 			MemoryUtil.memPutFloat(p + 116, CLOUD_Y1);
