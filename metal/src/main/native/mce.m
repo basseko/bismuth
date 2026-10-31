@@ -499,8 +499,24 @@ double mce4_cmd_gpu_end(id h) { waitTimes(h); return ((MceCmd *) h)->gpuEnd; }
 	}
 	[super dealloc];
 }
+// MEASUREMENT ONLY (unsafe): MCE_BARRIERS in the environment, a mask of the conservative barriers kept: 1 at encoder open, 2 at encoder end, 4 between a
+// serial encoder's commands (default 7, all). Turning any off can race; it exists to see what each class costs.
+static int barMask(void) {
+	static int m = -1;
+	if (m < 0) {
+		const char *v = getenv("MCE_BARRIERS");
+		m = v ? atoi(v) : 7;
+		if (m != 7) fprintf(stderr, "mcopt-metal4: MEASUREMENT barrier mask %d (unsafe)\n", m);
+	}
+	return m;
+}
+
+static void flushWaits(MceEncoder *e);
+static void track(MceEncoder *e, id obj);
+static void use(MceEncoder *e, id obj, int write);
 static void serialPoint(MceEncoder *e) {
-	if (e->kind == MCE_KIND_SERIAL || e->kind == MCE_KIND_BLIT) {
+	flushWaits(e);
+	if ((e->kind == MCE_KIND_SERIAL || e->kind == MCE_KIND_BLIT) && (barMask() & 4)) {
 		if (e->pending) [(id<MTL4ComputeCommandEncoder>) e->real barrierAfterEncoderStages:ENCODER_STAGES beforeEncoderStages:ENCODER_STAGES
 			visibilityOptions:MTL4VisibilityOptionDevice];
 		e->pending = 1;
@@ -511,37 +527,43 @@ static void serialPoint(MceEncoder *e) {
 - (void)dispatchThreadgroups:(MTLSize)g threadsPerThreadgroup:(MTLSize)t { serialPoint(self); [real dispatchThreadgroups:g threadsPerThreadgroup:t]; }
 - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)so toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)dO size:(NSUInteger)n {
 	serialPoint(self);
+	use(self, s, 0); use(self, d, 1); flushWaits(self);
 	[real copyFromBuffer:s sourceOffset:so toBuffer:d destinationOffset:dO size:n];
 }
 - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)o sourceBytesPerRow:(NSUInteger)r sourceBytesPerImage:(NSUInteger)i sourceSize:(MTLSize)z
 	toTexture:(id<MTLTexture>)t destinationSlice:(NSUInteger)sl destinationLevel:(NSUInteger)l destinationOrigin:(MTLOrigin)org {
 	serialPoint(self);
+	use(self, s, 0); use(self, t, 1); flushWaits(self);
 	[real copyFromBuffer:s sourceOffset:o sourceBytesPerRow:r sourceBytesPerImage:i sourceSize:z toTexture:t destinationSlice:sl destinationLevel:l destinationOrigin:org];
 }
 - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)o sourceBytesPerRow:(NSUInteger)r sourceBytesPerImage:(NSUInteger)i sourceSize:(MTLSize)z
 	toTexture:(id<MTLTexture>)t destinationSlice:(NSUInteger)sl destinationLevel:(NSUInteger)l destinationOrigin:(MTLOrigin)org options:(MTLBlitOption)op {
 	serialPoint(self);
+	use(self, s, 0); use(self, t, 1); flushWaits(self);
 	[real copyFromBuffer:s sourceOffset:o sourceBytesPerRow:r sourceBytesPerImage:i sourceSize:z toTexture:t destinationSlice:sl destinationLevel:l
 		destinationOrigin:org options:op];
 }
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
 	toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)o destinationBytesPerRow:(NSUInteger)r destinationBytesPerImage:(NSUInteger)i {
 	serialPoint(self);
+	use(self, s, 0); use(self, d, 1); flushWaits(self);
 	[real copyFromTexture:s sourceSlice:ss sourceLevel:sl sourceOrigin:so sourceSize:z toBuffer:d destinationOffset:o destinationBytesPerRow:r destinationBytesPerImage:i];
 }
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
 	toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dorg {
 	serialPoint(self);
+	use(self, s, 0); use(self, d, 1); flushWaits(self);
 	[real copyFromTexture:s sourceSlice:ss sourceLevel:sl sourceOrigin:so sourceSize:z toTexture:d destinationSlice:ds destinationLevel:dl destinationOrigin:dorg];
 }
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds
 	destinationLevel:(NSUInteger)dl sliceCount:(NSUInteger)sc levelCount:(NSUInteger)lc {
 	serialPoint(self);
+	use(self, s, 0); use(self, d, 1); flushWaits(self);
 	[real copyFromTexture:s sourceSlice:ss sourceLevel:sl toTexture:d destinationSlice:ds destinationLevel:dl sliceCount:sc levelCount:lc];
 }
-- (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d { serialPoint(self); [real copyFromTexture:s toTexture:d]; }
-- (void)fillBuffer:(id<MTLBuffer>)b range:(NSRange)r value:(uint8_t)v { serialPoint(self); [real fillBuffer:b range:r value:v]; }
-- (void)generateMipmapsForTexture:(id<MTLTexture>)t { serialPoint(self); [real generateMipmapsForTexture:t]; }
+- (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d { use(self, s, 0); use(self, d, 1); serialPoint(self); [real copyFromTexture:s toTexture:d]; }
+- (void)fillBuffer:(id<MTLBuffer>)b range:(NSRange)r value:(uint8_t)v { track(self, b); serialPoint(self); [real fillBuffer:b range:r value:v]; }
+- (void)generateMipmapsForTexture:(id<MTLTexture>)t { track(self, t); serialPoint(self); [real generateMipmapsForTexture:t]; }
 - (void)endEncoding { mce4_end_encoder(self); }
 // everything else MTL4 has under the same name goes straight to the real encoder; Metal 3-only selectors are logged and dropped
 - (id)forwardingTargetForSelector:(SEL)sel { return [real respondsToSelector:sel] ? real : nil; }
@@ -564,8 +586,149 @@ static void serialPoint(MceEncoder *e) {
 @end
 
 // The conservative inter-encoder barrier: nothing in this encoder starts before all earlier work on the queue is done.
+static int barMode(void) {
+	static int m = -1;
+	if (m < 0) { const char *v = getenv("MCE_BARMODE"); m = v ? atoi(v) : 0; if (m) fprintf(stderr, "mcopt-metal4: MEASUREMENT barrier mode %d\n", m); }
+	return m;
+}
+
 static void openBarrier(MceEncoder *e) {
+	if (!(barMask() & 1)) return;
+	int mode = barMode();
+	if (mode == 3 || mode == 4) {
+		[(id<MTL4CommandEncoder>) e->real barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionNone];
+		return;
+	}
+	if (mode == 1 || mode == 2) {
+		// 1: compute waits for compute only, render for compute + fragment; 2: compute waits for everything, render for compute + fragment
+		if (e->kind == MCE_KIND_RENDER) {
+			[(id<MTL4CommandEncoder>) e->real barrierAfterQueueStages:MTLStageDispatch | MTLStageBlit | MTLStageFragment
+				beforeStages:MTLStageVertex | MTLStageObject | MTLStageMesh | MTLStageFragment | MTLStageTile visibilityOptions:MTL4VisibilityOptionDevice];
+		} else {
+			[(id<MTL4CommandEncoder>) e->real barrierAfterQueueStages:(mode == 1 ? MTLStageDispatch | MTLStageBlit : MTLStageAll)
+				beforeStages:MTLStageDispatch | MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
+		}
+		return;
+	}
 	[(id<MTL4CommandEncoder>) e->real barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+}
+
+// ---- tracking ----
+// Metal 4 has no hazard tracking. The layer tracks per resource the last encoder that used it (bound it, drew from it, copied it, rendered to it):
+// an encoder that uses a resource last used by an earlier, ended encoder of the SAME command buffer waits on that encoder's fence right before its
+// next command (Apple: a wait as close to the consuming command as possible; independent encoders keep overlapping). Across command buffers the first
+// encoder of each command buffer carries one consumer queue barrier (all stages after all stages): a command buffer committed earlier (the frame's pre
+// buffer, the previous frames) is ordered before it, and no fence is ever waited on whose update comes later in queue order (that would hang the GPU).
+// Every use is treated as a write (conservative: two readers are ordered too). The upload ring (setBytes) is not tracked: each range is used once.
+// Resources that shaders reach only through addresses stored in other buffers are not seen: none in mcopt (everything is bound directly).
+// MCE_SYNC=barriers (environment) restores the old conservative barriers around every encoder.
+@interface MceSync : NSObject {
+@public
+	id fence;
+	void *cmd;
+	void *enc;
+	int ended;
+}
+@end
+@implementation MceSync
+- (void)dealloc { [fence release]; [super dealloc]; }
+@end
+
+static int syncBarriers(void) {
+	static int m = -1;
+	if (m < 0) {
+		const char *v = getenv("MCE_SYNC");
+		m = v && strcmp(v, "barriers") == 0;
+		if (m) fprintf(stderr, "mcopt-metal4: conservative barriers around every encoder (MCE_SYNC=barriers)\n");
+	}
+	return m;
+}
+
+static MTLStages encStages(MceEncoder *e) {
+	return e->kind == MCE_KIND_RENDER ? MTLStageVertex | MTLStageFragment | MTLStageObject | MTLStageMesh | MTLStageTile : MTLStageDispatch | MTLStageBlit;
+}
+
+// per resource: its last writer and the readers since (MceUse); a read waits for the writer, a write for the writer and those readers
+@interface MceUse : NSObject {
+@public
+	MceSync *writer;
+	MceSync *readers[8];
+	int nreaders;  // > 8: too many to wait on one by one (a writer then takes a queue barrier)
+}
+@end
+@implementation MceUse
+- (void)dealloc {
+	[writer release];
+	for (int i = 0; i < nreaders && i < 8; i++) [readers[i] release];
+	[super dealloc];
+}
+@end
+
+static CFMutableDictionaryRef trackMap;  // canonical resource (unretained key) -> MceUse (retained)
+
+static void *canon(id obj) {
+	if ([obj conformsToProtocol:@protocol(MTLTexture)]) {
+		id<MTLTexture> t = obj;
+		while (t.parentTexture) t = t.parentTexture;  // (views alias their texture)
+		if (t.buffer) return (__bridge void *) t.buffer;  // (texture over a buffer)
+		return (__bridge void *) t;
+	}
+	return (__bridge void *) obj;
+}
+
+// e waits for s's encoder, if that is an earlier, ended encoder of e's command buffer (anything older is ordered by the command buffer barrier)
+static void waitFor(MceEncoder *e, MceSync *s) {
+	if (!s || s == e->sync || !s->ended || s->cmd != (__bridge void *) e->cmd || !s->fence) return;
+	for (int i = 0; i < e->nwaits; i++) if (e->waits[i] == s->fence) return;
+	// encoded right here, before the command this use is for (a draw can be a plain drawPrimitives that goes straight to the real encoder)
+	[(id<MTL4CommandEncoder>) e->real waitForFence:s->fence beforeEncoderStages:encStages(e)];
+	if (e->nwaits < 16) e->waits[e->nwaits++] = s->fence;  // (only to skip repeats)
+}
+
+static void use(MceEncoder *e, id obj, int write) {
+	if (!obj || syncBarriers()) return;
+	if (!trackMap) trackMap = CFDictionaryCreateMutable(NULL, 0, NULL, &kCFTypeDictionaryValueCallBacks);
+	void *k = canon(obj);
+	MceUse *u = (MceUse *) CFDictionaryGetValue(trackMap, k);
+	if (!u) {
+		u = [MceUse new];
+		CFDictionarySetValue(trackMap, k, (__bridge const void *) u);
+		[u release];
+	}
+	MceSync *me = e->sync;
+	waitFor(e, u->writer);
+	if (!write) {
+		if (u->writer == me) return;
+		for (int i = 0; i < u->nreaders && i < 8; i++) if (u->readers[i] == me) return;
+		if (u->nreaders < 8) u->readers[u->nreaders] = [me retain];
+		u->nreaders++;
+		return;
+	}
+	if (u->nreaders > 8) {
+		// too many readers to wait on each: everything earlier on the queue first
+		[(id<MTL4CommandEncoder>) e->real barrierAfterQueueStages:MTLStageAll beforeStages:encStages(e) visibilityOptions:MTL4VisibilityOptionDevice];
+	} else {
+		for (int i = 0; i < u->nreaders; i++) waitFor(e, u->readers[i]);
+	}
+	for (int i = 0; i < u->nreaders && i < 8; i++) [u->readers[i] release];
+	u->nreaders = 0;
+	if (u->writer != me) {
+		[u->writer release];
+		u->writer = [me retain];
+	}
+}
+
+// a bind: compute binds may be written (treated as writes); in a render pass a buffer is read, a texture written only if it was made shader-writable
+static void track(MceEncoder *e, id obj) {
+	if (!obj) return;
+	int write = e->kind != MCE_KIND_RENDER;
+	if (!write && [obj conformsToProtocol:@protocol(MTLTexture)]) write = (((id<MTLTexture>) obj).usage & MTLTextureUsageShaderWrite) != 0;
+	use(e, obj, write);
+}
+
+// (the waits are encoded by track itself; nothing is left pending)
+static void flushWaits(MceEncoder *e) {
+	(void) e;
 }
 
 static MceEncoder *wrap(id real, int kind) {
@@ -584,7 +747,25 @@ static MceEncoder *wrap(id real, int kind) {
 		[(id<MTL4ComputeCommandEncoder>) real setArgumentTable:e->tables[0]];
 	}
 	os_unfair_lock_unlock(&M.lock);
-	openBarrier(e);
+	if (syncBarriers()) openBarrier(e);
+	return e;
+}
+
+// the tracking state of a new encoder on command buffer cmd (wrap's caller)
+static MceEncoder *tracked(MceEncoder *e, id cmd) {
+	if (syncBarriers()) return e;
+	MceCmd *c = cmd;
+	e->cmd = cmd;
+	e->fence = [M.device newFence];
+	MceSync *s = [MceSync new];
+	s->fence = [e->fence retain];
+	s->cmd = (__bridge void *) cmd;
+	s->enc = (__bridge void *) e;
+	e->sync = s;
+	if (!c->opened) {
+		c->opened = 1;
+		[(id<MTL4CommandEncoder>) e->real barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+	}
 	return e;
 }
 
@@ -610,26 +791,42 @@ id mce4_new_render_encoder(id cmd, MTLRenderPassDescriptor *rp) {
 		d.visibilityResultBuffer = rp.visibilityResultBuffer;
 		id<MTL4RenderCommandEncoder> r = [c->cb renderCommandEncoderWithDescriptor:d];
 		if (!r) { fprintf(stderr, "mcopt-metal4: render encoder creation failed\n"); abort(); }
-		return wrap(r, MCE_KIND_RENDER);
+		MceEncoder *e = tracked(wrap(r, MCE_KIND_RENDER), cmd);
+		// the attachments: the pass loads / stores them, so their earlier users are waited for before anything of this pass
+		for (int i = 0; i < MAX_COLORS; i++) if (rp.colorAttachments[i].texture) use(e, rp.colorAttachments[i].texture, 1);
+		if (rp.depthAttachment.texture) use(e, rp.depthAttachment.texture, 1);
+		if (rp.stencilAttachment.texture) use(e, rp.stencilAttachment.texture, 1);
+		flushWaits(e);
+		return e;
 	}
 }
 
 id mce4_new_compute_encoder(id cmd, MTLDispatchType type) {
 	MceCmd *c = cmd;
-	return wrap([c->cb computeCommandEncoder], type == MTLDispatchTypeConcurrent ? MCE_KIND_CONCURRENT : MCE_KIND_SERIAL);
+	return tracked(wrap([c->cb computeCommandEncoder], type == MTLDispatchTypeConcurrent ? MCE_KIND_CONCURRENT : MCE_KIND_SERIAL), cmd);
 }
 
 id mce4_new_blit_encoder(id cmd) {
 	MceCmd *c = cmd;
-	return wrap([c->cb computeCommandEncoder], MCE_KIND_BLIT);
+	return tracked(wrap([c->cb computeCommandEncoder], MCE_KIND_BLIT), cmd);
 }
 
 void mce4_end_encoder(id h) {
 	MceEncoder *e = h;
 	if (e->ended) return;
 	e->ended = 1;
+	if (!syncBarriers() && e->fence) {
+		flushWaits(e);  // (waits for resources bound but never used by a command: harmless)
+		[(id<MTL4CommandEncoder>) e->real updateFence:e->fence afterEncoderStages:encStages(e)];
+		((MceSync *) e->sync)->ended = 1;
+		[(MceSync *) e->sync release];  // (the resource map keeps it while it is some resource's last user)
+		e->sync = nil;
+		mce4_release(e->fence);  // (deferred until the frame completed)
+		e->fence = nil;
+	}
 	// and the other half of the conservative barrier: later encoders wait for all of this one
-	[(id<MTL4CommandEncoder>) e->real barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+	if (syncBarriers() && (barMask() & 2)) [(id<MTL4CommandEncoder>) e->real barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll
+		visibilityOptions:(barMode() == 4 ? MTL4VisibilityOptionNone : MTL4VisibilityOptionDevice)];
 	[(id<MTL4CommandEncoder>) e->real endEncoding];
 	[e->real release];
 	e->real = nil;
@@ -672,12 +869,14 @@ void mce4_set_bytes2(id h, int stageA, int stageB, const void *bytes, NSUInteger
 
 void mce4_set_buffer(id h, int stage, id<MTLBuffer> buffer, NSUInteger offset, NSUInteger index) {
 	if (!bufferIndexOk(index)) return;
+	track(h, buffer);
 	[table(h, stage) setAddress:buffer ? buffer.gpuAddress + offset : 0 atIndex:index];
 }
 
 void mce4_set_texture(id h, int stage, id<MTLTexture> texture, NSUInteger index) {
 	if (index >= TABLE_TEXTURES) { mce_log_once("texture binding index >= 48: dropped"); return; }
 	MTLResourceID none = {0};
+	track(h, texture);
 	[table(h, stage) setTexture:texture ? texture.gpuResourceID : none atIndex:index];
 }
 
@@ -689,20 +888,29 @@ void mce4_set_sampler(id h, int stage, id<MTLSamplerState> sampler, NSUInteger i
 
 // ---- draws and dispatches ----
 void mce4_draw_indexed(id h, MTLPrimitiveType p, NSUInteger count, MTLIndexType t, id<MTLBuffer> ib, NSUInteger off, NSUInteger inst, NSInteger bv, NSUInteger bi) {
+	track(h, ib);
+	flushWaits(h);
 	[(id<MTL4RenderCommandEncoder>) ((MceEncoder *) h)->real drawIndexedPrimitives:p indexCount:count indexType:t indexBuffer:ib.gpuAddress + off
 		indexBufferLength:ib.length - off instanceCount:inst baseVertex:bv baseInstance:bi];
 }
 
 void mce4_draw_indirect(id h, MTLPrimitiveType p, id<MTLBuffer> ind, NSUInteger indOff) {
+	track(h, ind);
+	flushWaits(h);
 	[(id<MTL4RenderCommandEncoder>) ((MceEncoder *) h)->real drawPrimitives:p indirectBuffer:ind.gpuAddress + indOff];
 }
 
 void mce4_draw_indexed_indirect(id h, MTLPrimitiveType p, MTLIndexType t, id<MTLBuffer> ib, NSUInteger off, id<MTLBuffer> ind, NSUInteger indOff) {
+	track(h, ib);
+	track(h, ind);
+	flushWaits(h);
 	[(id<MTL4RenderCommandEncoder>) ((MceEncoder *) h)->real drawIndexedPrimitives:p indexType:t indexBuffer:ib.gpuAddress + off
 		indexBufferLength:ib.length - off indirectBuffer:ind.gpuAddress + indOff];
 }
 
 void mce4_draw_mesh_indirect(id h, id<MTLBuffer> ind, NSUInteger indOff, MTLSize obj, MTLSize mesh) {
+	track(h, ind);
+	flushWaits(h);
 	[(id<MTL4RenderCommandEncoder>) ((MceEncoder *) h)->real drawMeshThreadgroupsWithIndirectBuffer:ind.gpuAddress + indOff
 		threadsPerObjectThreadgroup:obj threadsPerMeshThreadgroup:mesh];
 }
@@ -711,6 +919,7 @@ void mce4_dispatch_threads(id h, MTLSize grid, MTLSize tg) { [(MceEncoder *) h d
 void mce4_dispatch_threadgroups(id h, MTLSize groups, MTLSize tg) { [(MceEncoder *) h dispatchThreadgroups:groups threadsPerThreadgroup:tg]; }
 void mce4_dispatch_threadgroups_indirect(id h, id<MTLBuffer> ind, NSUInteger indOff, MTLSize tg) {
 	MceEncoder *e = h;
+	use(e, ind, 0);
 	serialPoint(e);
 	[(id<MTL4ComputeCommandEncoder>) e->real dispatchThreadgroupsWithIndirectBuffer:ind.gpuAddress + indOff threadsPerThreadgroup:tg];
 }

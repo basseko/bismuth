@@ -85,6 +85,13 @@ enum { MCE_KIND_RENDER = 1, MCE_KIND_SERIAL, MCE_KIND_CONCURRENT, MCE_KIND_BLIT 
 	int pending;  // serial/blit: a command was encoded since the last intra-encoder barrier
 	int ended;
 	id tables[MCE_STAGES];  // id<MTL4ArgumentTable>, nil where the kind has none
+	// automatic tracking (mce.m "tracking"): this encoder's fence (updated at its end), the command buffer it is on, the fences of earlier encoders
+	// of that command buffer it must wait for before its next command
+	id fence;
+	id cmd;
+	id sync;  // MceSync, the record the resource map points at
+	id waits[16];
+	int nwaits;
 }
 @end
 
@@ -97,6 +104,7 @@ enum { MCE_KIND_RENDER = 1, MCE_KIND_SERIAL, MCE_KIND_CONCURRENT, MCE_KIND_BLIT 
 	double gpuStart, gpuEnd;
 	NSMutableArray *completed, *waits, *signals;  // completion blocks; {event, value} pairs to wait on before / signal after the commit
 	id drawable;  // id<CAMetalDrawable> to present with this commit
+	int opened;  // an encoder was opened on it (the first gets the queue barrier that orders it after earlier command buffers)
 }
 @end
 
