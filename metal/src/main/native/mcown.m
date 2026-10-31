@@ -2,6 +2,7 @@
 // buffer, as the far terrain's) and the two instanced indirect draws (solid, cutout) into the level's open render encoder.
 // Only called with -Dmcopt.own; the backend's own paths never reach it.
 #import "mcmetal.h"
+#import "mce.h"
 #include <string.h>
 
 #define OWN_MAX_LAYOUTS 64
@@ -283,6 +284,7 @@ Own *mco_new(Ctx *ctx, const char *source, int compact, int fat, int cpuClip, ch
 			memcpy(idx + q * 6, k, sizeof k);
 		}
 		w->quadIdx = [ctx->device newBufferWithBytes:idx length:sizeof idx options:MTLResourceStorageModeShared];
+		mce_make_resident(w->quadIdx);
 		uint16_t idxG[256 * 6];
 		for (int q = 0; q < 256; q++) {
 			uint16_t b = (uint16_t) (q * 4);
@@ -290,6 +292,7 @@ Own *mco_new(Ctx *ctx, const char *source, int compact, int fat, int cpuClip, ch
 			memcpy(idxG + q * 6, k, sizeof k);
 		}
 		w->quadIdxG = [ctx->device newBufferWithBytes:idxG length:sizeof idxG options:MTLResourceStorageModeShared];
+		mce_make_resident(w->quadIdxG);
 		return w;
 	}
 }
@@ -298,9 +301,11 @@ Own *mco_new(Ctx *ctx, const char *source, int compact, int fat, int cpuClip, ch
 // else private and hazard-tracked (the cull's outputs: this frame's draws wait for this frame's cull)
 id<MTLBuffer> mco_buffer(Ctx *ctx, uint64_t size, int shared) {
 	// 2: shared and hazard-tracked (the draws' arguments: GPU-written, read back by the CPU for stats only)
-	return [ctx->device newBufferWithLength:size
+	id<MTLBuffer> b = [ctx->device newBufferWithLength:size
 		options:shared == 2 ? MTLResourceStorageModeShared : shared ? MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked
 		: MTLResourceStorageModePrivate];
+	mce_make_resident(b);
+	return b;
 }
 
 void *mco_contents(id<MTLBuffer> b) {
@@ -308,7 +313,7 @@ void *mco_contents(id<MTLBuffer> b) {
 }
 
 void mco_release(id obj) {
-	[obj release];
+	mce_release(obj);
 }
 
 // The cull, in an encoder of its own in the pre command buffer: reset the two draws' arguments, then a thread per section slot
@@ -326,6 +331,10 @@ static const char *opNames[OP_SLOTS] = {"cull", "quads A (list build)", "quads B
 	"uocc pyramid", "uocc test", "uocc finish", "uocc split"};  // (6-8: -Dmcopt.own.frag.uoccEnc's encoders; 9: the split's one encoder)
 
 void mco_set_gputime(int on) {
+	if (on && mce_metal4) {
+		mce_log_once("own.gputime: GPU timestamps of the own compute encoders are not available under Metal 4");
+		on = 0;
+	}
 	opOn = on;
 }
 
@@ -392,6 +401,7 @@ static void opNewFrame(Own *w) {
 
 // A compute encoder on cmd timed into slot (or untimed when off).
 static id<MTLComputeCommandEncoder> opCompute(id<MTLCommandBuffer> cmd, int slot, MTLDispatchType type) {
+	if (mce_metal4) return [mce_new_compute_encoder(cmd, type) autorelease];  // (never timed: opOn is 0 under Metal 4)
 	if (opOn == 1 && opBuf[0]) {
 		int r = opFrame % OP_RING;
 		MTLComputePassDescriptor *d = [MTLComputePassDescriptor computePassDescriptor];
@@ -412,46 +422,49 @@ static void ownBindSolid(Own *w, id<MTLComputeCommandEncoder> c) {
 		d.usage = MTLTextureUsageShaderRead;
 		d.storageMode = MTLStorageModePrivate;
 		w->soNone = [w->ctx->device newTextureWithDescriptor:d];
+		mce_make_resident(w->soNone);
 	}
 	if (w->soLength > 0) {
 		// built here, in the cull's own encoder, so the cull reads the finished pyramid (barriers, no cross-encoder view hazard)
 		int width = w->soW, height = w->soH;
-		[c setBuffer:w->soOcc offset:0 atIndex:13];
-		[c setBytes:w->soParams length:(NSUInteger) w->soLength atIndex:14];
-		[c setBuffer:w->soCols offset:0 atIndex:15];
+		mce_set_compute_buffer(c, w->soOcc, 0, 13);
+		mce_set_compute_bytes(c, w->soParams, (NSUInteger) w->soLength, 14);
+		mce_set_compute_buffer(c, w->soCols, 0, 15);
 		if (!w->soHead) {
 			w->soHead = [w->ctx->device newBufferWithLength:16 options:MTLResourceStorageModePrivate];
+			mce_make_resident(w->soHead);
 			w->soFaces = [w->ctx->device newBufferWithLength:16384 * 48 options:MTLResourceStorageModePrivate];
+			mce_make_resident(w->soFaces);
 		}
-		[c setBuffer:w->soHead offset:0 atIndex:16];
-		[c setBuffer:w->soFaces offset:0 atIndex:17];
-		[c setComputePipelineState:w->soClear];
-		[c dispatchThreads:MTLSizeMake((NSUInteger) width * height, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-		[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-		[c setComputePipelineState:w->soRaster];
-		[c dispatchThreads:MTLSizeMake((NSUInteger) w->soSpan, (NSUInteger) w->soSpan, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-		[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-		[c setComputePipelineState:w->soFill];
-		[c dispatchThreadgroupsWithIndirectBuffer:w->soHead indirectBufferOffset:0 threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-		[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-		[c setComputePipelineState:w->soMip0];
-		[c setTexture:w->soViews[0] atIndex:1];
-		[c dispatchThreads:MTLSizeMake((NSUInteger) width, (NSUInteger) height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-		[c setComputePipelineState:w->hizn];
+		mce_set_compute_buffer(c, w->soHead, 0, 16);
+		mce_set_compute_buffer(c, w->soFaces, 0, 17);
+		[mce_raw(c) setComputePipelineState:w->soClear];
+		mce_dispatch_threads(c, MTLSizeMake((NSUInteger) width * height, 1, 1), MTLSizeMake(64, 1, 1));
+		mce_memory_barrier(c, MTLBarrierScopeBuffers);
+		[mce_raw(c) setComputePipelineState:w->soRaster];
+		mce_dispatch_threads(c, MTLSizeMake((NSUInteger) w->soSpan, (NSUInteger) w->soSpan, 1), MTLSizeMake(8, 8, 1));
+		mce_memory_barrier(c, MTLBarrierScopeBuffers);
+		[mce_raw(c) setComputePipelineState:w->soFill];
+		mce_dispatch_threadgroups_indirect(c, w->soHead, 0, MTLSizeMake(32, 1, 1));
+		mce_memory_barrier(c, MTLBarrierScopeBuffers);
+		[mce_raw(c) setComputePipelineState:w->soMip0];
+		mce_set_compute_texture(c, w->soViews[0], 1);
+		mce_dispatch_threads(c, MTLSizeMake((NSUInteger) width, (NSUInteger) height, 1), MTLSizeMake(8, 8, 1));
+		[mce_raw(c) setComputePipelineState:w->hizn];
 		for (int i = 1; i < w->soMips; i++) {
-			[c memoryBarrierWithScope:MTLBarrierScopeTextures];
-			[c setTexture:w->soViews[i - 1] atIndex:0];
-			[c setTexture:w->soViews[i] atIndex:1];
-			[c dispatchThreads:MTLSizeMake((NSUInteger) MAX(1, width >> i), (NSUInteger) MAX(1, height >> i), 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+			mce_memory_barrier(c, MTLBarrierScopeTextures);
+			mce_set_compute_texture(c, w->soViews[i - 1], 0);
+			mce_set_compute_texture(c, w->soViews[i], 1);
+			mce_dispatch_threads(c, MTLSizeMake((NSUInteger) MAX(1, width >> i), (NSUInteger) MAX(1, height >> i), 1), MTLSizeMake(8, 8, 1));
 		}
-		[c memoryBarrierWithScope:MTLBarrierScopeTextures | MTLBarrierScopeBuffers];
-		[c setBytes:w->soParams length:(NSUInteger) w->soLength atIndex:12];
-		[c setTexture:w->soTex atIndex:1];
-		[c setTexture:nil atIndex:0];
+		mce_memory_barrier(c, MTLBarrierScopeTextures | MTLBarrierScopeBuffers);
+		mce_set_compute_bytes(c, w->soParams, (NSUInteger) w->soLength, 12);
+		mce_set_compute_texture(c, w->soTex, 1);
+		mce_set_compute_texture(c, nil, 0);
 	} else {
 		uint8_t zero[256] = {0};
-		[c setBytes:zero length:256 atIndex:12];
-		[c setTexture:w->soNone atIndex:1];
+		mce_set_compute_bytes(c, zero, 256, 12);
+		mce_set_compute_texture(c, w->soNone, 1);
 	}
 }
 
@@ -464,9 +477,9 @@ void mco_solid_occ(Own *w, Enc *enc, const void *params, int length, id<MTLBuffe
 		return;
 	}
 	if (!w->soTex || w->soW != width || w->soH != height) {
-		for (int i = 0; i < w->soMips; i++) [w->soViews[i] release];
-		[w->soTex release];
-		[w->soOcc release];
+		for (int i = 0; i < w->soMips; i++) mce_release(w->soViews[i]);
+		mce_release(w->soTex);
+		mce_release(w->soOcc);
 		int mips = 1;
 		while ((width >> mips) > 0 || (height >> mips) > 0) mips++;
 		if (mips > 16) mips = 16;
@@ -476,10 +489,14 @@ void mco_solid_occ(Own *w, Enc *enc, const void *params, int length, id<MTLBuffe
 			d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
 			d.storageMode = MTLStorageModePrivate;
 			w->soTex = [w->ctx->device newTextureWithDescriptor:d];
-			for (int i = 0; i < mips; i++)
+			mce_make_resident(w->soTex);
+			for (int i = 0; i < mips; i++) {
 				w->soViews[i] = [w->soTex newTextureViewWithPixelFormat:MTLPixelFormatR32Float textureType:MTLTextureType2D levels:NSMakeRange(i, 1) slices:NSMakeRange(0, 1)];
+				mce_make_resident(w->soViews[i]);
+			}
 		}
 		w->soOcc = [w->ctx->device newBufferWithLength:(NSUInteger) width * height * 4 options:MTLResourceStorageModePrivate];
+		mce_make_resident(w->soOcc);
 		w->soW = width;
 		w->soH = height;
 		w->soMips = mips;
@@ -500,41 +517,41 @@ void mco_cull(Own *w, Enc *enc, const void *frame, int frameLength, id<MTLBuffer
 	@autoreleasepool {
 		id<MTLComputeCommandEncoder> c = opOn == 1 ? opCompute(mc_pre(enc), 0, MTLDispatchTypeSerial)
 			: [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];  // (timed with gputime, else profiled while tracing)
-		c.label = @"own cull";
-		[c setBytes:frame length:frameLength atIndex:0];
-		[c setBuffer:sections offset:0 atIndex:1];
-		[c setBuffer:recs offset:0 atIndex:2];
-		[c setBuffer:args offset:0 atIndex:3];
-		[c setBuffer:lists offset:0 atIndex:4];
-		[c setBuffer:mask offset:0 atIndex:5];
-		[c setBuffer:curVis offset:0 atIndex:6];
-		[c setBytes:&visWords length:4 atIndex:7];
-		[c setBuffer:prevVis offset:0 atIndex:8];
-		[c setBuffer:tested offset:0 atIndex:9];
-		[c setBuffer:fat offset:0 atIndex:10];
+		[mce_raw(c) setLabel:@"own cull"];
+		mce_set_compute_bytes(c, frame, frameLength, 0);
+		mce_set_compute_buffer(c, sections, 0, 1);
+		mce_set_compute_buffer(c, recs, 0, 2);
+		mce_set_compute_buffer(c, args, 0, 3);
+		mce_set_compute_buffer(c, lists, 0, 4);
+		mce_set_compute_buffer(c, mask, 0, 5);
+		mce_set_compute_buffer(c, curVis, 0, 6);
+		mce_set_compute_bytes(c, &visWords, 4, 7);
+		mce_set_compute_buffer(c, prevVis, 0, 8);
+		mce_set_compute_buffer(c, tested, 0, 9);
+		mce_set_compute_buffer(c, fat, 0, 10);
 		ownBindSolid(w, c);
-		[c setComputePipelineState:w->reset];
-		[c dispatchThreads:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(4, 1, 1)];
+		[mce_raw(c) setComputePipelineState:w->reset];
+		mce_dispatch_threads(c, MTLSizeMake(4, 1, 1), MTLSizeMake(4, 1, 1));
 		if (visWords > 0) {
-			[c setComputePipelineState:w->clearVis];
-			[c dispatchThreads:MTLSizeMake((NSUInteger) visWords, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+			[mce_raw(c) setComputePipelineState:w->clearVis];
+			mce_dispatch_threads(c, MTLSizeMake((NSUInteger) visWords, 1, 1), MTLSizeMake(64, 1, 1));
 		}
-		[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
+		mce_memory_barrier(c, MTLBarrierScopeBuffers);
 		if (recThreads > 0 && visWords == 0) {
 			// a thread per record, appends aggregated per SIMD group (two-phase unit occlusion keeps the per-section kernel)
 			uint32_t cap = (uint32_t) recThreads;
-			[c setBytes:&cap length:4 atIndex:13];
-			[c setComputePipelineState:w->cullR];
-			[c dispatchThreads:MTLSizeMake((NSUInteger) recThreads, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-			[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
+			mce_set_compute_bytes(c, &cap, 4, 13);
+			[mce_raw(c) setComputePipelineState:w->cullR];
+			mce_dispatch_threads(c, MTLSizeMake((NSUInteger) recThreads, 1, 1), MTLSizeMake(64, 1, 1));
+			mce_memory_barrier(c, MTLBarrierScopeBuffers);
 		} else if (sectionCount > 0) {
-			[c setComputePipelineState:w->cull];
-			[c dispatchThreads:MTLSizeMake((NSUInteger) sectionCount, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-			[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
+			[mce_raw(c) setComputePipelineState:w->cull];
+			mce_dispatch_threads(c, MTLSizeMake((NSUInteger) sectionCount, 1, 1), MTLSizeMake(64, 1, 1));
+			mce_memory_barrier(c, MTLBarrierScopeBuffers);
 		}
-		[c setComputePipelineState:w->finish];
-		[c dispatchThreads:MTLSizeMake(2, 1, 1) threadsPerThreadgroup:MTLSizeMake(2, 1, 1)];
-		[c endEncoding];
+		[mce_raw(c) setComputePipelineState:w->finish];
+		mce_dispatch_threads(c, MTLSizeMake(2, 1, 1), MTLSizeMake(2, 1, 1));
+		mce_end_encoder(c);
 	}
 }
 
@@ -743,10 +760,10 @@ static void ownBindOcc(Own *w, id<MTLRenderCommandEncoder> r, int kind) {
 	uint32_t fo[8] = {w->fragOcc[0], w->fragOcc[1], w->fragOcc[2], w->fragOcc[3], w->fragOcc[4], w->fragStatsOn && w->fragStats ? 1u : 0u,
 		(uint32_t) (phaseB * 2 + (kind & 1)), 0};
 	if (phaseB && !w->hiz) fo[4] = 0;
-	[r setMeshBytes:fo length:sizeof fo atIndex:27];
-	[r setMeshBuffer:w->fragMasks offset:0 atIndex:26];
-	[r setMeshBuffer:w->fragStats offset:(NSUInteger) w->fragStatsOffset atIndex:28];
-	if (phaseB) [r setMeshTexture:w->hiz atIndex:18];
+	mce_set_mesh_bytes(r, fo, sizeof fo, 27);
+	mce_set_mesh_buffer(r, w->fragMasks, 0, 26);
+	mce_set_mesh_buffer(r, w->fragStats, (NSUInteger) w->fragStatsOffset, 28);
+	if (phaseB) mce_set_mesh_texture(r, w->hiz, 18);
 }
 
 // -Dmcopt.own.frag.vGroup: the grouped-draw state of the frag cull's args buffer a (NULL if none)
@@ -841,79 +858,79 @@ int mco_draw(Own *w, Enc *enc, int cutout, const void *frame, int frameLength, i
 	if (!pso) return -1;
 	int mesh = (cutout & (1 << 21)) != 0;
 	if (bound) {
-		if (pso != w->lastPso) [r setRenderPipelineState:pso];
+		if (pso != w->lastPso) [mce_raw(r) setRenderPipelineState:pso];
 		w->lastPso = pso;
-		[r setDepthStencilState:equal ? w->depthEqual : greater ? w->depthGreater : w->depth];
-		[r setDepthBias:bias ? 1.0f : 0 slopeScale:0 clamp:0];
-		if (mesh) [r setMeshBytes:frame length:frameLength atIndex:20];
-		else [r setVertexBytes:frame length:frameLength atIndex:20];
+		[mce_raw(r) setDepthStencilState:equal ? w->depthEqual : greater ? w->depthGreater : w->depth];
+		[mce_raw(r) setDepthBias:bias ? 1.0f : 0 slopeScale:0 clamp:0];
+		if (mesh) mce_set_mesh_bytes(r, frame, frameLength, 20);
+		else mce_set_vertex_bytes(r, frame, frameLength, 20);
 		if (mesh && (cutout & (3 << 27))) ownBindOcc(w, r, cutout);
 		goto drawCall;
 	}
 	w->lastPso = pso;
-	[r setRenderPipelineState:pso];
-	[r setDepthStencilState:shadow ? sh.depthLess : equal ? w->depthEqual : greater ? w->depthGreater : w->depth];
-	[r setCullMode:shadow ? MTLCullModeNone : MTLCullModeBack];
-	[r setFrontFacingWinding:MTLWindingClockwise];
-	[r setTriangleFillMode:MTLTriangleFillModeFill];
-	if (shadow) [r setDepthBias:sh.biasC slopeScale:sh.biasS clamp:0];
-	else [r setDepthBias:bias ? 1.0f : 0 slopeScale:0 clamp:0];
+	[mce_raw(r) setRenderPipelineState:pso];
+	[mce_raw(r) setDepthStencilState:shadow ? sh.depthLess : equal ? w->depthEqual : greater ? w->depthGreater : w->depth];
+	[mce_raw(r) setCullMode:shadow ? MTLCullModeNone : MTLCullModeBack];
+	[mce_raw(r) setFrontFacingWinding:MTLWindingClockwise];
+	[mce_raw(r) setTriangleFillMode:MTLTriangleFillModeFill];
+	if (shadow) [mce_raw(r) setDepthBias:sh.biasC slopeScale:sh.biasS clamp:0];
+	else [mce_raw(r) setDepthBias:bias ? 1.0f : 0 slopeScale:0 clamp:0];
 	if (mesh) {
-		[r setMeshBytes:frame length:frameLength atIndex:20];
-		[r setMeshBuffer:arena offset:0 atIndex:16];
-		[r setMeshBuffer:sections offset:0 atIndex:17];
-		[r setMeshBuffer:recs offset:0 atIndex:18];
-		[r setMeshBuffer:lists offset:0 atIndex:19];
-		[r setMeshBuffer:(id<MTLBuffer>) (void *) u[0] offset:(NSUInteger) u[1] atIndex:21];
-		[r setMeshBuffer:(id<MTLBuffer>) (void *) u[2] offset:(NSUInteger) u[3] atIndex:22];
-		[r setMeshBuffer:(id<MTLBuffer>) (void *) u[4] offset:(NSUInteger) u[5] atIndex:23];
-		[r setMeshTexture:light atIndex:17];
-		[r setMeshSamplerState:lightSampler atIndex:15];
+		mce_set_mesh_bytes(r, frame, frameLength, 20);
+		mce_set_mesh_buffer(r, arena, 0, 16);
+		mce_set_mesh_buffer(r, sections, 0, 17);
+		mce_set_mesh_buffer(r, recs, 0, 18);
+		mce_set_mesh_buffer(r, lists, 0, 19);
+		mce_set_mesh_buffer(r, (id<MTLBuffer>) (void *) u[0], (NSUInteger) u[1], 21);
+		mce_set_mesh_buffer(r, (id<MTLBuffer>) (void *) u[2], (NSUInteger) u[3], 22);
+		mce_set_mesh_buffer(r, (id<MTLBuffer>) (void *) u[4], (NSUInteger) u[5], 23);
+		mce_set_mesh_texture(r, light, 17);
+		mce_set_mesh_sampler(r, lightSampler, 15);
 		if (cutout & (3 << 27)) ownBindOcc(w, r, cutout);
 		if (cutout & (1 << 29)) {
 			// own_mesh_q: the per-quad path's arguments (count, start per list) and its index lists
-			[r setMeshBuffer:args offset:0 atIndex:18];
-			[r setMeshBuffer:indices offset:0 atIndex:25];
+			mce_set_mesh_buffer(r, args, 0, 18);
+			mce_set_mesh_buffer(r, indices, 0, 25);
 		}
 	}
-	[r setVertexBytes:frame length:frameLength atIndex:20];
-	[r setVertexBuffer:arena offset:0 atIndex:16];
-	[r setVertexBuffer:sections offset:0 atIndex:17];
-	[r setVertexBuffer:recs offset:0 atIndex:18];
-	[r setVertexBuffer:lists offset:0 atIndex:19];
-	[r setVertexBuffer:(id<MTLBuffer>) (void *) u[0] offset:(NSUInteger) u[1] atIndex:21];
-	[r setVertexBuffer:(id<MTLBuffer>) (void *) u[2] offset:(NSUInteger) u[3] atIndex:22];
-	[r setVertexBuffer:(id<MTLBuffer>) (void *) u[4] offset:(NSUInteger) u[5] atIndex:23];
-	[r setFragmentBuffer:(id<MTLBuffer>) (void *) u[2] offset:(NSUInteger) u[3] atIndex:22];
-	[r setFragmentBuffer:(id<MTLBuffer>) (void *) u[4] offset:(NSUInteger) u[5] atIndex:23];
-	[r setFragmentBuffer:(id<MTLBuffer>) (void *) u[6] offset:(NSUInteger) u[7] atIndex:24];
-	if ((cutout >> 13) & 3) [r setVertexBuffer:(id<MTLBuffer>) (void *) u[6] offset:(NSUInteger) u[7] atIndex:24];  // (F_FOGVERT: the fog block per vertex)
-	[r setVertexTexture:light atIndex:17];
-	[r setVertexSamplerState:lightSampler atIndex:15];
-	[r setFragmentTexture:atlas atIndex:16];
-	[r setFragmentSamplerState:atlasSampler atIndex:14];
+	mce_set_vertex_bytes(r, frame, frameLength, 20);
+	mce_set_vertex_buffer(r, arena, 0, 16);
+	mce_set_vertex_buffer(r, sections, 0, 17);
+	mce_set_vertex_buffer(r, recs, 0, 18);
+	mce_set_vertex_buffer(r, lists, 0, 19);
+	mce_set_vertex_buffer(r, (id<MTLBuffer>) (void *) u[0], (NSUInteger) u[1], 21);
+	mce_set_vertex_buffer(r, (id<MTLBuffer>) (void *) u[2], (NSUInteger) u[3], 22);
+	mce_set_vertex_buffer(r, (id<MTLBuffer>) (void *) u[4], (NSUInteger) u[5], 23);
+	mce_set_fragment_buffer(r, (id<MTLBuffer>) (void *) u[2], (NSUInteger) u[3], 22);
+	mce_set_fragment_buffer(r, (id<MTLBuffer>) (void *) u[4], (NSUInteger) u[5], 23);
+	mce_set_fragment_buffer(r, (id<MTLBuffer>) (void *) u[6], (NSUInteger) u[7], 24);
+	if ((cutout >> 13) & 3) mce_set_vertex_buffer(r, (id<MTLBuffer>) (void *) u[6], (NSUInteger) u[7], 24);  // (F_FOGVERT: the fog block per vertex)
+	mce_set_vertex_texture(r, light, 17);
+	mce_set_vertex_sampler(r, lightSampler, 15);
+	mce_set_fragment_texture(r, atlas, 16);
+	mce_set_fragment_sampler(r, atlasSampler, 14);
 drawCall:
 	if (cutout & (1 << 8)) {
 		// the shaded variant: the frame block, this frame's shadow map, and the lightmap (the fragment stage applies it)
-		[r setFragmentBytes:sh.frame length:(NSUInteger) sh.frameLen atIndex:30];
-		[r setFragmentTexture:sh.cur atIndex:24];
-		[r setFragmentTexture:sk.cur atIndex:25];
-		if (sk.shCur) [r setFragmentBuffer:sk.shCur offset:0 atIndex:29];  // (the sky ambient's SH coefficients, mcopt.shaders.ambient.sh)
-		[r setFragmentTexture:sk.cov ? sk.cov : sk.cur atIndex:29];  // (the clouds track: the coverage map for the cloud shadows; any texture when there is none, ShadeFrame.cloudShA.y is 0 then)
-		[r setFragmentTexture:light atIndex:17];
-		[r setFragmentSamplerState:lightSampler atIndex:15];
+		mce_set_fragment_bytes(r, sh.frame, (NSUInteger) sh.frameLen, 30);
+		mce_set_fragment_texture(r, sh.cur, 24);
+		mce_set_fragment_texture(r, sk.cur, 25);
+		if (sk.shCur) mce_set_fragment_buffer(r, sk.shCur, 0, 29);  // (the sky ambient's SH coefficients, mcopt.shaders.ambient.sh)
+		mce_set_fragment_texture(r, sk.cov ? sk.cov : sk.cur, 29);  // (the clouds track: the coverage map for the cloud shadows; any texture when there is none, ShadeFrame.cloudShA.y is 0 then)
+		mce_set_fragment_texture(r, light, 17);
+		mce_set_fragment_sampler(r, lightSampler, 15);
 	}
 	if (cutout & (1 << 10)) ownBindWater(r, light, lightSampler, (cutout & 15) == 3);
-	if (w->vcount && !mesh) [r setVertexBuffer:w->vcount offset:0 atIndex:28];
+	if (w->vcount && !mesh) mce_set_vertex_buffer(r, w->vcount, 0, 28);
 	if (cutout & (1 << 30)) {
 		// the visibility oracle: the drawn units (vertex stage) and the units with a visible pixel (fragment stage), this sample's number
-		[r setVertexBuffer:w->oracleKept offset:0 atIndex:26];
-		[r setVertexBytes:&w->oracleFrame length:4 atIndex:27];
-		[r setFragmentBuffer:w->oracleVis offset:0 atIndex:26];
-		[r setFragmentBytes:&w->oracleFrame length:4 atIndex:27];
+		mce_set_vertex_buffer(r, w->oracleKept, 0, 26);
+		mce_set_vertex_bytes(r, &w->oracleFrame, 4, 27);
+		mce_set_fragment_buffer(r, w->oracleVis, 0, 26);
+		mce_set_fragment_bytes(r, &w->oracleFrame, 4, 27);
 	}
 	// the layer's debug group around the draw itself (a follow-up 'bound' draw too), so a GPU tool's groups delimit draws
-	[r pushDebugGroup:ownLayerName(cutout)];
+	[mce_raw(r) pushDebugGroup:ownLayerName(cutout)];
 	if (vgArgs) {
 		// (vGroup: frag_finish's {2^sh x class x 6, instances, 0, 0, 0} for this list, own_vs F_GROUP; vArgsCopy: its plain copy)
 		static int vgSaid;
@@ -922,56 +939,49 @@ drawCall:
 			if (vgGrp[0]) fprintf(stderr, "mcopt-own: vGroup on: phase A class draws as instances of %u units\n", 1u << vgGrp[2]);
 			else fprintf(stderr, "mcopt-own: vArgsCopy on: class draws read their arguments from the finish's private copy\n");
 		}
-		if (vgGrp[0]) [r setVertexBytes:vgGrp length:sizeof vgGrp atIndex:29];
-		[r drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexType:MTLIndexTypeUInt16 indexBuffer:vgGrp[0] ? w->quadIdxG : w->quadIdx indexBufferOffset:0
-			indirectBuffer:vgArgs indirectBufferOffset:(NSUInteger) argsOffset];
+		if (vgGrp[0]) mce_set_vertex_bytes(r, vgGrp, sizeof vgGrp, 29);
+		mce_draw_indexed_indirect(r, MTLPrimitiveTypeTriangle, MTLIndexTypeUInt16, vgGrp[0] ? w->quadIdxG : w->quadIdx, 0, vgArgs, (NSUInteger) argsOffset);
 	} else if (mesh) {
 		// argsOffset: the list's {units, 1, 1} (terrain.metal frag_finish)
-		[r drawMeshThreadgroupsWithIndirectBuffer:args indirectBufferOffset:(NSUInteger) argsOffset threadsPerObjectThreadgroup:MTLSizeMake(1, 1, 1)
-			threadsPerMeshThreadgroup:MTLSizeMake((cutout & (1 << 23)) ? 128 : 32, 1, 1)];
+		mce_draw_mesh_threadgroups_indirect(r, args, (NSUInteger) argsOffset, MTLSizeMake(1, 1, 1), MTLSizeMake((cutout & (1 << 23)) ? 128 : 32, 1, 1));
 	} else if (nonidx) {
 		// the indexed arguments {count, instances, 0, 0, 0} read as {vertexCount, instanceCount, vertexStart, baseInstance};
 		// the per-quad path's quad lists (-Dmcopt.own.quads.list): an entry a quad, the vertex stage reads it at vertex_id / 6
-		if (indices) [r setVertexBuffer:indices offset:0 atIndex:25];
-		[r drawPrimitives:MTLPrimitiveTypeTriangle indirectBuffer:args indirectBufferOffset:(NSUInteger) argsOffset];
+		if (indices) mce_set_vertex_buffer(r, indices, 0, 25);
+		mce_draw_indirect(r, MTLPrimitiveTypeTriangle, args, (NSUInteger) argsOffset);
 	} else if (indices) {
 		// the per-quad path: the GPU-built list of arena vertex indices (its arguments carry the region's start)
-		[r drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexType:MTLIndexTypeUInt32 indexBuffer:indices indexBufferOffset:0 indirectBuffer:args
-			indirectBufferOffset:(NSUInteger) argsOffset];
+		mce_draw_indexed_indirect(r, MTLPrimitiveTypeTriangle, MTLIndexTypeUInt32, indices, 0, args, (NSUInteger) argsOffset);
 	} else if ((cutout & (1 << 12)) && w->a1Mode == 1 && w->a1Tab[w->a1Set]) {
 		// a1Exact / a2Exact: this list (id = argsOffset / 20) over its region of the cull's per-block table (the table in place of the
 		// lists; the frame's listBase 0, the draw's base vertex 4 x the region's first quad slot), then its fallback class draw
 		int lid = (int) (argsOffset / 20), set = w->a1Set;
-		[r setVertexBuffer:w->a1Tab[set] offset:0 atIndex:19];
+		mce_set_vertex_buffer(r, w->a1Tab[set], 0, 19);
 		// (instances of 64 quads over the region: the class draws' 16-bit quad indices, cached, with the region's base vertex)
-		[r drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexType:MTLIndexTypeUInt16 indexBuffer:w->quadIdx indexBufferOffset:0 indirectBuffer:w->a1Draws[set]
-			indirectBufferOffset:(NSUInteger) lid * 40];
-		[r setVertexBuffer:lists offset:0 atIndex:19];
+		mce_draw_indexed_indirect(r, MTLPrimitiveTypeTriangle, MTLIndexTypeUInt16, w->quadIdx, 0, w->a1Draws[set], (NSUInteger) lid * 40);
+		mce_set_vertex_buffer(r, lists, 0, 19);
 		// the class draw, with instances only if the list's region or the list overflowed (frag_finish): the same pipeline, its
 		// vertex stage told by listBase bit 31 to read the list as a class draw does
 		if (frameLength <= (int) sizeof fbuf) {
 			memcpy(fbuf, frame, (size_t) frameLength);
 			*(uint32_t *) fbuf = (uint32_t) (lid * w->a1ListCap) | 0x80000000u;
-			[r setVertexBytes:fbuf length:(NSUInteger) frameLength atIndex:20];
-			[r drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexType:MTLIndexTypeUInt16 indexBuffer:w->quadIdx indexBufferOffset:0 indirectBuffer:w->a1Draws[set]
-				indirectBufferOffset:(NSUInteger) lid * 40 + 20];
-			[r setVertexBytes:frame length:(NSUInteger) frameLength atIndex:20];
+			mce_set_vertex_bytes(r, fbuf, (NSUInteger) frameLength, 20);
+			mce_draw_indexed_indirect(r, MTLPrimitiveTypeTriangle, MTLIndexTypeUInt16, w->quadIdx, 0, w->a1Draws[set], (NSUInteger) lid * 40 + 20);
+			mce_set_vertex_bytes(r, frame, (NSUInteger) frameLength, 20);
 		}
 	} else if ((cutout & (1 << 12)) && frameLength <= (int) sizeof fbuf) {
 		// (a table draw without this frame's table, e.g. its buffers couldn't be made: the list's class draw through the same F_QFLAT
 		// pipeline, listBase bit 31; never the table's listBase 0 against the list)
 		memcpy(fbuf, frame, (size_t) frameLength);
 		*(uint32_t *) fbuf = (uint32_t) ((argsOffset / 20) * w->a1ListCap) | 0x80000000u;
-		[r setVertexBytes:fbuf length:(NSUInteger) frameLength atIndex:20];
-		[r drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexType:MTLIndexTypeUInt16 indexBuffer:w->quadIdx indexBufferOffset:0 indirectBuffer:args
-			indirectBufferOffset:(NSUInteger) argsOffset];
-		[r setVertexBytes:frame length:(NSUInteger) frameLength atIndex:20];
+		mce_set_vertex_bytes(r, fbuf, (NSUInteger) frameLength, 20);
+		mce_draw_indexed_indirect(r, MTLPrimitiveTypeTriangle, MTLIndexTypeUInt16, w->quadIdx, 0, args, (NSUInteger) argsOffset);
+		mce_set_vertex_bytes(r, frame, (NSUInteger) frameLength, 20);
 		w->exactPipeFallbacks++;
 	} else {
-		[r drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexType:MTLIndexTypeUInt16 indexBuffer:w->quadIdx indexBufferOffset:0 indirectBuffer:args
-			indirectBufferOffset:(NSUInteger) argsOffset];
+		mce_draw_indexed_indirect(r, MTLPrimitiveTypeTriangle, MTLIndexTypeUInt16, w->quadIdx, 0, args, (NSUInteger) argsOffset);
 	}
-	[r popDebugGroup];
+	[mce_raw(r) popDebugGroup];
 	return 1;
 }
 
@@ -986,8 +996,8 @@ int mco_occ(Own *w, Enc *enc, const void *frame, int frameLength, id<MTLBuffer> 
 	int dw = (int) depth.width, dh = (int) depth.height;
 	int hw = (dw + 1) / 2, hh = (dh + 1) / 2;
 	if (!w->hiz || w->hizWidth != hw || w->hizHeight != hh) {
-		for (int i = 0; i < w->hizMips; i++) [w->hizViews[i] release];
-		[w->hiz release];
+		for (int i = 0; i < w->hizMips; i++) mce_release(w->hizViews[i]);
+		mce_release(w->hiz);
 		int mips = 1;
 		while ((hw >> mips) > 0 || (hh >> mips) > 0) mips++;
 		if (mips > 16) mips = 16;
@@ -997,8 +1007,11 @@ int mco_occ(Own *w, Enc *enc, const void *frame, int frameLength, id<MTLBuffer> 
 			d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
 			d.storageMode = MTLStorageModePrivate;
 			w->hiz = [w->ctx->device newTextureWithDescriptor:d];
-			for (int i = 0; i < mips; i++)
+			mce_make_resident(w->hiz);
+			for (int i = 0; i < mips; i++) {
 				w->hizViews[i] = [w->hiz newTextureViewWithPixelFormat:MTLPixelFormatR32Float textureType:MTLTextureType2D levels:NSMakeRange(i, 1) slices:NSMakeRange(0, 1)];
+				mce_make_resident(w->hizViews[i]);
+			}
 		}
 		w->hizWidth = hw;
 		w->hizHeight = hh;
@@ -1016,43 +1029,43 @@ int mco_occ(Own *w, Enc *enc, const void *frame, int frameLength, id<MTLBuffer> 
 	hizOut[3] = hh;
 	hizOut[4] = w->hizMips;
 	id<MTLComputeCommandEncoder> c = mc_render_suspend(enc);
-	c.label = @"own occlusion";
+	[mce_raw(c) setLabel:@"own occlusion"];
 	{
 		uint32_t two = 2;
-		[c setBytes:&two length:4 atIndex:2];
+		mce_set_compute_bytes(c, &two, 4, 2);
 	}
-	[c setComputePipelineState:w->hiz0];
-	[c setTexture:depth atIndex:0];
-	[c setTexture:w->hizViews[0] atIndex:1];
-	[c dispatchThreads:MTLSizeMake((NSUInteger) hw, (NSUInteger) hh, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-	[c setComputePipelineState:w->hizn];
+	[mce_raw(c) setComputePipelineState:w->hiz0];
+	mce_set_compute_texture(c, depth, 0);
+	mce_set_compute_texture(c, w->hizViews[0], 1);
+	mce_dispatch_threads(c, MTLSizeMake((NSUInteger) hw, (NSUInteger) hh, 1), MTLSizeMake(8, 8, 1));
+	[mce_raw(c) setComputePipelineState:w->hizn];
 	for (int i = 1; i < w->hizMips; i++) {
-		[c memoryBarrierWithScope:MTLBarrierScopeTextures];
-		[c setTexture:w->hizViews[i - 1] atIndex:0];
-		[c setTexture:w->hizViews[i] atIndex:1];
+		mce_memory_barrier(c, MTLBarrierScopeTextures);
+		mce_set_compute_texture(c, w->hizViews[i - 1], 0);
+		mce_set_compute_texture(c, w->hizViews[i], 1);
 		NSUInteger mw = MAX(1, hw >> i), mh = MAX(1, hh >> i);
-		[c dispatchThreads:MTLSizeMake(mw, mh, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+		mce_dispatch_threads(c, MTLSizeMake(mw, mh, 1), MTLSizeMake(8, 8, 1));
 	}
 	if (stage == 1) {  // probe "pyr": the split and the pyramid only
 		mc_render_resume(enc, c);
 		return 1;
 	}
-	[c memoryBarrierWithScope:MTLBarrierScopeTextures | MTLBarrierScopeBuffers];
-	[c setComputePipelineState:w->occ];
-	[c setBytes:occFrame length:(NSUInteger) frameLength atIndex:0];
-	[c setBuffer:sections offset:0 atIndex:1];
-	[c setBuffer:recs offset:0 atIndex:2];
-	[c setBuffer:args offset:0 atIndex:3];
-	[c setBuffer:lists offset:0 atIndex:4];
-	[c setBuffer:curVis offset:0 atIndex:6];
-	[c setBuffer:tested offset:0 atIndex:9];
-	[c setBuffer:fat offset:0 atIndex:10];
-	[c setTexture:w->hiz atIndex:0];
-	[c dispatchThreadgroupsWithIndirectBuffer:args indirectBufferOffset:21 * 4 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-	[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-	[c setComputePipelineState:w->finishB];
-	[c setBytes:occFrame length:(NSUInteger) frameLength atIndex:0];
-	[c dispatchThreads:MTLSizeMake(2, 1, 1) threadsPerThreadgroup:MTLSizeMake(2, 1, 1)];
+	mce_memory_barrier(c, MTLBarrierScopeTextures | MTLBarrierScopeBuffers);
+	[mce_raw(c) setComputePipelineState:w->occ];
+	mce_set_compute_bytes(c, occFrame, (NSUInteger) frameLength, 0);
+	mce_set_compute_buffer(c, sections, 0, 1);
+	mce_set_compute_buffer(c, recs, 0, 2);
+	mce_set_compute_buffer(c, args, 0, 3);
+	mce_set_compute_buffer(c, lists, 0, 4);
+	mce_set_compute_buffer(c, curVis, 0, 6);
+	mce_set_compute_buffer(c, tested, 0, 9);
+	mce_set_compute_buffer(c, fat, 0, 10);
+	mce_set_compute_texture(c, w->hiz, 0);
+	mce_dispatch_threadgroups_indirect(c, args, 21 * 4, MTLSizeMake(64, 1, 1));
+	mce_memory_barrier(c, MTLBarrierScopeBuffers);
+	[mce_raw(c) setComputePipelineState:w->finishB];
+	mce_set_compute_bytes(c, occFrame, (NSUInteger) frameLength, 0);
+	mce_dispatch_threads(c, MTLSizeMake(2, 1, 1), MTLSizeMake(2, 1, 1));
 	mc_render_resume(enc, c);
 	return 1;
 }
@@ -1124,18 +1137,23 @@ static void ownA1Bind(Own *w, id<MTLComputeCommandEncoder> c) {
 		if (!w->a1Cnt[0]) {
 			for (int i = 0; i < 2; i++) {
 				w->a1Cnt[i] = [w->ctx->device newBufferWithLength:4 * 128 options:MTLResourceStorageModePrivate];
+				mce_make_resident(w->a1Cnt[i]);
 				w->a1Draws[i] = [w->ctx->device newBufferWithLength:4 * (640 + 32) options:MTLResourceStorageModeShared];
+				mce_make_resident(w->a1Draws[i]);
 				if (w->a1Draws[i]) memset(w->a1Draws[i].contents, 0, 4 * (640 + 32));
 			}
 		}
 		if (w->a1Mode == 1 && !w->a1Tab[0]) {
-			for (int i = 0; i < 2; i++) w->a1Tab[i] = [w->ctx->device newBufferWithLength:4 * (NSUInteger) A1_REGION * 64 options:MTLResourceStorageModePrivate];
+			for (int i = 0; i < 2; i++) {
+				w->a1Tab[i] = [w->ctx->device newBufferWithLength:4 * (NSUInteger) A1_REGION * 64 options:MTLResourceStorageModePrivate];
+				mce_make_resident(w->a1Tab[i]);
+			}
 		}
 		if (!w->a1Cnt[0] || !w->a1Cnt[1] || !w->a1Draws[0] || !w->a1Draws[1] || (w->a1Mode == 1 && (!w->a1Tab[0] || !w->a1Tab[1]))) {
 			// (sticky: no further tries; the K_EXACT draws find no table and draw their class draws, counted)
 			w->exactAllocFailed = 1;
 			for (int i = 0; i < 2; i++) {
-				[w->a1Tab[i] release];
+				mce_release(w->a1Tab[i]);
 				w->a1Tab[i] = nil;
 			}
 			w->a1Mode = 0;
@@ -1146,11 +1164,11 @@ static void ownA1Bind(Own *w, id<MTLComputeCommandEncoder> c) {
 		k[0] = lo;
 		k[1] = hi;
 		k[2] = w->a1Mode == 1 && w->a1Tab[set] ? 1 : 2;
-		[c setBuffer:w->a1Cnt[set] offset:0 atIndex:22];
-		[c setBuffer:w->a1Draws[set] offset:0 atIndex:24];
-		if (k[2] == 1) [c setBuffer:w->a1Tab[set] offset:0 atIndex:26];
+		mce_set_compute_buffer(c, w->a1Cnt[set], 0, 22);
+		mce_set_compute_buffer(c, w->a1Draws[set], 0, 24);
+		if (k[2] == 1) mce_set_compute_buffer(c, w->a1Tab[set], 0, 26);
 	}
-	[c setBytes:k length:sizeof k atIndex:27];
+	mce_set_compute_bytes(c, k, sizeof k, 27);
 }
 
 // -Dmcopt.own.frag.vGroup (FragFrame flags bits 24-25, log2 units per instance) for the finish of a draw-argument buffer a (the frag
@@ -1174,8 +1192,8 @@ static int ownVgPrepare(Own *w, id<MTLBuffer> a, const void **frame, int length,
 			if (!w->vg[i].args) v = i;
 		if (v < 0) {
 			// (the oldest out)
-			if (w->vg[0].args) [(id) w->vg[0].args release];
-			[w->vg[0].gArgs release];
+			if (w->vg[0].args) mce_release((id) w->vg[0].args);
+			mce_release(w->vg[0].gArgs);
 			for (int i = 1; i < 4; i++) w->vg[i - 1] = w->vg[i];
 			v = 3;
 			memset(&w->vg[3], 0, sizeof w->vg[3]);
@@ -1183,10 +1201,13 @@ static int ownVgPrepare(Own *w, id<MTLBuffer> a, const void **frame, int length,
 	}
 	if (v >= 0) {
 		if (w->vg[v].args != (void *) a) {
-			if (w->vg[v].args) [(id) w->vg[v].args release];
+			if (w->vg[v].args) mce_release((id) w->vg[v].args);
 			w->vg[v].args = (void *) [a retain];
 		}
-		if ((sh || cp) && !w->vg[v].gArgs) w->vg[v].gArgs = [w->ctx->device newBufferWithLength:64 * 20 options:MTLResourceStorageModePrivate];
+		if ((sh || cp) && !w->vg[v].gArgs) {
+			w->vg[v].gArgs = [w->ctx->device newBufferWithLength:64 * 20 options:MTLResourceStorageModePrivate];
+			mce_make_resident(w->vg[v].gArgs);
+		}
 		if (!w->vg[v].gArgs) sh = cp = 0;
 		const uint8_t *g = (const uint8_t *) *frame;
 		int32_t f[6];
@@ -1272,51 +1293,51 @@ void mco_frag_cull(Own *w, Enc *enc, const void *frame, int frameLength, const v
 	@autoreleasepool {
 		if (w->fragClearN > 0) {
 			// (newly allocated buffers zeroed first, in the same pre command buffer, before the cull or any later pass reads them)
-			id<MTLBlitCommandEncoder> b = [mc_pre(enc) blitCommandEncoder];
-			b.label = @"own frag clear";
-			for (int i = 0; i < w->fragClearN; i++) [b fillBuffer:w->fragClear[i] range:NSMakeRange(0, w->fragClear[i].length) value:0];
-			[b endEncoding];
+			id<MTLBlitCommandEncoder> b = [mce_new_blit_encoder(mc_pre(enc)) autorelease];
+			[mce_raw(b) setLabel:@"own frag clear"];
+			for (int i = 0; i < w->fragClearN; i++) mce_fill_buffer(b, w->fragClear[i], NSMakeRange(0, w->fragClear[i].length), 0);
+			mce_end_encoder(b);
 			w->fragClearN = 0;
 		}
 		id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];  // (profiled while tracing)
-		c.label = @"own frag cull";
-		[c setBytes:frame length:frameLength atIndex:0];
-		[c setBytes:fragFrame length:fragLength atIndex:11];
-		[c setBuffer:sections offset:0 atIndex:1];
-		[c setBuffer:recs offset:0 atIndex:2];
-		[c setBuffer:args offset:0 atIndex:3];
-		[c setBuffer:lists offset:0 atIndex:4];
-		[c setBuffer:mask offset:0 atIndex:5];
+		[mce_raw(c) setLabel:@"own frag cull"];
+		mce_set_compute_bytes(c, frame, frameLength, 0);
+		mce_set_compute_bytes(c, fragFrame, fragLength, 11);
+		mce_set_compute_buffer(c, sections, 0, 1);
+		mce_set_compute_buffer(c, recs, 0, 2);
+		mce_set_compute_buffer(c, args, 0, 3);
+		mce_set_compute_buffer(c, lists, 0, 4);
+		mce_set_compute_buffer(c, mask, 0, 5);
 		if (w->uoccVis) {
-			[c setBuffer:w->uoccVis offset:0 atIndex:13];
-			[c setBuffer:w->uoccT offset:0 atIndex:14];
-			[c setBuffer:w->uoccBArgs offset:0 atIndex:15];
+			mce_set_compute_buffer(c, w->uoccVis, 0, 13);
+			mce_set_compute_buffer(c, w->uoccT, 0, 14);
+			mce_set_compute_buffer(c, w->uoccBArgs, 0, 15);
 		}
 		ownBindSolid(w, c);
 		ownA1Bind(w, c);
-		[c setBuffer:w->tieRing ? w->tieRing : sections offset:0 atIndex:30];  // (read only under FragFrame's F_TIE_CLOSE, which needs the ring)
-		[c setComputePipelineState:w->fragReset];
+		mce_set_compute_buffer(c, w->tieRing ? w->tieRing : sections, 0, 30);  // (read only under FragFrame's F_TIE_CLOSE, which needs the ring)
+		[mce_raw(c) setComputePipelineState:w->fragReset];
 		NSUInteger resetThreads = (NSUInteger) MAX(listCount, 32);  // (the stats, occlusion counters, unit test, facing tally, culling funnel)
-		[c dispatchThreads:MTLSizeMake(resetThreads, 1, 1) threadsPerThreadgroup:MTLSizeMake(resetThreads, 1, 1)];
-		[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
+		mce_dispatch_threads(c, MTLSizeMake(resetThreads, 1, 1), MTLSizeMake(resetThreads, 1, 1));
+		mce_memory_barrier(c, MTLBarrierScopeBuffers);
 		if (lanes > 0 && !vArgs && sectionCount > 0) {
-			[c setComputePipelineState:w->fragCullR];
-			[c dispatchThreads:MTLSizeMake((NSUInteger) sectionCount * (NSUInteger) lanes, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-			[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
+			[mce_raw(c) setComputePipelineState:w->fragCullR];
+			mce_dispatch_threads(c, MTLSizeMake((NSUInteger) sectionCount * (NSUInteger) lanes, 1, 1), MTLSizeMake(256, 1, 1));
+			mce_memory_barrier(c, MTLBarrierScopeBuffers);
 		} else if (sectionCount > 0) {
-			[c setComputePipelineState:w->fragCull];
-			[c dispatchThreads:MTLSizeMake((NSUInteger) sectionCount, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-			[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
+			[mce_raw(c) setComputePipelineState:w->fragCull];
+			mce_dispatch_threads(c, MTLSizeMake((NSUInteger) sectionCount, 1, 1), MTLSizeMake(64, 1, 1));
+			mce_memory_barrier(c, MTLBarrierScopeBuffers);
 		}
 		// (vGroup / vArgsCopy: frag_finish_g and its grouped arguments, marked written once encoded; else the base's frag_finish)
 		int vgEnc = vgSh != 0 && vgSlot >= 0 && w->fragFinishG && w->vg[vgSlot].gArgs;
 		if (vgEnc) {
-			[c setComputePipelineState:w->fragFinishG];
-			[c setBuffer:w->vg[vgSlot].gArgs offset:0 atIndex:28];
+			[mce_raw(c) setComputePipelineState:w->fragFinishG];
+			mce_set_compute_buffer(c, w->vg[vgSlot].gArgs, 0, 28);
 		} else {
-			[c setComputePipelineState:w->fragFinish];
+			[mce_raw(c) setComputePipelineState:w->fragFinish];
 		}
-		[c dispatchThreads:MTLSizeMake((NSUInteger) listCount, 1, 1) threadsPerThreadgroup:MTLSizeMake((NSUInteger) listCount, 1, 1)];
+		mce_dispatch_threads(c, MTLSizeMake((NSUInteger) listCount, 1, 1), MTLSizeMake((NSUInteger) listCount, 1, 1));
 		if (vgEnc) {
 			w->vg[vgSlot].written = 1;
 			w->vgFrameA = 1;
@@ -1326,11 +1347,11 @@ void mco_frag_cull(Own *w, Enc *enc, const void *frame, int frameLength, const v
 		w->a1sGOut = NULL;
 		if (w->a1sOut && w->a1sKernel) {
 			// (-Dmcopt.own.tl.a1Split: one list's finished arguments as two draws, mco_tl_a1split_req)
-			[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-			[c setComputePipelineState:w->a1sKernel];
-			[c setBuffer:w->a1sOut offset:0 atIndex:29];
-			[c setBytes:w->a1sParams length:16 atIndex:28];
-			[c dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+			mce_memory_barrier(c, MTLBarrierScopeBuffers);
+			[mce_raw(c) setComputePipelineState:w->a1sKernel];
+			mce_set_compute_buffer(c, w->a1sOut, 0, 29);
+			mce_set_compute_bytes(c, w->a1sParams, 16, 28);
+			mce_dispatch_threads(c, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
 			// (vGroup: the same split of frag_finish_g's GROUPED arguments of the list into a buffer of ours, so the two halves are ranges of
 			// whole groups (the tail's sentinel units in the last group, the second half); mco_draw draws them grouped, as the unsplit list
 			// would be. tl.a1Split's own buffer keeps the plain halves: the draw falls back to them if the grouped pipeline can't be made)
@@ -1346,19 +1367,22 @@ void mco_frag_cull(Own *w, Enc *enc, const void *frame, int frameLength, const v
 					if (!w->a1sGKey[i]) k = i;
 				if (k < 0) {
 					k = 3;  // (more than 4 split buffers seen: the last slot reused)
-					[w->a1sGBufs[3] release];
+					mce_release(w->a1sGBufs[3]);
 					w->a1sGBufs[3] = nil;
 				}
 				w->a1sGKey[k] = (void *) w->a1sOut;
-				if (!w->a1sGBufs[k]) w->a1sGBufs[k] = [w->ctx->device newBufferWithLength:64 options:MTLResourceStorageModePrivate];
+				if (!w->a1sGBufs[k]) {
+					w->a1sGBufs[k] = [w->ctx->device newBufferWithLength:64 options:MTLResourceStorageModePrivate];
+					mce_make_resident(w->a1sGBufs[k]);
+				}
 				gb = w->a1sGBufs[k];
 			}
 			if (gb) {
-				[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-				[c setBuffer:w->vg[vgSlot].gArgs offset:0 atIndex:3];
-				[c setBuffer:gb offset:0 atIndex:29];
-				[c dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-				[c setBuffer:args offset:0 atIndex:3];
+				mce_memory_barrier(c, MTLBarrierScopeBuffers);
+				mce_set_compute_buffer(c, w->vg[vgSlot].gArgs, 0, 3);
+				mce_set_compute_buffer(c, gb, 0, 29);
+				mce_dispatch_threads(c, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
+				mce_set_compute_buffer(c, args, 0, 3);
 				w->a1sGOut = (void *) w->a1sOut;
 				w->a1sGBuf = gb;
 				w->a1sGClass = gc;
@@ -1369,29 +1393,29 @@ void mco_frag_cull(Own *w, Enc *enc, const void *frame, int frameLength, const v
 		w->a1sOut = nil;
 		if (lanes > 0 && vArgs && sectionCount > 0) {
 			// =verify: the record cull into the second set, then both sets' signatures
-			[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-			[c setBuffer:vArgs offset:0 atIndex:3];
-			[c setBuffer:vLists offset:0 atIndex:4];
-			[c setComputePipelineState:w->fragReset];
-			[c dispatchThreads:MTLSizeMake(resetThreads, 1, 1) threadsPerThreadgroup:MTLSizeMake(resetThreads, 1, 1)];
-			[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-			[c setComputePipelineState:w->fragCullR];
-			[c dispatchThreads:MTLSizeMake((NSUInteger) sectionCount * (NSUInteger) lanes, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-			[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-			[c setComputePipelineState:w->fragFinish];
-			[c dispatchThreads:MTLSizeMake((NSUInteger) listCount, 1, 1) threadsPerThreadgroup:MTLSizeMake((NSUInteger) listCount, 1, 1)];
-			[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-			[c setComputePipelineState:w->fragSig];
-			[c setBuffer:sig offset:0 atIndex:16];
+			mce_memory_barrier(c, MTLBarrierScopeBuffers);
+			mce_set_compute_buffer(c, vArgs, 0, 3);
+			mce_set_compute_buffer(c, vLists, 0, 4);
+			[mce_raw(c) setComputePipelineState:w->fragReset];
+			mce_dispatch_threads(c, MTLSizeMake(resetThreads, 1, 1), MTLSizeMake(resetThreads, 1, 1));
+			mce_memory_barrier(c, MTLBarrierScopeBuffers);
+			[mce_raw(c) setComputePipelineState:w->fragCullR];
+			mce_dispatch_threads(c, MTLSizeMake((NSUInteger) sectionCount * (NSUInteger) lanes, 1, 1), MTLSizeMake(256, 1, 1));
+			mce_memory_barrier(c, MTLBarrierScopeBuffers);
+			[mce_raw(c) setComputePipelineState:w->fragFinish];
+			mce_dispatch_threads(c, MTLSizeMake((NSUInteger) listCount, 1, 1), MTLSizeMake((NSUInteger) listCount, 1, 1));
+			mce_memory_barrier(c, MTLBarrierScopeBuffers);
+			[mce_raw(c) setComputePipelineState:w->fragSig];
+			mce_set_compute_buffer(c, sig, 0, 16);
 			NSUInteger total = (NSUInteger) listCount * (NSUInteger) listCap;
 			for (uint32_t set = 0; set < 2; set++) {
-				[c setBuffer:set == 0 ? args : vArgs offset:0 atIndex:3];
-				[c setBuffer:set == 0 ? lists : vLists offset:0 atIndex:4];
-				[c setBytes:&set length:4 atIndex:17];
-				[c dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+				mce_set_compute_buffer(c, set == 0 ? args : vArgs, 0, 3);
+				mce_set_compute_buffer(c, set == 0 ? lists : vLists, 0, 4);
+				mce_set_compute_bytes(c, &set, 4, 17);
+				mce_dispatch_threads(c, MTLSizeMake(total, 1, 1), MTLSizeMake(256, 1, 1));
 			}
-			[c setBuffer:args offset:0 atIndex:3];
-			[c setBuffer:lists offset:0 atIndex:4];
+			mce_set_compute_buffer(c, args, 0, 3);
+			mce_set_compute_buffer(c, lists, 0, 4);
 		}
 		if (w->faceOn && w->faceArena) {
 			if (!w->fragFace) {
@@ -1402,20 +1426,19 @@ void mco_frag_cull(Own *w, Enc *enc, const void *frame, int frameLength, const v
 			}
 			if (w->fragFace) {
 				// every list's units, a threadgroup each (the lists' mesh dispatches {units, 1, 1} that frag_finish wrote)
-				[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-				[c setComputePipelineState:w->fragFace];
+				mce_memory_barrier(c, MTLBarrierScopeBuffers);
+				[mce_raw(c) setComputePipelineState:w->fragFace];
 				uint32_t compact = w->compact ? 1 : 0;
-				[c setBytes:&compact length:4 atIndex:8];
-				[c setBuffer:w->faceArena offset:0 atIndex:15];
+				mce_set_compute_bytes(c, &compact, 4, 8);
+				mce_set_compute_buffer(c, w->faceArena, 0, 15);
 				for (int id = 0; id < listCount; id++) {
 					uint32_t lid = (uint32_t) id;
-					[c setBytes:&lid length:4 atIndex:7];
-					[c dispatchThreadgroupsWithIndirectBuffer:args indirectBufferOffset:(NSUInteger) (listCount * 5 + id * 3) * 4
-						threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+					mce_set_compute_bytes(c, &lid, 4, 7);
+					mce_dispatch_threadgroups_indirect(c, args, (NSUInteger) (listCount * 5 + id * 3) * 4, MTLSizeMake(32, 1, 1));
 				}
 			}
 		}
-		[c endEncoding];
+		mce_end_encoder(c);
 	}
 }
 
@@ -1451,11 +1474,11 @@ void mco_set_hiz_tiled(int on) {
 // (uoccEnc) the open compute encoder ended and a new one on the same command buffer, labelled: timed into op slot (-Dmcopt.own.gputime),
 // else profiled like a pass
 static id<MTLComputeCommandEncoder> ownNextCompute(Enc *enc, id<MTLComputeCommandEncoder> c, NSString *label, int slot) {
-	[c endEncoding];
+	mce_end_encoder(c);
 	[c release];
 	c = opOn == 1 && opBuf[0] ? [opCompute(mc_frame_cmd(enc), slot, MTLDispatchTypeConcurrent) retain]
 		: mc_profiled_compute(enc, mc_frame_cmd(enc), MTLDispatchTypeConcurrent);
-	c.label = label;
+	[mce_raw(c) setLabel:label];
 	return c;
 }
 
@@ -1474,8 +1497,8 @@ static void ownPyramid(Own *w, Enc *enc, id<MTLComputeCommandEncoder> c, id<MTLT
 		hh = (hh + pad - 1) / pad * pad;
 	}
 	if (!w->hiz || w->hizWidth != hw || w->hizHeight != hh) {
-		for (int i = 0; i < w->hizMips; i++) [w->hizViews[i] release];
-		[w->hiz release];
+		for (int i = 0; i < w->hizMips; i++) mce_release(w->hizViews[i]);
+		mce_release(w->hiz);
 		int mips = 1;
 		while ((hw >> mips) > 0 || (hh >> mips) > 0) mips++;
 		if (mips > 16) mips = 16;
@@ -1485,8 +1508,11 @@ static void ownPyramid(Own *w, Enc *enc, id<MTLComputeCommandEncoder> c, id<MTLT
 			d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
 			d.storageMode = MTLStorageModePrivate;
 			w->hiz = [w->ctx->device newTextureWithDescriptor:d];
-			for (int i = 0; i < mips; i++)
+			mce_make_resident(w->hiz);
+			for (int i = 0; i < mips; i++) {
 				w->hizViews[i] = [w->hiz newTextureViewWithPixelFormat:MTLPixelFormatR32Float textureType:MTLTextureType2D levels:NSMakeRange(i, 1) slices:NSMakeRange(0, 1)];
+				mce_make_resident(w->hizViews[i]);
+			}
 		}
 		w->hizWidth = hw;
 		w->hizHeight = hh;
@@ -1499,71 +1525,71 @@ static void ownPyramid(Own *w, Enc *enc, id<MTLComputeCommandEncoder> c, id<MTLT
 	if (mco_hiz_tiled && skip > 0) {
 		// (levels below skip are left unwritten: the uocc tests read level skip or coarser, FragTest.minLevel)
 		uint32_t k = (uint32_t) skip;
-		[c setComputePipelineState:w->hizTileGS];
-		[c setTexture:depth atIndex:0];
-		for (int i = 0; i < 5; i++) [c setTexture:w->hizViews[skip + i] atIndex:(NSUInteger) (1 + i)];
-		[c setBytes:&k length:4 atIndex:0];
-		[c dispatchThreadgroups:MTLSizeMake((NSUInteger) (hw >> skip) / 16, (NSUInteger) (hh >> skip) / 16, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
-		[c setComputePipelineState:w->hizPad];
+		[mce_raw(c) setComputePipelineState:w->hizTileGS];
+		mce_set_compute_texture(c, depth, 0);
+		for (int i = 0; i < 5; i++) mce_set_compute_texture(c, w->hizViews[skip + i], (NSUInteger) (1 + i));
+		mce_set_compute_bytes(c, &k, 4, 0);
+		mce_dispatch_threadgroups(c, MTLSizeMake((NSUInteger) (hw >> skip) / 16, (NSUInteger) (hh >> skip) / 16, 1), MTLSizeMake(16, 16, 1));
+		[mce_raw(c) setComputePipelineState:w->hizPad];
 		int i = skip + 5;
 		for (; i < w->hizMips; i++) {
 			NSUInteger mw = MAX(1, hw >> i), mh = MAX(1, hh >> i);
 			if (mco_hiz_top && w->hizTop && mw <= 32 && mh <= 32) break;
-			[c memoryBarrierWithScope:MTLBarrierScopeTextures];
-			[c setTexture:w->hizViews[i - 1] atIndex:0];
-			[c setTexture:w->hizViews[i] atIndex:1];
-			[c dispatchThreads:MTLSizeMake(mw, mh, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+			mce_memory_barrier(c, MTLBarrierScopeTextures);
+			mce_set_compute_texture(c, w->hizViews[i - 1], 0);
+			mce_set_compute_texture(c, w->hizViews[i], 1);
+			mce_dispatch_threads(c, MTLSizeMake(mw, mh, 1), MTLSizeMake(8, 8, 1));
 		}
 		if (i < w->hizMips) {
 			uint32_t levels = (uint32_t) MIN(11, w->hizMips - i);
-			[c memoryBarrierWithScope:MTLBarrierScopeTextures];
-			[c setComputePipelineState:w->hizTop];
-			[c setTexture:w->hizViews[i - 1] atIndex:0];
-			for (uint32_t q = 0; q < levels; q++) [c setTexture:w->hizViews[i + (int) q] atIndex:1 + q];
-			[c setBytes:&levels length:4 atIndex:0];
-			[c dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 32, 1)];
+			mce_memory_barrier(c, MTLBarrierScopeTextures);
+			[mce_raw(c) setComputePipelineState:w->hizTop];
+			mce_set_compute_texture(c, w->hizViews[i - 1], 0);
+			for (uint32_t q = 0; q < levels; q++) mce_set_compute_texture(c, w->hizViews[i + (int) q], 1 + q);
+			mce_set_compute_bytes(c, &levels, 4, 0);
+			mce_dispatch_threadgroups(c, MTLSizeMake(1, 1, 1), MTLSizeMake(32, 32, 1));
 		}
 		mco_hiz_skip = -skip;  // (tells the caller the level it got: -k, 0 if none)
 		return;
 	}
 	if (mco_hiz_tiled && w->hizMips >= 5) {
-		[c setComputePipelineState:mco_hiz_gather && w->hizTileG ? w->hizTileG : w->hizTile];
-		[c setTexture:depth atIndex:0];
-		for (int i = 0; i < 5; i++) [c setTexture:w->hizViews[i] atIndex:(NSUInteger) (1 + i)];
-		[c dispatchThreadgroups:MTLSizeMake((NSUInteger) hw / 16, (NSUInteger) hh / 16, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
-		[c setComputePipelineState:w->hizPad];
+		[mce_raw(c) setComputePipelineState:mco_hiz_gather && w->hizTileG ? w->hizTileG : w->hizTile];
+		mce_set_compute_texture(c, depth, 0);
+		for (int i = 0; i < 5; i++) mce_set_compute_texture(c, w->hizViews[i], (NSUInteger) (1 + i));
+		mce_dispatch_threadgroups(c, MTLSizeMake((NSUInteger) hw / 16, (NSUInteger) hh / 16, 1), MTLSizeMake(16, 16, 1));
+		[mce_raw(c) setComputePipelineState:w->hizPad];
 		int i = 5;
 		for (; i < w->hizMips; i++) {
 			NSUInteger mw = MAX(1, hw >> i), mh = MAX(1, hh >> i);
 			if (mco_hiz_top && w->hizTop && mw <= 32 && mh <= 32) break;  // (the rest in one threadgroup below)
-			[c memoryBarrierWithScope:MTLBarrierScopeTextures];
-			[c setTexture:w->hizViews[i - 1] atIndex:0];
-			[c setTexture:w->hizViews[i] atIndex:1];
-			[c dispatchThreads:MTLSizeMake(mw, mh, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+			mce_memory_barrier(c, MTLBarrierScopeTextures);
+			mce_set_compute_texture(c, w->hizViews[i - 1], 0);
+			mce_set_compute_texture(c, w->hizViews[i], 1);
+			mce_dispatch_threads(c, MTLSizeMake(mw, mh, 1), MTLSizeMake(8, 8, 1));
 		}
 		if (i < w->hizMips) {
 			uint32_t levels = (uint32_t) MIN(11, w->hizMips - i);
-			[c memoryBarrierWithScope:MTLBarrierScopeTextures];
-			[c setComputePipelineState:w->hizTop];
-			[c setTexture:w->hizViews[i - 1] atIndex:0];
-			for (uint32_t k = 0; k < levels; k++) [c setTexture:w->hizViews[i + (int) k] atIndex:1 + k];
-			[c setBytes:&levels length:4 atIndex:0];
-			[c dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 32, 1)];
+			mce_memory_barrier(c, MTLBarrierScopeTextures);
+			[mce_raw(c) setComputePipelineState:w->hizTop];
+			mce_set_compute_texture(c, w->hizViews[i - 1], 0);
+			for (uint32_t k = 0; k < levels; k++) mce_set_compute_texture(c, w->hizViews[i + (int) k], 1 + k);
+			mce_set_compute_bytes(c, &levels, 4, 0);
+			mce_dispatch_threadgroups(c, MTLSizeMake(1, 1, 1), MTLSizeMake(32, 32, 1));
 		}
 		return;
 	}
-	[c setComputePipelineState:w->hiz0];
-	[c setBytes:&scale length:4 atIndex:2];
-	[c setTexture:depth atIndex:0];
-	[c setTexture:w->hizViews[0] atIndex:1];
-	[c dispatchThreads:MTLSizeMake((NSUInteger) hw, (NSUInteger) hh, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-	[c setComputePipelineState:w->hizn];
+	[mce_raw(c) setComputePipelineState:w->hiz0];
+	mce_set_compute_bytes(c, &scale, 4, 2);
+	mce_set_compute_texture(c, depth, 0);
+	mce_set_compute_texture(c, w->hizViews[0], 1);
+	mce_dispatch_threads(c, MTLSizeMake((NSUInteger) hw, (NSUInteger) hh, 1), MTLSizeMake(8, 8, 1));
+	[mce_raw(c) setComputePipelineState:w->hizn];
 	for (int i = 1; i < w->hizMips; i++) {
-		[c memoryBarrierWithScope:MTLBarrierScopeTextures];
-		[c setTexture:w->hizViews[i - 1] atIndex:0];
-		[c setTexture:w->hizViews[i] atIndex:1];
+		mce_memory_barrier(c, MTLBarrierScopeTextures);
+		mce_set_compute_texture(c, w->hizViews[i - 1], 0);
+		mce_set_compute_texture(c, w->hizViews[i], 1);
 		NSUInteger mw = MAX(1, hw >> i), mh = MAX(1, hh >> i);
-		[c dispatchThreads:MTLSizeMake(mw, mh, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+		mce_dispatch_threads(c, MTLSizeMake(mw, mh, 1), MTLSizeMake(8, 8, 1));
 	}
 }
 
@@ -1577,7 +1603,7 @@ int mco_frag_occ(Own *w, Enc *enc) {
 	memset(qf, 0, sizeof qf);
 	id<MTLTexture> depth = enc->depth;
 	id<MTLComputeCommandEncoder> c = mc_render_suspend(enc);
-	c.label = @"own frag occlusion";
+	[mce_raw(c) setLabel:@"own frag occlusion"];
 	ownPyramid(w, enc, c, depth, qf);
 	memcpy(w->fragOcc, qf + 96, sizeof w->fragOcc);  // {screen, hiz0, mips}
 	mc_render_resume(enc, c);
@@ -1604,8 +1630,8 @@ static int ownPyramidRP(Own *w, id<MTLCommandBuffer> cb, id<MTLTexture> depth, u
 			}
 		}
 		if (!w->rpHiz || w->rpW != hw || w->rpH != hh) {
-			for (int i = 0; i < w->rpMips; i++) [w->rpViews[i] release];
-			[w->rpHiz release];
+			for (int i = 0; i < w->rpMips; i++) mce_release(w->rpViews[i]);
+			mce_release(w->rpHiz);
 			int mips = 1;
 			while ((hw >> mips) > 0 || (hh >> mips) > 0) mips++;
 			if (mips > 16) mips = 16;
@@ -1614,8 +1640,11 @@ static int ownPyramidRP(Own *w, id<MTLCommandBuffer> cb, id<MTLTexture> depth, u
 			d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView;
 			d.storageMode = MTLStorageModePrivate;
 			w->rpHiz = [w->ctx->device newTextureWithDescriptor:d];
-			for (int i = 0; i < mips; i++)
+			mce_make_resident(w->rpHiz);
+			for (int i = 0; i < mips; i++) {
 				w->rpViews[i] = [w->rpHiz newTextureViewWithPixelFormat:MTLPixelFormatR32Float textureType:MTLTextureType2D levels:NSMakeRange(i, 1) slices:NSMakeRange(0, 1)];
+				mce_make_resident(w->rpViews[i]);
+			}
 			w->rpW = hw;
 			w->rpH = hh;
 			w->rpMips = mips;
@@ -1624,12 +1653,12 @@ static int ownPyramidRP(Own *w, id<MTLCommandBuffer> cb, id<MTLTexture> depth, u
 		rp.colorAttachments[0].texture = w->rpViews[0];
 		rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
 		rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-		id<MTLRenderCommandEncoder> r = [cb renderCommandEncoderWithDescriptor:rp];
-		r.label = @"own frag pyramid base";
-		[r setRenderPipelineState:w->rpPso];
-		[r setFragmentTexture:depth atIndex:0];
-		[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-		[r endEncoding];
+		id<MTLRenderCommandEncoder> r = [mce_new_render_encoder(cb, rp) autorelease];
+		[mce_raw(r) setLabel:@"own frag pyramid base"];
+		[mce_raw(r) setRenderPipelineState:w->rpPso];
+		mce_set_fragment_texture(r, depth, 0);
+		[mce_raw(r) drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		mce_end_encoder(r);
 	}
 	sizes[0] = (uint32_t) dw;
 	sizes[1] = (uint32_t) dh;
@@ -1708,7 +1737,7 @@ int mco_frag_uocc(Own *w, Enc *enc, const void *cullFrame, int cullLength, const
 	memcpy(ft, clip, 64);
 	id<MTLTexture> depth = enc->depth;
 	id<MTLComputeCommandEncoder> c = mc_render_suspend(enc);
-	c.label = @"own frag unit occlusion";
+	[mce_raw(c) setLabel:@"own frag unit occlusion"];
 	// (-Dmcopt.own.gputime: the split's compute timed, in one encoder (slot 9) or with uoccEnc its pyramid's (6), test's and finish's)
 	if (opOn == 1 && opBuf[0] && !((fine >> 12) & 1)) c = ownNextCompute(enc, c, mco_uocc_enc ? @"own frag uocc pyramid" : @"own frag unit occlusion", mco_uocc_enc ? 6 : 9);
 	int noPyr = (fine >> 9) & 1;  // (diagnostic only, not exact: the previous frame's pyramid, no read of this frame's depth)
@@ -1717,7 +1746,7 @@ int mco_frag_uocc(Own *w, Enc *enc, const void *cullFrame, int cullLength, const
 	// reopened after it (phase A's later part) then waits only for the pyramid's read of the depth. 4096: the test only, against
 	// the pyramid the 2048 call built this frame, in an encoder after that render work: it runs under its fragment work.)
 	int pyrOnly = (fine >> 11) & 1, testOnly = (fine >> 12) & 1;
-	if (pyrOnly) c.label = @"own frag pyramid";
+	if (pyrOnly) [mce_raw(c) setLabel:@"own frag pyramid"];
 	id<MTLTexture> hizTex = w->hiz;
 	if (depth && testOnly) {
 		if (!w->hiz) memset(ft + 16, 0, 20);  // (no pyramid: every unit visible)
@@ -1726,7 +1755,7 @@ int mco_frag_uocc(Own *w, Enc *enc, const void *cullFrame, int cullLength, const
 		ft[21] = (uint32_t) MAX(0, fine & 255);
 		ft[22] = (uint32_t) ((fine >> 8) & 1);
 	} else if (depth && rPyr) {
-		[c endEncoding];
+		mce_end_encoder(c);
 		[c release];
 		id<MTLCommandBuffer> cb = mc_frame_cmd(enc);  // (the level pass is already ended: nothing else is open)
 		uint32_t sizes[5];
@@ -1735,20 +1764,20 @@ int mco_frag_uocc(Own *w, Enc *enc, const void *cullFrame, int cullLength, const
 			return -1;
 		}
 		c = mc_profiled_compute(enc, cb, MTLDispatchTypeConcurrent);
-		c.label = @"own frag unit occlusion";
-		[c setComputePipelineState:w->hizPad];
+		[mce_raw(c) setLabel:@"own frag unit occlusion"];
+		[mce_raw(c) setComputePipelineState:w->hizPad];
 		for (int i = 1; i < w->rpMips; i++) {
-			if (i > 1) [c memoryBarrierWithScope:MTLBarrierScopeTextures];
-			[c setTexture:w->rpViews[i - 1] atIndex:0];
-			[c setTexture:w->rpViews[i] atIndex:1];
+			if (i > 1) mce_memory_barrier(c, MTLBarrierScopeTextures);
+			mce_set_compute_texture(c, w->rpViews[i - 1], 0);
+			mce_set_compute_texture(c, w->rpViews[i], 1);
 			NSUInteger mw = MAX(1, w->rpW >> i), mh = MAX(1, w->rpH >> i);
-			[c dispatchThreads:MTLSizeMake(mw, mh, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+			mce_dispatch_threads(c, MTLSizeMake(mw, mh, 1), MTLSizeMake(8, 8, 1));
 		}
 		memcpy(ft + 16, sizes, 20);
 		ft[21] = (uint32_t) MAX(0, fine & 255);
 		ft[22] = (uint32_t) ((fine >> 8) & 1);
 		hizTex = w->rpHiz;
-		[c memoryBarrierWithScope:MTLBarrierScopeTextures | MTLBarrierScopeBuffers];
+		mce_memory_barrier(c, MTLBarrierScopeTextures | MTLBarrierScopeBuffers);
 	} else if (depth && noPyr && w->hiz) {
 		memcpy(ft + 16, w->uoccLastPyr, 20);
 		ft[24] = w->uoccLastK;
@@ -1771,7 +1800,7 @@ int mco_frag_uocc(Own *w, Enc *enc, const void *cullFrame, int cullLength, const
 		w->uoccLastK = k;
 		ft[21] = (uint32_t) MAX(0, fine & 255);  // FragTest.fine
 		ft[22] = (uint32_t) ((fine >> 8) & 1);  // FragTest.hull
-		[c memoryBarrierWithScope:MTLBarrierScopeTextures | MTLBarrierScopeBuffers];
+		mce_memory_barrier(c, MTLBarrierScopeTextures | MTLBarrierScopeBuffers);
 	}
 	if (pyrOnly) {
 		mc_render_resume(enc, c);
@@ -1784,44 +1813,44 @@ int mco_frag_uocc(Own *w, Enc *enc, const void *cullFrame, int cullLength, const
 		int gather = mco_uocc_gather && depth && hizTex == w->hiz && w->hiz && w->hizMips <= 12;
 		test = gather ? ownLazyKernel(w, &w->uoccTestFG, "frag_uocc_test_fg") : mco_uocc_box ? ownLazyKernel(w, &w->uoccTestFB, "frag_uocc_test_fb")
 			: ownLazyKernel(w, &w->uoccTestF, "frag_uocc_test_f");
-		if (gather && test) for (int k = 0; k < w->hizMips; k++) [c setTexture:w->hizViews[k] atIndex:(NSUInteger) (1 + k)];
+		if (gather && test) for (int k = 0; k < w->hizMips; k++) mce_set_compute_texture(c, w->hizViews[k], (NSUInteger) (1 + k));
 		if (!test) {
 			snprintf(err, (size_t) errCap, "frag_uocc_test_f: no pipeline");
 			mc_render_resume(enc, c);
 			return -1;
 		}
 	}
-	[c setComputePipelineState:test];
-	[c setBytes:cullFrame length:(NSUInteger) cullLength atIndex:0];
-	[c setBytes:fragFrame length:(NSUInteger) fragLength atIndex:11];
-	[c setBytes:ft length:sizeof ft atIndex:17];
-	[c setBuffer:sections offset:0 atIndex:1];
-	[c setBuffer:recs offset:0 atIndex:2];
-	[c setBuffer:args offset:0 atIndex:3];
-	[c setBuffer:w->uoccVis offset:0 atIndex:13];
-	[c setBuffer:w->uoccT offset:0 atIndex:14];
-	[c setBuffer:w->uoccBArgs offset:0 atIndex:15];
-	[c setBuffer:w->uoccListsB offset:0 atIndex:16];
-	[c setTexture:depth ? hizTex : nil atIndex:0];
-	[c dispatchThreadgroupsWithIndirectBuffer:args indirectBufferOffset:(NSUInteger) (lists * 8 + 19) * 4 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+	[mce_raw(c) setComputePipelineState:test];
+	mce_set_compute_bytes(c, cullFrame, (NSUInteger) cullLength, 0);
+	mce_set_compute_bytes(c, fragFrame, (NSUInteger) fragLength, 11);
+	mce_set_compute_bytes(c, ft, sizeof ft, 17);
+	mce_set_compute_buffer(c, sections, 0, 1);
+	mce_set_compute_buffer(c, recs, 0, 2);
+	mce_set_compute_buffer(c, args, 0, 3);
+	mce_set_compute_buffer(c, w->uoccVis, 0, 13);
+	mce_set_compute_buffer(c, w->uoccT, 0, 14);
+	mce_set_compute_buffer(c, w->uoccBArgs, 0, 15);
+	mce_set_compute_buffer(c, w->uoccListsB, 0, 16);
+	mce_set_compute_texture(c, depth ? hizTex : nil, 0);
+	mce_dispatch_threadgroups_indirect(c, args, (NSUInteger) (lists * 8 + 19) * 4, MTLSizeMake(64, 1, 1));
 	if (mco_uocc_enc) c = ownNextCompute(enc, c, @"own frag uocc finish", 8);
-	else [c memoryBarrierWithScope:MTLBarrierScopeBuffers];
+	else mce_memory_barrier(c, MTLBarrierScopeBuffers);
 	// (vGroup / vArgsCopy: frag_uocc_finish_g and phase B's grouped arguments; else the base's frag_uocc_finish)
 	int vgEnc = vgSh != 0 && vgSlot >= 0 && w->uoccFinishG && w->vg[vgSlot].gArgs;
 	if (vgEnc) {
-		[c setComputePipelineState:w->uoccFinishG];
+		[mce_raw(c) setComputePipelineState:w->uoccFinishG];
 		if (mco_uocc_enc) {
 			// (a new encoder: the finish's inputs again)
-			[c setBytes:cullFrame length:(NSUInteger) cullLength atIndex:0];
-			[c setBytes:fragFrame length:(NSUInteger) fragLength atIndex:11];
-			[c setBuffer:w->uoccBArgs offset:0 atIndex:15];
+			mce_set_compute_bytes(c, cullFrame, (NSUInteger) cullLength, 0);
+			mce_set_compute_bytes(c, fragFrame, (NSUInteger) fragLength, 11);
+			mce_set_compute_buffer(c, w->uoccBArgs, 0, 15);
 		}
-		[c setBuffer:w->uoccListsB offset:0 atIndex:16];
-		[c setBuffer:w->vg[vgSlot].gArgs offset:0 atIndex:28];
+		mce_set_compute_buffer(c, w->uoccListsB, 0, 16);
+		mce_set_compute_buffer(c, w->vg[vgSlot].gArgs, 0, 28);
 	} else {
-		[c setComputePipelineState:w->uoccFinish];
+		[mce_raw(c) setComputePipelineState:w->uoccFinish];
 	}
-	[c dispatchThreads:MTLSizeMake((NSUInteger) lists, 1, 1) threadsPerThreadgroup:MTLSizeMake((NSUInteger) lists, 1, 1)];
+	mce_dispatch_threads(c, MTLSizeMake((NSUInteger) lists, 1, 1), MTLSizeMake((NSUInteger) lists, 1, 1));
 	if (vgEnc) w->vg[vgSlot].written = 1;  // (phase B's grouped arguments encoded this frame: its draws may read them)
 	if (w->tieVerify && w->tieLists && cullLength >= 124) {
 		// (tieCloseVerify: phase A's submitted lists stamp their records, then each B entry is checked against them; terrain.metal)
@@ -1830,13 +1859,13 @@ int mco_frag_uocc(Own *w, Enc *enc, const void *cullFrame, int cullLength, const
 		memcpy(&listCap, (const uint8_t *) cullFrame + 120, 4);
 		if (va && vb && listCap > 0) {
 			NSUInteger total = (NSUInteger) lists * listCap;
-			[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-			[c setBuffer:w->tieLists offset:0 atIndex:4];
-			[c setComputePipelineState:va];
-			[c dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-			[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-			[c setComputePipelineState:vb];
-			[c dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+			mce_memory_barrier(c, MTLBarrierScopeBuffers);
+			mce_set_compute_buffer(c, w->tieLists, 0, 4);
+			[mce_raw(c) setComputePipelineState:va];
+			mce_dispatch_threads(c, MTLSizeMake(total, 1, 1), MTLSizeMake(256, 1, 1));
+			mce_memory_barrier(c, MTLBarrierScopeBuffers);
+			[mce_raw(c) setComputePipelineState:vb];
+			mce_dispatch_threads(c, MTLSizeMake(total, 1, 1), MTLSizeMake(256, 1, 1));
 		}
 	}
 	if (w->oracleTest && w->uoccVis) {
@@ -1848,12 +1877,12 @@ int mco_frag_uocc(Own *w, Enc *enc, const void *cullFrame, int cullLength, const
 		}
 		if (w->oracleCopy) {
 			uint32_t n = (uint32_t) (MIN(w->uoccVis.length, w->oracleTest.length) / 4);
-			[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-			[c setComputePipelineState:w->oracleCopy];
-			[c setBuffer:w->uoccVis offset:0 atIndex:0];
-			[c setBuffer:w->oracleTest offset:0 atIndex:1];
-			[c setBytes:&n length:4 atIndex:2];
-			[c dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+			mce_memory_barrier(c, MTLBarrierScopeBuffers);
+			[mce_raw(c) setComputePipelineState:w->oracleCopy];
+			mce_set_compute_buffer(c, w->uoccVis, 0, 0);
+			mce_set_compute_buffer(c, w->oracleTest, 0, 1);
+			mce_set_compute_bytes(c, &n, 4, 2);
+			mce_dispatch_threads(c, MTLSizeMake(n, 1, 1), MTLSizeMake(64, 1, 1));
 		}
 		w->oracleTest = nil;
 	}
@@ -1878,31 +1907,31 @@ void mco_quads_a(Own *w, Enc *enc, const void *frame, int frameLength, id<MTLBuf
 	mc_pre_end_encoders(enc);
 	@autoreleasepool {
 		id<MTLComputeCommandEncoder> c = opCompute(mc_pre(enc), 1, MTLDispatchTypeSerial);
-		c.label = @"own quads A";
-		[c setBuffer:tfat offset:0 atIndex:10];
-		[c setBytes:frame length:frameLength atIndex:0];
-		[c setBuffer:recs offset:0 atIndex:2];
-		[c setBuffer:args offset:0 atIndex:3];
-		[c setBuffer:tested offset:0 atIndex:9];
-		[c setBuffer:qargs offset:0 atIndex:11];
-		[c setBuffer:prevVis offset:0 atIndex:12];
-		[c setBuffer:idx offset:0 atIndex:13];
-		[c setBuffer:curVis offset:0 atIndex:14];
-		[c setBytes:&visWords length:4 atIndex:7];
-		[c setComputePipelineState:w->clearWords];
-		[c dispatchThreads:MTLSizeMake((NSUInteger) MAX(1, visWords), 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-		[c setComputePipelineState:w->qReset];
-		[c dispatchThreads:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(4, 1, 1)];
-		[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-		[c setComputePipelineState:w->qSize];
-		[c dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-		[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-		[c setComputePipelineState:w->qA];
-		[c dispatchThreadgroupsWithIndirectBuffer:qargs indirectBufferOffset:24 * 4 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-		[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-		[c setComputePipelineState:w->qFinish];
-		[c dispatchThreads:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(4, 1, 1)];
-		[c endEncoding];
+		[mce_raw(c) setLabel:@"own quads A"];
+		mce_set_compute_buffer(c, tfat, 0, 10);
+		mce_set_compute_bytes(c, frame, frameLength, 0);
+		mce_set_compute_buffer(c, recs, 0, 2);
+		mce_set_compute_buffer(c, args, 0, 3);
+		mce_set_compute_buffer(c, tested, 0, 9);
+		mce_set_compute_buffer(c, qargs, 0, 11);
+		mce_set_compute_buffer(c, prevVis, 0, 12);
+		mce_set_compute_buffer(c, idx, 0, 13);
+		mce_set_compute_buffer(c, curVis, 0, 14);
+		mce_set_compute_bytes(c, &visWords, 4, 7);
+		[mce_raw(c) setComputePipelineState:w->clearWords];
+		mce_dispatch_threads(c, MTLSizeMake((NSUInteger) MAX(1, visWords), 1, 1), MTLSizeMake(64, 1, 1));
+		[mce_raw(c) setComputePipelineState:w->qReset];
+		mce_dispatch_threads(c, MTLSizeMake(4, 1, 1), MTLSizeMake(4, 1, 1));
+		mce_memory_barrier(c, MTLBarrierScopeBuffers);
+		[mce_raw(c) setComputePipelineState:w->qSize];
+		mce_dispatch_threads(c, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
+		mce_memory_barrier(c, MTLBarrierScopeBuffers);
+		[mce_raw(c) setComputePipelineState:w->qA];
+		mce_dispatch_threadgroups_indirect(c, qargs, 24 * 4, MTLSizeMake(64, 1, 1));
+		mce_memory_barrier(c, MTLBarrierScopeBuffers);
+		[mce_raw(c) setComputePipelineState:w->qFinish];
+		mce_dispatch_threads(c, MTLSizeMake(4, 1, 1), MTLSizeMake(4, 1, 1));
+		mce_end_encoder(c);
 	}
 }
 
@@ -1918,59 +1947,60 @@ int mco_quads_b(Own *w, Enc *enc, const void *frame, int frameLength, id<MTLBuff
 	id<MTLComputeCommandEncoder> c = mc_render_suspend(enc);
 	if (opOn == 1) {
 		// (timed: our own encoder in place of the backend's, on the same command buffer; resume ends and releases it as it would)
-		[c endEncoding];
+		mce_end_encoder(c);
 		[c release];
 		c = [opCompute(mc_frame_cmd(enc), 2, MTLDispatchTypeConcurrent) retain];
 	}
-	c.label = @"own quads B";
+	[mce_raw(c) setLabel:@"own quads B"];
 	ownPyramid(w, enc, c, depth, qf);
 	if (opOn == 1) {
 		// (timed apart: the pyramid's encoder ends here, the test gets its own)
-		[c endEncoding];
+		mce_end_encoder(c);
 		[c release];
 		c = [opCompute(mc_frame_cmd(enc), 5, MTLDispatchTypeConcurrent) retain];
-		c.label = @"own quads B test";
+		[mce_raw(c) setLabel:@"own quads B test"];
 	}
-	[c memoryBarrierWithScope:MTLBarrierScopeTextures | MTLBarrierScopeBuffers];
+	mce_memory_barrier(c, MTLBarrierScopeTextures | MTLBarrierScopeBuffers);
 	uint32_t units = 0, listCap = 0;
 	if (frameLength >= 152) memcpy(&units, qf + 148, 4);  // QuadFrame.units
 	memcpy(&listCap, qf + 128, 4);                        // QuadFrame.listCap
 	if (units && (!w->qUnits || w->qUnits.length < (NSUInteger) listCap * 4)) {
 		// (the old one is left alive, not released: a frame still in flight may read it; growth is rare and doubles)
 		w->qUnits = [w->ctx->device newBufferWithLength:MAX((NSUInteger) listCap * 8, 4) options:MTLResourceStorageModePrivate];
+		mce_make_resident(w->qUnits);
 	}
 	uint32_t flat = 0;
 	if (frameLength >= 168) memcpy(&flat, qf + 164, 4);  // QuadFrame.flat
-	[c setComputePipelineState:units ? w->qBu : flat && boxes ? w->qBf : w->qB];
-	[c setBytes:qf length:(NSUInteger) frameLength atIndex:0];
-	[c setBuffer:sections offset:0 atIndex:1];
-	[c setBuffer:recs offset:0 atIndex:2];
-	[c setBuffer:args offset:0 atIndex:3];
-	[c setBuffer:tested offset:0 atIndex:9];
-	[c setBuffer:qargs offset:0 atIndex:11];
-	[c setBuffer:prevVis offset:0 atIndex:12];
-	[c setBuffer:idx offset:0 atIndex:13];
-	[c setBuffer:curVis offset:0 atIndex:14];
-	[c setBuffer:arena offset:0 atIndex:15];
-	[c setBuffer:boxes ? boxes : arena offset:0 atIndex:17];  // (bound either way; read only with QuadFrame.box)
-	[c setBuffer:tfat offset:0 atIndex:10];  // (the cull's TUnit entries; read only with QuadFrame.fatT)
-	[c setTexture:w->hiz atIndex:0];
+	[mce_raw(c) setComputePipelineState:units ? w->qBu : flat && boxes ? w->qBf : w->qB];
+	mce_set_compute_bytes(c, qf, (NSUInteger) frameLength, 0);
+	mce_set_compute_buffer(c, sections, 0, 1);
+	mce_set_compute_buffer(c, recs, 0, 2);
+	mce_set_compute_buffer(c, args, 0, 3);
+	mce_set_compute_buffer(c, tested, 0, 9);
+	mce_set_compute_buffer(c, qargs, 0, 11);
+	mce_set_compute_buffer(c, prevVis, 0, 12);
+	mce_set_compute_buffer(c, idx, 0, 13);
+	mce_set_compute_buffer(c, curVis, 0, 14);
+	mce_set_compute_buffer(c, arena, 0, 15);
+	mce_set_compute_buffer(c, boxes ? boxes : arena, 0, 17);  // (bound either way; read only with QuadFrame.box)
+	mce_set_compute_buffer(c, tfat, 0, 10);  // (the cull's TUnit entries; read only with QuadFrame.fatT)
+	mce_set_compute_texture(c, w->hiz, 0);
 	if (units) {
 		// a thread per unit (phase A's dispatch size), then a thread per quad of the units it listed
-		[c setBuffer:w->qUnits offset:0 atIndex:16];
-		[c dispatchThreadgroupsWithIndirectBuffer:qargs indirectBufferOffset:24 * 4 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-		[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-		[c setComputePipelineState:w->qSize2];
-		[c dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-		[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-		[c setComputePipelineState:w->qBq];
-		[c dispatchThreadgroupsWithIndirectBuffer:qargs indirectBufferOffset:29 * 4 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+		mce_set_compute_buffer(c, w->qUnits, 0, 16);
+		mce_dispatch_threadgroups_indirect(c, qargs, 24 * 4, MTLSizeMake(64, 1, 1));
+		mce_memory_barrier(c, MTLBarrierScopeBuffers);
+		[mce_raw(c) setComputePipelineState:w->qSize2];
+		mce_dispatch_threads(c, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
+		mce_memory_barrier(c, MTLBarrierScopeBuffers);
+		[mce_raw(c) setComputePipelineState:w->qBq];
+		mce_dispatch_threadgroups_indirect(c, qargs, 29 * 4, MTLSizeMake(64, 1, 1));
 	} else {
-		[c dispatchThreadgroupsWithIndirectBuffer:qargs indirectBufferOffset:20 * 4 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+		mce_dispatch_threadgroups_indirect(c, qargs, 20 * 4, MTLSizeMake(64, 1, 1));
 	}
-	[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-	[c setComputePipelineState:w->qFinish];
-	[c dispatchThreads:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(4, 1, 1)];
+	mce_memory_barrier(c, MTLBarrierScopeBuffers);
+	[mce_raw(c) setComputePipelineState:w->qFinish];
+	mce_dispatch_threads(c, MTLSizeMake(4, 1, 1), MTLSizeMake(4, 1, 1));
 	mc_render_resume(enc, c);
 	return 1;
 }
@@ -1985,19 +2015,19 @@ int mco_qstats(Own *w, Enc *enc, const void *frame, int frameLength, id<MTLBuffe
 	memcpy(qf, frame, (size_t) frameLength);
 	id<MTLTexture> depth = enc->depth;
 	id<MTLComputeCommandEncoder> c = mc_render_suspend(enc);
-	c.label = @"own quad tally";
+	[mce_raw(c) setLabel:@"own quad tally"];
 	ownPyramid(w, enc, c, depth, qf);
-	[c memoryBarrierWithScope:MTLBarrierScopeTextures | MTLBarrierScopeBuffers];
-	[c setComputePipelineState:w->qStat];
-	[c setBytes:qf length:(NSUInteger) frameLength atIndex:0];
-	[c setBuffer:sections offset:0 atIndex:1];
-	[c setBuffer:recs offset:0 atIndex:2];
-	[c setBuffer:args offset:0 atIndex:3];
-	[c setBuffer:lists offset:0 atIndex:4];
-	[c setBuffer:arena offset:0 atIndex:15];
-	[c setBuffer:stats offset:0 atIndex:18];
-	[c setTexture:w->hiz atIndex:0];
-	[c dispatchThreads:MTLSizeMake((NSUInteger) threads, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+	mce_memory_barrier(c, MTLBarrierScopeTextures | MTLBarrierScopeBuffers);
+	[mce_raw(c) setComputePipelineState:w->qStat];
+	mce_set_compute_bytes(c, qf, (NSUInteger) frameLength, 0);
+	mce_set_compute_buffer(c, sections, 0, 1);
+	mce_set_compute_buffer(c, recs, 0, 2);
+	mce_set_compute_buffer(c, args, 0, 3);
+	mce_set_compute_buffer(c, lists, 0, 4);
+	mce_set_compute_buffer(c, arena, 0, 15);
+	mce_set_compute_buffer(c, stats, 0, 18);
+	mce_set_compute_texture(c, w->hiz, 0);
+	mce_dispatch_threads(c, MTLSizeMake((NSUInteger) threads, 1, 1), MTLSizeMake(64, 1, 1));
 	mc_render_resume(enc, c);
 	return 1;
 }
@@ -2009,27 +2039,27 @@ void mco_quads_pre(Own *w, Enc *enc, const void *frame, int frameLength, id<MTLB
 	mc_pre_end_encoders(enc);
 	@autoreleasepool {
 		id<MTLComputeCommandEncoder> c = opCompute(mc_pre(enc), 3, MTLDispatchTypeSerial);
-		c.label = @"own quad prefilter";
-		[c setBytes:frame length:frameLength atIndex:0];
-		[c setBuffer:sections offset:0 atIndex:1];
-		[c setBuffer:recs offset:0 atIndex:2];
-		[c setBuffer:args offset:0 atIndex:3];
-		[c setBuffer:tested offset:0 atIndex:9];
-		[c setBuffer:qargs offset:0 atIndex:11];
-		[c setBuffer:idx offset:0 atIndex:13];
-		[c setBuffer:arena offset:0 atIndex:15];
-		[c setComputePipelineState:w->qReset];
-		[c dispatchThreads:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(4, 1, 1)];
-		[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-		[c setComputePipelineState:w->qSize];
-		[c dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-		[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-		[c setComputePipelineState:w->qPre];
-		[c dispatchThreadgroupsWithIndirectBuffer:qargs indirectBufferOffset:20 * 4 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-		[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
-		[c setComputePipelineState:w->qFinish];
-		[c dispatchThreads:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(4, 1, 1)];
-		[c endEncoding];
+		[mce_raw(c) setLabel:@"own quad prefilter"];
+		mce_set_compute_bytes(c, frame, frameLength, 0);
+		mce_set_compute_buffer(c, sections, 0, 1);
+		mce_set_compute_buffer(c, recs, 0, 2);
+		mce_set_compute_buffer(c, args, 0, 3);
+		mce_set_compute_buffer(c, tested, 0, 9);
+		mce_set_compute_buffer(c, qargs, 0, 11);
+		mce_set_compute_buffer(c, idx, 0, 13);
+		mce_set_compute_buffer(c, arena, 0, 15);
+		[mce_raw(c) setComputePipelineState:w->qReset];
+		mce_dispatch_threads(c, MTLSizeMake(4, 1, 1), MTLSizeMake(4, 1, 1));
+		mce_memory_barrier(c, MTLBarrierScopeBuffers);
+		[mce_raw(c) setComputePipelineState:w->qSize];
+		mce_dispatch_threads(c, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
+		mce_memory_barrier(c, MTLBarrierScopeBuffers);
+		[mce_raw(c) setComputePipelineState:w->qPre];
+		mce_dispatch_threadgroups_indirect(c, qargs, 20 * 4, MTLSizeMake(64, 1, 1));
+		mce_memory_barrier(c, MTLBarrierScopeBuffers);
+		[mce_raw(c) setComputePipelineState:w->qFinish];
+		mce_dispatch_threads(c, MTLSizeMake(4, 1, 1), MTLSizeMake(4, 1, 1));
+		mce_end_encoder(c);
 	}
 }
 
@@ -2039,17 +2069,17 @@ void mco_qrec_verify(Own *w, Enc *enc, id<MTLBuffer> sections, id<MTLBuffer> rec
 	if (slots <= 0) return;
 	mc_pre_end_encoders(enc);
 	@autoreleasepool {
-		id<MTLComputeCommandEncoder> c = [mc_pre(enc) computeCommandEncoder];
-		c.label = @"own qrec verify";
+		id<MTLComputeCommandEncoder> c = [mce_new_compute_encoder(mc_pre(enc), MTLDispatchTypeSerial) autorelease];
+		[mce_raw(c) setLabel:@"own qrec verify"];
 		uint32_t n = (uint32_t) slots;
-		[c setComputePipelineState:w->qrecVerify];
-		[c setBuffer:sections offset:0 atIndex:1];
-		[c setBuffer:recs offset:0 atIndex:2];
-		[c setBuffer:arena offset:0 atIndex:15];
-		[c setBuffer:stats offset:0 atIndex:18];
-		[c setBytes:&n length:4 atIndex:7];
-		[c dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-		[c endEncoding];
+		[mce_raw(c) setComputePipelineState:w->qrecVerify];
+		mce_set_compute_buffer(c, sections, 0, 1);
+		mce_set_compute_buffer(c, recs, 0, 2);
+		mce_set_compute_buffer(c, arena, 0, 15);
+		mce_set_compute_buffer(c, stats, 0, 18);
+		mce_set_compute_bytes(c, &n, 4, 7);
+		mce_dispatch_threads(c, MTLSizeMake(n, 1, 1), MTLSizeMake(64, 1, 1));
+		mce_end_encoder(c);
 	}
 }
 
@@ -2076,9 +2106,16 @@ void mco_oracle_test(Own *w, id<MTLBuffer> test) {
 void mco_pre_commit(Enc *enc) {
 	if (!enc->pre) return;
 	mc_pre_end_encoders(enc);
-	[enc->pre commit];
+	mce_cmd_commit(enc->pre);
 	[enc->pre release];
 	enc->pre = nil;
+}
+
+// A single-level 2D view of tex's mip, resident (Metal 4), for one frame's copies: the caller ends it with mce_release (deferred under Metal 4).
+static id<MTLTexture> ownMipView(id<MTLTexture> tex, int mip) {
+	id<MTLTexture> v = [tex newTextureViewWithPixelFormat:tex.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(mip, 1) slices:NSMakeRange(0, 1)];
+	mce_make_resident(v);
+	return v;
 }
 
 // -Dmcopt.own.int.animCopy + atlasWrite: count rectangles (rects: 6 uints each) copied from src's mip into dst's mip in one dispatch, in the
@@ -2088,16 +2125,18 @@ int mco_anim_copy(Own *w, Enc *enc, id<MTLTexture> src, id<MTLTexture> dst, int 
 	if (count <= 0) return 1;
 	if (!ownLazyKernel(w, &w->animCopy, "anim_copy")) return 0;
 	@autoreleasepool {
-		id<MTLTexture> s = [[src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(mip, 1) slices:NSMakeRange(0, 1)] autorelease];
-		id<MTLTexture> d = [[dst newTextureViewWithPixelFormat:dst.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(mip, 1) slices:NSMakeRange(0, 1)] autorelease];
+		id<MTLTexture> s = ownMipView(src, mip);
+		id<MTLTexture> d = ownMipView(dst, mip);
 		id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_frame_cmd(enc), MTLDispatchTypeSerial) autorelease];
-		c.label = @"mcopt animation copy";
-		[c setComputePipelineState:w->animCopy];
-		[c setTexture:s atIndex:0];
-		[c setTexture:d atIndex:1];
-		[c setBytes:rects length:(NSUInteger) count * 24 atIndex:0];
-		[c dispatchThreads:MTLSizeMake((NSUInteger) maxW, (NSUInteger) maxH, (NSUInteger) count) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-		[c endEncoding];
+		[mce_raw(c) setLabel:@"mcopt animation copy"];
+		[mce_raw(c) setComputePipelineState:w->animCopy];
+		mce_set_compute_texture(c, s, 0);
+		mce_set_compute_texture(c, d, 1);
+		mce_set_compute_bytes(c, rects, (NSUInteger) count * 24, 0);
+		mce_dispatch_threads(c, MTLSizeMake((NSUInteger) maxW, (NSUInteger) maxH, (NSUInteger) count), MTLSizeMake(8, 8, 1));
+		mce_end_encoder(c);
+		mce_release(s);
+		mce_release(d);
 	}
 	return 1;
 }
@@ -2111,13 +2150,12 @@ int mco_anim_blit_mips(Own *w, Enc *enc, id<MTLTexture> src, id<MTLTexture> dst,
 	if (count <= 0) return 1;
 	@autoreleasepool {
 		id<MTLBlitCommandEncoder> b = [mc_profiled_blit(enc, mc_frame_cmd(enc)) autorelease];
-		b.label = @"mcopt animation copy (one blit encoder)";
+		[mce_raw(b) setLabel:@"mcopt animation copy (one blit encoder)"];
 		for (int i = 0; i < count; i++) {
 			const uint32_t *r = rects + i * 7;
-			[b copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(r[0], r[1], 0) sourceSize:MTLSizeMake(r[4], r[5], 1)
-				toTexture:dst destinationSlice:0 destinationLevel:r[6] destinationOrigin:MTLOriginMake(r[2], r[3], 0)];
+			mce_copy_texture(b, src, 0, 0, MTLOriginMake(r[0], r[1], 0), MTLSizeMake(r[4], r[5], 1), dst, 0, r[6], MTLOriginMake(r[2], r[3], 0));
 		}
-		[b endEncoding];
+		mce_end_encoder(b);
 	}
 	return 1;
 }
@@ -2132,9 +2170,9 @@ int mco_anim_copy_mips(Own *w, Enc *enc, id<MTLTexture> src, id<MTLTexture> dst,
 	if (!ownLazyKernel(w, &w->animCopy, "anim_copy")) return 0;
 	@autoreleasepool {
 		id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_frame_cmd(enc), MTLDispatchTypeSerial) autorelease];
-		c.label = @"mcopt animation copy (one encoder)";
-		[c setComputePipelineState:w->animCopy];
-		[c setTexture:src atIndex:0];
+		[mce_raw(c) setLabel:@"mcopt animation copy (one encoder)"];
+		[mce_raw(c) setComputePipelineState:w->animCopy];
+		mce_set_compute_texture(c, src, 0);
 		uint32_t group[6 * 512];
 		int i = 0;
 		while (i < count) {
@@ -2146,12 +2184,13 @@ int mco_anim_copy_mips(Own *w, Enc *enc, id<MTLTexture> src, id<MTLTexture> dst,
 				n++;
 				i++;
 			}
-			id<MTLTexture> d = [[dst newTextureViewWithPixelFormat:dst.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(mip, 1) slices:NSMakeRange(0, 1)] autorelease];
-			[c setTexture:d atIndex:1];
-			[c setBytes:group length:(NSUInteger) n * 24 atIndex:0];
-			[c dispatchThreads:MTLSizeMake((NSUInteger) maxW, (NSUInteger) maxH, (NSUInteger) n) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+			id<MTLTexture> d = ownMipView(dst, mip);
+			mce_set_compute_texture(c, d, 1);
+			mce_set_compute_bytes(c, group, (NSUInteger) n * 24, 0);
+			mce_dispatch_threads(c, MTLSizeMake((NSUInteger) maxW, (NSUInteger) maxH, (NSUInteger) n), MTLSizeMake(8, 8, 1));
+			mce_release(d);
 		}
-		[c endEncoding];
+		mce_end_encoder(c);
 	}
 	return 1;
 }
