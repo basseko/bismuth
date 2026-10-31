@@ -28,7 +28,9 @@ public final class OwnShade {
 	public static final boolean ON = Boolean.getBoolean("mcopt.shaders");
 	/** Shadow map side, cascades and the farthest cascade's half extent (blocks). */
 	static final int RES = Integer.getInteger("mcopt.shaders.shadow.res", 2048);
-	static final int CASCADES = Math.max(1, Math.min(3, Integer.getInteger("mcopt.shaders.shadow.cascades", 3)));
+	/** -Dmcopt.shaders.shadow.farSky=true (default off): no third (512-block) cascade; the terrain beyond the second takes the skylight test as its shadow. */
+	static final boolean FAR_SKY = Boolean.getBoolean("mcopt.shaders.shadow.farSky");
+	static final int CASCADES = Math.max(1, Math.min(FAR_SKY ? 2 : 3, Integer.getInteger("mcopt.shaders.shadow.cascades", 3)));
 	static final double DISTANCE = Double.parseDouble(System.getProperty("mcopt.shaders.shadow.distance", "128"));
 	/** The third (far, cached) cascade's half extent: the whole loaded terrain at RD16 and beyond (blocks). */
 	static final double FAR = Double.parseDouble(System.getProperty("mcopt.shaders.shadow.far", "512"));
@@ -45,7 +47,26 @@ public final class OwnShade {
 	static final float SUN_AMP = Float.parseFloat(System.getProperty("mcopt.shaders.sunAmp", "0.72"));
 	/** The light-space depth range: blocks toward the light that still cast, and beyond the box's centre plane. */
 	private static final double CASTER = 320.0, BEYOND = 192.0;
-	private static final int FRAME_BYTES = 368, CULL_BYTES = 160, CULLFRAME_BYTES = 144, DRAW_BYTES = OwnTerrain.DRAW_FRAME_BYTES;
+	// ---- foliage track (D1): each behind its own sub-flag (default on under -Dmcopt.shaders=true), also switchable per frame by OwnProbe ----
+	/** Subsurface transmission and sheen on cutout foliage (-Dmcopt.shaders.foliage.sss). */
+	static final boolean F_SSS = !"false".equals(System.getProperty("mcopt.shaders.foliage.sss"));
+	/** Distant foliage skips the shadow map for the skylight test (-Dmcopt.shaders.foliage.cut), from this distance (blocks) to the full cut. */
+	static final boolean F_CUT = !"false".equals(System.getProperty("mcopt.shaders.foliage.cut"));
+	static final float CUT_FROM = Float.parseFloat(System.getProperty("mcopt.shaders.foliage.cutFrom", "24"));
+	static final float CUT_TO = Float.parseFloat(System.getProperty("mcopt.shaders.foliage.cutTo", "32"));
+	/** Leaves lose the vertex-baked AO (OwnIntAoMixin) and take the up ambient (-Dmcopt.shaders.foliage.ao). */
+	public static final boolean F_AO = ON && !"false".equals(System.getProperty("mcopt.shaders.foliage.ao"));
+	/** Variable penumbra from a blocker search, and the distance-scaled normal bias and light-leak fix (-Dmcopt.shaders.shadow.pcss / .bias). */
+	static final boolean F_PCSS = !"false".equals(System.getProperty("mcopt.shaders.shadow.pcss"));
+	static final boolean F_BIAS = !"false".equals(System.getProperty("mcopt.shaders.shadow.bias"));
+	static final float SSS_K = Float.parseFloat(System.getProperty("mcopt.shaders.foliage.k", "0.7"));
+	static final float LEAF_SSS = Float.parseFloat(System.getProperty("mcopt.shaders.foliage.leafSss", "1.0"));
+	static final float LEAF_SHEEN = Float.parseFloat(System.getProperty("mcopt.shaders.foliage.leafSheen", "0.5"));
+	static final float PLANT_SSS = Float.parseFloat(System.getProperty("mcopt.shaders.foliage.plantSss", "0.5"));
+	static final float PLANT_SHEEN = Float.parseFloat(System.getProperty("mcopt.shaders.foliage.plantSheen", "1.0"));
+	static final float PENUMBRA = Float.parseFloat(System.getProperty("mcopt.shaders.shadow.penumbra", "0.06"));
+	static final float PENUMBRA_MAX = Float.parseFloat(System.getProperty("mcopt.shaders.shadow.penumbraMax", "0.7"));
+	private static final int FRAME_BYTES = 512, CULL_BYTES = 160, CULLFRAME_BYTES = 144, DRAW_BYTES = OwnTerrain.DRAW_FRAME_BYTES;
 
 	/** This frame draws the shaded terrain variant (set by {@link #frame}; read at the one choke point, OwnNative.draw). */
 	static boolean frameActive;
@@ -376,9 +397,22 @@ public final class OwnShade {
 			MemoryUtil.memPutFloat(fb + 348, OwnSky.rain);
 			for (int c = 0; c < 3; c++) MemoryUtil.memPutFloat(fb + 352 + c * 4L, OwnSky.warmTint[c]);
 			MemoryUtil.memPutFloat(fb + 364, OwnSky.warm);
+			// bytes 368 .. 431 belong to other tracks (zero here); 432 .. 511: the foliage track's block (terrain.metal ShadeFrame fol0 .. fol4)
+			int flags = (F_SSS && OwnProbe.bool("shaders.foliage.sss", true) ? 1 : 0) | (F_PCSS && OwnProbe.bool("shaders.pcss", true) ? 2 : 0)
+				| (F_CUT && OwnProbe.bool("shaders.foliage.cut", true) ? 4 : 0) | (F_AO ? 8 : 0) | (FAR_SKY ? 16 : 0) | (F_BIAS && OwnProbe.bool("shaders.bias", true) ? 32 : 0);
+			MemoryUtil.memPutFloat(fb + 432, flags);
+			MemoryUtil.memPutFloat(fb + 436, CUT_FROM);
+			MemoryUtil.memPutFloat(fb + 440, CUT_TO);
+			MemoryUtil.memPutFloat(fb + 444, SSS_K);
+			MemoryUtil.memPutFloat(fb + 448, LEAF_SSS);
+			MemoryUtil.memPutFloat(fb + 452, LEAF_SHEEN);
+			MemoryUtil.memPutFloat(fb + 456, PLANT_SSS);
+			MemoryUtil.memPutFloat(fb + 460, PLANT_SHEEN);
+			MemoryUtil.memPutFloat(fb + 464, PENUMBRA);
+			MemoryUtil.memPutFloat(fb + 468, PENUMBRA_MAX);
 			OwnNative.shadeFrame(own, k, fb, FRAME_BYTES, 0f, 0f);
 			// milestone 5: entities and items (vanilla pipelines) take the same block and shadow map; cascade 0 also takes their casters
-			if (EntityShade.ON && OwnProbe.bool("shaders.entities", true)) EntityShade.publish(fb, k, sunOn && render);
+			if (EntityShade.ON && OwnProbe.bool("shaders.entities", true)) EntityShade.publish(fb, k, sunOn && render);  // (copies only the first 368 bytes)
 		}
 		frameActive = true;
 	}

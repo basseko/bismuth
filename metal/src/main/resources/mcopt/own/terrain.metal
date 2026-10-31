@@ -1578,6 +1578,12 @@ struct ShadeFrame {
 	float4 haze;          // x aerial perspective density (1 / blocks), y haze strength 0..1 (0: vanilla's fog colour), z sky exposure, w height falloff (1 / blocks)
 	float4 sunTrue;       // xyz the true sun direction (the sky look-up table's azimuth origin), w rain
 	float4 skyWarm;       // rgb the sun's colour at the camera (normalised), w how far the sky is pulled toward it (a low sun's aerosol glow)
+	float4 padOther[4];   // 368 .. 431: other tracks' fields (zero here)
+	float4 fol0;          // 432 foliage track: x flags (1 foliage transmission, 2 variable penumbra, 4 distant foliage takes the skylight test, 8 leaves take the up ambient, 16 no far cascade (skylight test beyond), 32 distance-scaled bias and leak fix), y distance where distant foliage starts to skip the map, z where it fully does, w the transmission's absorption per block
+	float4 fol1;          // 448 x leaf transmission, y leaf sheen, z plant transmission, w plant sheen
+	float4 fol2;          // 464 x penumbra blocks per block of blocker distance, y its maximum (blocks, radius), zw unused
+	float4 fol3;          // 480 unused
+	float4 fol4;          // 496 unused
 };
 #endif
 
@@ -2361,6 +2367,139 @@ static float shShadow(constant ShadeFrame &sf, depth2d_array<float> sm, float3 p
 	return acc + remaining;  // (outside every cascade: lit)
 }
 
+// ---- foliage light and shadow penumbra (D1; -Dmcopt.shaders.foliage.*, .shadow.pcss / .bias / .farSky) ----
+constexpr sampler shRaw(coord::normalized, filter::nearest, address::clamp_to_edge);
+
+// Henyey-Greenstein, normalised so that the isotropic phase is 1 (c: cosine between the view ray and the direction to the light)
+static float shHG(float g, float c) {
+	float d = 1.0 + g * g - 2.0 * g * c;
+	return (1.0 - g * g) * rsqrt(d * d * d);
+}
+
+// the skylight as the shadow far from the shadow map (adapted from Photon Shaders (c) Benjamin Stott, Photon licence): a point that sees the full sky is lit
+static float shSkyTest(float sky) {
+	return smoothstep(13.5 / 15.0, 14.5 / 15.0, sky);
+}
+
+// the cascade's lookup position: the normal offset, in uv and the reference depth. bias: Complementary-style offset 0.25 n clamp(0.12 + 0.01 d) (2 - n.l), at least a texel
+static float4 shLook(constant ShadeFrame &sf, uint c, float3 p, float3 n, float ndl, float dist, bool bias, thread float &slope) {
+	float4 info = sf.info[c];
+	slope = min(sqrt(max(1.0 - ndl * ndl, 0.0)) / max(ndl, 0.15), 4.0);
+	float off = bias ? max(0.25 * clamp(0.12 + 0.01 * dist, 0.12, 0.7) * (2.0 - ndl), info.x) : info.w * (1.0 + 0.35 * slope);
+	return sf.clip[c] * float4(p + n * off, 1.0);
+}
+
+// variable penumbra: a blocker search of 3 gathers (12 texels) that doubles as the lit early-out (no blocker: lit); the filter radius grows with the blocker's distance
+// (sf.fol2.x per block, up to fol2.y), the disc's taps shrink to 4 when it is under 2 texels wide (a contact edge). thick: the mean blocker's distance (blocks)
+static float shCascadeP(constant ShadeFrame &sf, depth2d_array<float> sm, uint c, float3 p, float3 n, float ndl, float rot, float dist, bool bias, int coarse,
+	thread float &edge, thread float &thick) {
+	float4 info = sf.info[c];
+	float slope;
+	float4 q = shLook(sf, c, p, n, ndl, dist, bias, slope);
+	float2 uv = q.xy * 0.5 + 0.5;
+	float2 e = min(uv, 1.0 - uv);
+	edge = min(e.x, e.y);
+	if (edge <= 0.0) return 0.0;
+	if (q.z >= 1.0 || q.z <= 0.0) return 1.0;
+	float z = q.z - info.x * (1.25 + 0.75 * slope) * info.y;
+	float upb = info.z / info.x;  // uv per block
+	float maxR = sf.fol2.y;
+	float sr = 0.6 * maxR * upb;
+	float sum = 0.0, cnt = 0.0;
+	for (int i = 0; i < 3; i++) {
+		float a = (float(i) * 2.0943951 + rot * 6.2831853);
+		float4 d = sm.gather(shRaw, uv + float2(cos(a), sin(a)) * sr, c);
+		float4 b = float4(d < z);
+		sum += dot(b, d);
+		cnt += b.x + b.y + b.z + b.w;
+	}
+	if (cnt < 0.5) return 1.0;
+	float dB = (z - sum / cnt) / info.y;
+	thick = dB;
+	float penB = clamp(sf.fol2.x * dB, sf.amb.y, maxR);  // (blocks)
+	float radius = max(penB * upb, 1.2 * info.z);
+	bool sharp = penB < 2.0 * info.x;
+	const int TAPS = OWN_SHADE_TAPS, STEP = 3;
+	float lit = 0.0;
+	for (int i = 0; i < TAPS; i += STEP) {
+		float r = sqrt((float(i) + 0.5) / float(TAPS));
+		float a = float(i) * 2.399963 + rot * 6.2831853;
+		lit += sm.sample_compare(shCmp, uv + float2(cos(a), sin(a)) * (r * radius), c, z);
+	}
+	const float FIRST = float((TAPS + STEP - 1) / STEP);
+	if (coarse != 0 || sharp || lit < 0.001 || lit > FIRST - 0.001) return lit / FIRST;
+	for (int i = 0; i < TAPS; i++) {
+		if (i % STEP == 0) continue;
+		float r = sqrt((float(i) + 0.5) / float(TAPS));
+		float a = float(i) * 2.399963 + rot * 6.2831853;
+		lit += sm.sample_compare(shCmp, uv + float2(cos(a), sin(a)) * (r * radius), c, z);
+	}
+	return lit / float(TAPS);
+}
+
+// near foliage: two compare taps on opposite sides of the pixel (a jittered, coarse penumbra: the transmission hides the hard edges); only where they
+// are not both lit one gather says how far behind the occluder the pixel is (the transmission's thickness)
+static float shCascadeL(constant ShadeFrame &sf, depth2d_array<float> sm, uint c, float3 p, float3 n, float ndl, float rot, float dist, bool bias, bool wantThick,
+	thread float &edge, thread float &thick) {
+	float4 info = sf.info[c];
+	float slope;
+	float4 q = shLook(sf, c, p, n, ndl, dist, bias, slope);
+	float2 uv = q.xy * 0.5 + 0.5;
+	float2 e = min(uv, 1.0 - uv);
+	edge = min(e.x, e.y);
+	if (edge <= 0.0) return 0.0;
+	if (q.z >= 1.0 || q.z <= 0.0) return 1.0;
+	float z = q.z - info.x * (1.25 + 0.75 * slope) * info.y;
+	float radius = max(sf.amb.y * info.z / info.x, 1.2 * info.z);
+	float a = rot * 6.2831853;
+	float2 o = float2(cos(a), sin(a)) * (0.6 * radius);
+	float lit = sm.sample_compare(shCmp, uv + o, c, z) + sm.sample_compare(shCmp, uv - o, c, z);
+	if (wantThick && lit < 1.999) {
+		float4 d = sm.gather(shRaw, uv, c);
+		float4 b = float4(d < z);
+		float cnt = b.x + b.y + b.z + b.w;
+		if (cnt > 0.5) thick = (z - dot(b, d) / cnt) / info.y;
+	}
+	return lit * 0.5;
+}
+
+// shShadow with the foliage track's options (flags in sf.fol0.x; none set: the same lookups as shShadow). foliage: cutout, lit by the two-tap path, thinned out with
+// distance; sky: the skylight 0..1 (the distant-foliage and far-cascade test); camOff: block origin minus camera (the light-leak fix finds the block centre)
+static float shShadow2(constant ShadeFrame &sf, depth2d_array<float> sm, float3 p, float3 n, float ndl, float2 pix, bool foliage, float sky, float3 camOff, thread float &thick) {
+	const uint fl = uint(sf.fol0.x);
+	const float dist = length(p);
+	const float skyT = shSkyTest(sky);
+	float cutW = 0.0;
+	if (foliage && (fl & 4u) != 0u) {
+		cutW = smoothstep(sf.fol0.y, sf.fol0.z, dist);
+		if (cutW >= 1.0) return skyT;  // (no map at all)
+	}
+	const bool bias = (fl & 32u) != 0u;
+	if (bias) {
+		// light-leak fix: where the sky light is low the lookup moves toward the block's centre (the position is not at a corner of a neighbour that is lit)
+		float w = 1.0 - smoothstep(0.4, 0.8, sky);
+		if (w > 0.0) p = mix(p, floor(p - camOff) + 0.5 + camOff, 0.5 * w);
+	}
+	const bool pcss = (fl & 2u) != 0u, leaf2 = foliage && (fl & 1u) != 0u;
+	float rot = shIgn(pix);
+	uint count = uint(sf.sunColor.w);
+	float acc = 0.0, remaining = 1.0;
+	uint c0 = 0;
+	while (c0 + 1 < count && dist > 1.35 * 0.5 * sf.info[c0].x / sf.info[c0].z) c0++;
+	for (uint c = c0; c < count; c++) {
+		float edge, s;
+		if (foliage) s = shCascadeL(sf, sm, c, p, n, ndl, rot, dist, bias, leaf2, edge, thick);
+		else if (pcss) s = shCascadeP(sf, sm, c, p, n, ndl, rot, dist, bias, c >= 2 ? 1 : 0, edge, thick);
+		else s = shCascade(sf, sm, c, p, n, ndl, rot, c >= 2 ? 1 : 0, edge);
+		float t = saturate(edge / 0.08);
+		acc += remaining * t * s;
+		remaining *= 1.0 - t;
+		if (remaining < 0.002) break;
+	}
+	float r = acc + remaining * ((fl & 16u) != 0u ? skyT : 1.0);
+	return mix(r, skyT, cutW);
+}
+
 // ---- sky (milestone 3): the sky-view look-up table is shared by the dome and the terrain's aerial perspective ----
 // The table is indexed by the view's azimuth relative to the sun (u = sin(angle / 2), symmetric) and elevation (v: l = sign(s) sqrt(|s|) of s = sin(e),
 // finer near the horizon), holding the single-scattered radiance (Rayleigh + Mie + ozone) of the sun's light, built by sky_lut each frame.
@@ -2881,17 +3020,28 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 		// foliage (cutout) is lit wrapped around the terminator and its ambient lifted (leaves are thin and translucent), terrain is plain N.L
 		const bool foliage = CUTOUT && CUTOUT_LIMIT > 0.2;
 		float dir = S * (foliage ? saturate((ndl + 0.3) / 1.3) : ndl);
-		float lit = dir > 0.002 ? shShadow(sf, shadowMap, in.shPos, n, ndl, in.pos.xy, foliage ? 2 : 0) : 1.0;
+		float thick = 0.35;  // (blocks of leaf the sun's light goes through, for the transmission: a leaf's own thickness where it is lit)
+		float lit = dir > 0.002 ? shShadow2(sf, shadowMap, in.shPos, n, ndl, in.pos.xy, foliage, sky, float3(g.CameraOffset), thick) : 1.0;
+		const uint fol = uint(sf.fol0.x);
+		const bool leaf = foliage && in.shFace < 6;
 		// the baked vanilla face shade (top 1, bottom 0.5, z 0.8, x 0.6) is replaced, in proportion to the direct light, by a hemisphere
 		// ambient (up 1, side 0.6, down 0.4): the sun supplies the contrast that the old fixed per-face factors faked
 		float vs = in.shFace == 2 ? 1.0 : in.shFace == 3 ? 0.5 : in.shFace < 2 ? 0.6 : in.shFace < 6 ? 0.8 : 1.0;
 		float hemi = n.y >= 0.0 ? 0.6 + 0.4 * n.y : 0.6 + 0.2 * n.y;
-		if (foliage) hemi = mix(hemi, 1.0, 0.45);
+		if (foliage) hemi = mix(hemi, 1.0, (fol & 8u) != 0u && leaf ? 1.0 : 0.45);  // (leaves take the up ambient: no baked AO either, OwnIntAoMixin)
 		color.rgb *= mix(1.0, hemi / vs, S * sf.amb.z);
 		// ambient (the vanilla lightmap, partly replaced by the sun, cooler where the sun does not reach) + sun x shadow + a sky fill
 		const float3 cool = sf.shade.rgb;
 		float fill = sf.amb.w * S * (0.5 + 0.5 * n.y);
-		color.rgb *= lm.rgb * mix(float3(1.0), cool, S * (1.0 - dir * lit) * 0.7) * (1.0 - sf.amb.x * S) + sf.sunColor.rgb * (dir * lit) + fill * sf.fillc.rgb;
+		float3 trans = float3(0.0);
+		if (foliage && (fol & 1u) != 0u && S > 0.0) {
+			// subsurface transmission and sheen (the light through the leaf, tinted by it; not gated by the shadow: the thicker the occluder the less): scattered mostly
+			// forward, so a leaf is brightest looking toward the sun (a low sun's warm backlight)
+			float c = dot(in.shPos, sf.sunDir.xyz) * rsqrt(max(dot(in.shPos, in.shPos), 1e-6));
+			float sss = leaf ? sf.fol1.x : sf.fol1.z, sheen = leaf ? sf.fol1.y : sf.fol1.w;
+			trans = sf.sunColor.rgb * S * 0.3 * (sss * exp2(-sf.fol0.w * thick) * mix(1.0, shHG(0.7, c), 0.33) + sheen * 0.5 * shHG(0.5, c));
+		}
+		color.rgb *= lm.rgb * mix(float3(1.0), cool, S * (1.0 - dir * lit) * 0.7) * (1.0 - sf.amb.x * S) + sf.sunColor.rgb * (dir * lit) + fill * sf.fillc.rgb + trans;
 		// water (blue translucent terrain) keeps only a part of its colour and brightness (sf.shade.w: the day's and the night's dimming): vanilla's
 		// water texture is much brighter and more saturated than the land it lies in, and lit by the sun it reads cyan. A dark grey-blue slate instead.
 		if (CUTOUT && CUTOUT_LIMIT < 0.2 && blueW > 0.0) {
