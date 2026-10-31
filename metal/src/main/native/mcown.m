@@ -701,17 +701,19 @@ static id<MTLRenderPipelineState> ownPipeline(Own *w, Enc *enc, int cutout, char
 static struct {
 	uint8_t frame[384];
 	int frameLen;
-	id<MTLTexture> scene, depth;        // this frame's scene (nil: none)
-	id<MTLTexture> copyCol, copyDepth;  // mcs_water_split's copy mode: a copy of the pass's colour and depth
+	id<MTLTexture> scene, depth;        // this frame's scene (nil: none): the copies below, set by mcs_water_split, cleared by every mcs_water_frame without a scene
+	id<MTLTexture> copyCol, copyDepth;  // the split's copies of the pass's colour (RGBA8 / RGBA16F) and depth (R32Float), half or full size
 	id<MTLTexture> dummyCol, dummyDepth;
+	id<MTLComputePipelineState> copyPso;
 } wat;
 
 extern int mc_tl_restart_ok(Enc *enc);
 
-static void ownBindWater(id<MTLRenderCommandEncoder> r, id<MTLTexture> light, id<MTLSamplerState> lightSampler) {
+// scene: the draw is a translucent one (the only kind that reads the scene); the opaque draws under water get the dummies
+static void ownBindWater(id<MTLRenderCommandEncoder> r, id<MTLTexture> light, id<MTLSamplerState> lightSampler, bool scene) {
 	[r setFragmentBytes:wat.frame length:(NSUInteger) wat.frameLen atIndex:12];
-	[r setFragmentTexture:wat.scene ?: wat.dummyCol atIndex:27];
-	[r setFragmentTexture:wat.depth ?: wat.dummyDepth atIndex:28];
+	[r setFragmentTexture:scene && wat.scene && wat.depth ? wat.scene : wat.dummyCol atIndex:27];
+	[r setFragmentTexture:scene && wat.scene && wat.depth ? wat.depth : wat.dummyDepth atIndex:28];
 	[r setFragmentTexture:light atIndex:17];
 	[r setFragmentSamplerState:lightSampler atIndex:15];
 }
@@ -880,7 +882,7 @@ drawCall:
 		[r setFragmentTexture:light atIndex:17];
 		[r setFragmentSamplerState:lightSampler atIndex:15];
 	}
-	if (cutout & (1 << 10)) ownBindWater(r, light, lightSampler);
+	if (cutout & (1 << 10)) ownBindWater(r, light, lightSampler, (cutout & 15) == 3);
 	if (w->vcount && !mesh) [r setVertexBuffer:w->vcount offset:0 atIndex:28];
 	if (cutout & (1 << 30)) {
 		// the visibility oracle: the drawn units (vertex stage) and the units with a visible pixel (fragment stage), this sample's number
@@ -2522,6 +2524,12 @@ void mcs_water_frame(Own *w, const void *bytes, int length) {
 	if (length > (int) sizeof wat.frame) length = (int) sizeof wat.frame;
 	memcpy(wat.frame, bytes, (size_t) length);
 	wat.frameLen = length;
+	// (the block's flags say whether this frame has a scene: the frame's first block, written before the split, has none, so last frame's scene is never bound)
+	float flags = length >= 256 ? *(const float *) (wat.frame + 252) : 0.0f;
+	if (!((int) flags & 1)) {
+		wat.scene = nil;
+		wat.depth = nil;
+	}
 	if (!wat.dummyCol) {
 		@autoreleasepool {
 			MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
@@ -2529,7 +2537,7 @@ void mcs_water_frame(Own *w, const void *bytes, int length) {
 			d.storageMode = MTLStorageModePrivate;
 			wat.dummyCol = [w->ctx->device newTextureWithDescriptor:d];
 			wat.dummyCol.label = @"shade water dummy colour";
-			d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:1 height:1 mipmapped:NO];
+			d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float width:1 height:1 mipmapped:NO];
 			d.usage = MTLTextureUsageShaderRead;
 			d.storageMode = MTLStorageModePrivate;
 			wat.dummyDepth = [w->ctx->device newTextureWithDescriptor:d];
@@ -2538,13 +2546,13 @@ void mcs_water_frame(Own *w, const void *bytes, int length) {
 	}
 }
 
-// A copy texture of src's size and format (made again when they change).
-static id<MTLTexture> watCopyTex(Own *w, id<MTLTexture> *slot, id<MTLTexture> src, NSString *label) {
+// A copy texture of w x h in format fmt (made again when they change).
+static id<MTLTexture> watCopyTex(Own *w, id<MTLTexture> *slot, MTLPixelFormat fmt, NSUInteger tw, NSUInteger th, NSString *label) {
 	id<MTLTexture> t = *slot;
-	if (t && t.width == src.width && t.height == src.height && t.pixelFormat == src.pixelFormat) return t;
+	if (t && t.width == tw && t.height == th && t.pixelFormat == fmt) return t;
 	[t release];
-	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:src.width height:src.height mipmapped:NO];
-	d.usage = MTLTextureUsageShaderRead;
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:tw height:th mipmapped:NO];
+	d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
 	d.storageMode = MTLStorageModePrivate;
 	t = [w->ctx->device newTextureWithDescriptor:d];
 	t.label = label;
@@ -2552,38 +2560,36 @@ static id<MTLTexture> watCopyTex(Own *w, id<MTLTexture> *slot, id<MTLTexture> sr
 	return t;
 }
 
-// The split before the translucent draw: the open render encoder (the world pass on `target`, the main colour) ends with colour and depth stored and
-// reopens with both loaded, so what the opaque pass drew is in memory for the water's pixels to read (the stale contents: this pass's later writes stay in
-// tile memory until it ends). copy 0: those very textures are bound at 27 / 28 (the cheapest; reading an attachment is formally undefined, and works because
-// the tile's writes reach memory only at the end of the pass); copy 1: a blit of both into textures of their own first (about one more colour + depth round
-// trip of bandwidth). Returns 1 done (the scene is bound by the following K_WATER draws), 0 the pass has the wrong shape (nothing was changed),
-// -1 the attachments cannot be read as textures (nothing changed).
+// The split before the translucent draw: the open render encoder (the world pass on `target`, the main colour) ends with colour and depth stored; a compute
+// kernel (terrain.metal water_copy) reads them and writes copies of its own (colour, and depth as R32Float: the nearest of each block), at half size (copy 1)
+// or full size (copy 2); the encoder reopens with both loaded. The water's draws bind only the copies, so no texture is ever read while it is also an
+// attachment of the pass that reads it (that is undefined, and corrupted the colour). Returns 1 done (the scene is bound by the following translucent K_WATER
+// draws), 0 the pass has the wrong shape or the kernel is missing (nothing was changed), -1 the attachments cannot be read as textures (nothing changed).
 int mcs_water_split(Own *w, Enc *enc, id<MTLTexture> target, int copy) {
 	wat.scene = nil;
 	wat.depth = nil;
 	if (!enc->render || enc->colorCount != 1 || !enc->colors[0] || enc->colors[0] != target || !enc->depth || mc_tl_restart_ok(enc) != 0) return 0;
 	if (!(enc->colors[0].usage & MTLTextureUsageShaderRead) || !(enc->depth.usage & MTLTextureUsageShaderRead)) return -1;
+	id<MTLComputePipelineState> pso = ownLazyKernel(w, &wat.copyPso, "water_copy");
+	if (!pso) return 0;
 	@autoreleasepool {
 		id<MTLTexture> col = enc->colors[0], dep = enc->depth;
+		uint32_t scale = copy == 2 ? 1 : 2;
+		NSUInteger tw = (col.width + scale - 1) / scale, th = (col.height + scale - 1) / scale;
+		MTLPixelFormat cf = col.pixelFormat == MTLPixelFormatBGRA8Unorm || col.pixelFormat == MTLPixelFormatRGBA8Unorm ? MTLPixelFormatRGBA8Unorm : MTLPixelFormatRGBA16Float;
+		id<MTLTexture> cc = watCopyTex(w, &wat.copyCol, cf, tw, th, @"shade water scene colour");
+		id<MTLTexture> cd = watCopyTex(w, &wat.copyDepth, MTLPixelFormatR32Float, tw, th, @"shade water scene depth");
 		id<MTLComputeCommandEncoder> c = mc_render_suspend(enc);
-		if (copy) {
-			[c endEncoding];
-			[c release];
-			id<MTLTexture> cc = (copy & 1) ? watCopyTex(w, &wat.copyCol, col, @"shade water scene colour") : col;
-			id<MTLTexture> cd = (copy & 2) ? watCopyTex(w, &wat.copyDepth, dep, @"shade water scene depth") : dep;
-			id<MTLBlitCommandEncoder> b = [enc->cmd blitCommandEncoder];
-			b.label = @"shade water scene copy";
-			if (copy & 1) [b copyFromTexture:col toTexture:cc];
-			if (copy & 2) [b copyFromTexture:dep toTexture:cd];
-			[b endEncoding];
-			mc_render_resume(enc, nil);
-			wat.scene = cc;
-			wat.depth = cd;
-		} else {
-			mc_render_resume(enc, c);
-			wat.scene = col;
-			wat.depth = dep;
-		}
+		[c setComputePipelineState:pso];
+		[c setTexture:col atIndex:0];
+		[c setTexture:dep atIndex:1];
+		[c setTexture:cc atIndex:2];
+		[c setTexture:cd atIndex:3];
+		[c setBytes:&scale length:4 atIndex:0];
+		[c dispatchThreads:MTLSizeMake(tw, th, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+		mc_render_resume(enc, c);
+		wat.scene = cc;
+		wat.depth = cd;
 	}
 	return 1;
 }

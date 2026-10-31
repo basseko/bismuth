@@ -2411,7 +2411,7 @@ struct WaterFrame {
 	float4 proj;          // 256 x A, y B of z_ndc = A + B / w (the projection), z reflection thickness (blocks), w caustic gain
 	float4 still;         // 272 water_still's uv rectangle u0 v0 u1 v1
 	float4 flow;          // 288 water_flow's
-	float4 med;           // 304 rgb the underwater medium's absorption per block
+	float4 med;           // 304 rgb the underwater medium's absorption per block, w the scene copy's pixels per screen pixel (0.5 half size, 1 full)
 };
 
 constexpr sampler wLin(coord::normalized, filter::linear, address::clamp_to_edge);
@@ -2467,9 +2467,10 @@ static float wFresnel(float cosI, bool below) {
 		if (s2 >= 1.0) return 1.0;
 		cosI = sqrt(1.0 - s2);
 	}
+	// (the fourth power with a 0.04 floor, not Schlick's fifth: a wavy surface averages the angle, so mid distances reflect more of the sky)
 	float m = 1.0 - cosI;
 	float m2 = m * m;
-	return 0.02 + 0.98 * m2 * m2 * m;
+	return 0.04 + 0.96 * m2 * m2;
 }
 
 // ---- the two environment functions of the water: the milestone 3 sky model and underwater fog plug in here ----
@@ -2488,7 +2489,7 @@ static float3 skyRadiance(float3 dir, float3 horizon, constant WaterFrame &wf) {
 // the clear colour and every vanilla pipeline use as well)
 static float3 waterMedium(float3 c, float dist, constant WaterFrame &wf, constant Fog &fog) {
 	float3 T = exp(-wf.med.rgb * dist);
-	return c * T + fog.FogColor.rgb * (1.0 - T);
+	return c * (T * 1.25) + fog.FogColor.rgb * (1.0 - T);  // (the 1.25: the light that reaches down is brighter than the lightmap says)
 }
 
 // the camera-relative position of the scene point whose depth is z at the pixel (pix as the position builtin reports it: the centre of the pixel)
@@ -2498,9 +2499,14 @@ static float3 wRecon(float2 pix, float z, constant WaterFrame &wf) {
 	return w.xyz / w.w;
 }
 
+// the scene's depth at a screen pixel (full-resolution coordinates) from the split's copy (R32Float, med.w pixels of it per screen pixel)
+static float wZ(texture2d<float, access::read> d, float2 pix, constant WaterFrame &wf) {
+	return d.read(uint2(pix * wf.med.w)).r;
+}
+
 // screen-space reflection: the ray p + r * s marched through the stored scene depth (reversed Z), steps spread quadratically from the surface with a
 // per-pixel offset, then four bisections; rgb the scene colour at the hit, w the confidence (0 no hit)
-static float4 wSsr(float3 p, float3 r, float jitter, constant WaterFrame &wf, texture2d<float> scene, depth2d<float, access::read> sdepth) {
+static float4 wSsr(float3 p, float3 r, float jitter, constant WaterFrame &wf, texture2d<float> scene, texture2d<float, access::read> sdepth) {
 	const float NEARW = 0.15;
 	float4 c0 = wf.viewProj * float4(p, 1.0);
 	if (c0.w < NEARW) return float4(0.0);
@@ -2527,7 +2533,7 @@ static float4 wSsr(float3 p, float3 r, float jitter, constant WaterFrame &wf, te
 		float f = min((float(i) + jitter) / float(N), 1.0);
 		float t = tmax * f * f;
 		float2 q = q0 + dq * t;
-		if (sdepth.read(uint2(q)) > mix(z0, z1, t)) {  // the ray is behind the scene here
+		if (wZ(sdepth, q, wf) > mix(z0, z1, t)) {  // the ray is behind the scene here
 			hi = t;
 			break;
 		}
@@ -2536,11 +2542,11 @@ static float4 wSsr(float3 p, float3 r, float jitter, constant WaterFrame &wf, te
 	if (hi < 0.0) return float4(0.0);
 	for (int i = 0; i < 4; i++) {
 		float mid = 0.5 * (lo + hi);
-		if (sdepth.read(uint2(q0 + dq * mid)) > mix(z0, z1, mid)) hi = mid;
+		if (wZ(sdepth, q0 + dq * mid, wf) > mix(z0, z1, mid)) hi = mid;
 		else lo = mid;
 	}
 	float2 qh = q0 + dq * hi;
-	float zs = sdepth.read(uint2(qh));
+	float zs = wZ(sdepth, qh, wf);
 	// thickness: the ray may pass behind a surface by this much (view depth, blocks) and still count as hitting it
 	float wr = 1.0 / mix(k0, k1, hi), ws = zs - A > 1e-7 ? B / (zs - A) : 1e9;
 	if (wr - ws > wf.proj.z + 0.05 * ws) return float4(0.0);
@@ -2562,7 +2568,7 @@ static float3 wSkyAt(float3 d, float3 horizon, constant WaterFrame &wf, constant
 // The water surface: tint = the vertex colour (the biome's water colour, no light in it), lm the lightmap at the quad, access its sky exposure 0..1, gnRaw the
 // derivative normal of the position (taken by the caller in uniform control flow). rgb and the alpha the blend applies (1 with a scene to refract).
 static float4 waterSurface(VOut in, float3 gnRaw, float3 tint, float3 lm, float access, constant WaterFrame &wf, constant Fog &fog,
-	texture2d<float> scene, depth2d<float, access::read> sdepth, constant ShadeFrame &sf, texture2d<float> lut) {
+	texture2d<float> scene, texture2d<float, access::read> sdepth, constant ShadeFrame &sf, texture2d<float> lut) {
 	const uint flags = uint(wf.misc.w);
 	float3 p = in.shPos;
 	float dist = max(length(p), 1e-3);
@@ -2576,7 +2582,7 @@ static float4 waterSurface(VOut in, float3 gnRaw, float3 tint, float3 lm, float 
 	float3 gnf = below ? -gn : gn;
 	float3 N = gn;
 	if (!vertical) {
-		float2 s = waveSlope(p.xz + wf.cam.xz, wf.cam.w, dist) * (wf.misc.y / (1.0 + dist * 0.004));
+		float2 s = waveSlope(p.xz + wf.cam.xz, wf.cam.w, dist) * (wf.misc.y / (1.0 + dist * 0.004) * (below ? 0.35 : 1.0));  // (calmer seen from below)
 		N = normalize(gn + float3(-s.x, 0.0, -s.y));
 	}
 	float3 Nf = below ? -N : N;
@@ -2592,7 +2598,7 @@ static float4 waterSurface(VOut in, float3 gnRaw, float3 tint, float3 lm, float 
 	float3 refl = below ? horizon : wSkyAt(r, horizon, wf, sf, lut) * mix(0.25, 1.0, access);
 	if ((flags & 1u) != 0u && wf.misc.z > 0.5 && F > 0.04) {
 		float4 h = wSsr(p, r, shIgn(in.pos.xy), wf, scene, sdepth);
-		refl = mix(refl, h.rgb, h.w);
+		refl = mix(refl, h.rgb, h.w * (below ? 0.6 : 1.0));
 	}
 	float3 L = wf.sunDir.xyz;
 	float S = wf.sunDir.w;
@@ -2601,14 +2607,15 @@ static float4 waterSurface(VOut in, float3 gnRaw, float3 tint, float3 lm, float 
 	if (below) {
 		// from under the surface: the sky through the window (refracted), total internal reflection of the scene beyond the critical angle
 		float3 rt = refract(v, Nf, 1.33);
-		float3 sky = dot(rt, rt) > 1e-6 ? wSkyAt(rt, horizon, wf, sf, lut) * float3(0.55, 0.80, 0.90) * mix(0.3, 1.0, access) : refl;
+		float3 sky = dot(rt, rt) > 1e-6 ? wSkyAt(rt, horizon, wf, sf, lut) * float3(0.36, 0.52, 0.60) * mix(0.3, 1.0, access) : refl;
 		col = mix(sky, refl, F);
+		col = mix(col, horizon, 0.3);  // (the ripples' contrast fades into the medium)
 	} else {
 		float3 tintN = tint / max(max(tint.r, tint.g), max(tint.b, 0.01));
 		float3 scatter = wf.body.rgb * mix(float3(1.0), tintN, 0.4) * (lm * 0.85 + wf.sunColor.rgb * (S * 0.35 * access)) * wf.body.w;
 		float3 trans;
 		if ((flags & 1u) != 0u) {
-			float zs = sdepth.read(uint2(in.pos.xy));
+			float zs = wZ(sdepth, in.pos.xy, wf);
 			float dRay = zs <= 0.0 ? wf.sigma.w : min(length(wRecon(in.pos.xy, zs, wf) - p), wf.sigma.w);
 			// refraction: where the bent ray lands, relative to where the flat surface would send it (so calm water shifts nothing)
 			float3 ph = p + v * dRay + (refract(v, Nf, 0.752) - refract(v, gnf, 0.752)) * dRay;
@@ -2619,7 +2626,7 @@ static float4 waterSurface(VOut in, float3 gnRaw, float3 tint, float3 lm, float 
 				float2 uvp = float2(cp.x / cp.w * 0.5 + 0.5, 0.5 - cp.y / cp.w * 0.5);
 				float2 pp = uvp * wf.screen.xy;
 				if (all(uvp > 0.003) && all(uvp < 0.997)) {
-					float z2 = sdepth.read(uint2(pp));
+					float z2 = wZ(sdepth, pp, wf);
 					if (z2 <= in.pos.z && z2 > 0.0) {  // (not something in front of the water)
 						uv = uvp;
 						dUse = min(length(wRecon(pp, z2, wf) - p), wf.sigma.w);
@@ -2627,9 +2634,10 @@ static float4 waterSurface(VOut in, float3 gnRaw, float3 tint, float3 lm, float 
 				}
 			}
 			float3 bed = scene.sample(wLin, uv, level(0.0)).rgb;
-			bed = mix(bed, float3(dot(bed, float3(0.3, 0.59, 0.11))), 0.35) * 0.62;  // (a lit bed seen through water is duller and greyer than in air)
+			bed = mix(bed, float3(dot(bed, float3(0.3, 0.59, 0.11))), 0.12) * 0.74;  // (a lit bed seen through water is a little duller than in air; the absorption does the rest)
 			float3 T = exp(-wf.sigma.rgb * dUse);
 			trans = bed * T + scatter * (1.0 - T);
+			trans = mix(trans, float3(dot(trans, float3(0.3, 0.59, 0.11))), 0.18);  // (grey-blue, not saturated: a river's water is full of silt)
 		} else {
 			// no scene: a fixed depth of water, blended over what is there (the colour is premultiplied by the alpha below)
 			float3 T0 = exp(-wf.sigma.rgb * 3.0);
@@ -2652,6 +2660,25 @@ static float4 waterSurface(VOut in, float3 gnRaw, float3 tint, float3 lm, float 
 	}
 	return float4(col / alpha, alpha);
 }
+// The split's scene copy (mcown.m mcs_water_split): colour (mean of each scale x scale block) and depth (the nearest: reversed Z, so the largest) into textures
+// of their own, so the water's pixels never read an attachment of the pass they are drawn in.
+kernel void water_copy(texture2d<float, access::read> col [[texture(0)]], depth2d<float, access::read> dep [[texture(1)]],
+	texture2d<float, access::write> outCol [[texture(2)]], texture2d<float, access::write> outDep [[texture(3)]],
+	constant uint &scale [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+	if (gid.x >= outCol.get_width() || gid.y >= outCol.get_height()) return;
+	const uint2 lim = uint2(col.get_width() - 1, col.get_height() - 1);
+	float4 c = float4(0.0);
+	float z = 0.0;
+	for (uint j = 0; j < scale; j++) {
+		for (uint i = 0; i < scale; i++) {
+			uint2 q = min(gid * scale + uint2(i, j), lim);
+			c += col.read(q);
+			z = max(z, dep.read(q));
+		}
+	}
+	outCol.write(c / float(scale * scale), gid);
+	outDep.write(float4(z, 0.0, 0.0, 1.0), gid);
+}
 #endif
 
 fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]], constant Terrain &t [[buffer(23)]], constant Fog &fog [[buffer(24)]],
@@ -2662,7 +2689,7 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 	texture2d<float> skLut [[texture(25), function_constant(F_SHADE)]]
 #ifdef OWN_WATER
 	, constant WaterFrame &wf [[buffer(12), function_constant(F_WATER)]], texture2d<float> wScene [[texture(27), function_constant(F_WATER)]],
-	depth2d<float, access::read> wDepth [[texture(28), function_constant(F_WATER)]]
+	texture2d<float, access::read> wDepth [[texture(28), function_constant(F_WATER)]]
 #endif
 #endif
 	) {

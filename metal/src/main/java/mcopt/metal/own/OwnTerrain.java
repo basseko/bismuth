@@ -384,6 +384,8 @@ public final class OwnTerrain {
 		/** TFRUSTUM: the translucent vertices' box, section-relative (lo x, y, z, hi x, y, z), from vanilla's floats; this frame: left out. */
 		float @Nullable [] tBox;
 		boolean tOut;
+		/** shaders water: the translucent layer holds water quads (OwnWater.hasWater, at store time). */
+		boolean hasWater;
 		/** TS_BUILD: the full order's sorted quad copy (arena units, 64 bytes a quad) and its units' records (after the order ones); the filtered version's copy and records. */
 		int sortStart = -1, sortUnits, sRecStart = -1, fSort = -1, fSortUnits, fsRec = -1;
 		/** When it was stored (System.nanoTime) and whether it was ever published: an unpublished mesh 10 s old is an orphan (sweepOrphans). */
@@ -873,6 +875,7 @@ public final class OwnTerrain {
 		}
 		OwnMesh m = this.meshes.computeIfAbsent(mesh, k -> new OwnMesh());
 		m.layers[2] = new Layer(start, n, new int[0], -1);
+		m.hasWater = OwnWater.hasWater(src, n, QUAD_BYTES);
 		if (TFRUSTUM || TFR_PROBE) {
 			float[] box = {Float.MAX_VALUE, Float.MAX_VALUE, Float.MAX_VALUE, -Float.MAX_VALUE, -Float.MAX_VALUE, -Float.MAX_VALUE};
 			for (int v = 0, nv = n * 4; v < nv; v++) {
@@ -2756,6 +2759,7 @@ public final class OwnTerrain {
 		int at = 0;
 		// (thalf: the split after the last section not lean-eligible; the fog start and now as frag_cull reads them)
 		int tSplit = 0, tNowMs = (int) (Util.getMillis() - this.baseMs);
+		boolean waterListed = false;  // (shaders water: a listed section holds water quads)
 		float tRdStart = 0;
 		if (this.tHalfNow) {
 			long fa = MetalBridge.bufferAddress(fog.buffer());
@@ -2775,6 +2779,7 @@ public final class OwnTerrain {
 					continue;
 				}
 			}
+			if (m.hasWater) waterListed = true;
 			if (TSTAT) {
 				this.tsMeshes++;
 				this.tsUnits += TCULL && m.tUse ? m.fRecCount : m.tRecCount;
@@ -2843,7 +2848,7 @@ public final class OwnTerrain {
 		Matrix4fc view = camera.viewRotationMatrix;
 		Matrix4f clip = new Matrix4f(proj).mul(view);
 		// (shaders water: splits the world pass for the scene behind the water, before anything below is bound to the encoder)
-		if (OwnWater.ON) OwnWater.beforeTranslucent(this, this.encoder, camera, proj, clip);
+		if (OwnWater.ON) OwnWater.beforeTranslucent(this, this.encoder, camera, proj, clip, waterListed);
 		GpuBufferSlice terrain = RenderSystem.getDynamicUniforms().writeTerrainTransform(new Matrix4f(view), atlas.getWidth(0), atlas.getHeight(0));
 		try (MemoryStack stack = MemoryStack.stackPush()) {
 			long u = stack.nmalloc(8, 8 * 8);
