@@ -1561,7 +1561,7 @@ struct ShadeFrame {
 	float4 info[3];       // x blocks per texel, y 1 / depth range (blocks), z uv margin where the next cascade takes over, w normal offset (blocks)
 	float4 sunDir;        // xyz unit vector to the light that casts shadows, w its strength 0..1 (0: no shadows this frame)
 	float4 sunColor;      // rgb direct light colour x amplitude, w cascade count
-	float4 amb;           // x ambient attenuation at full sun and sky light, y filter radius (blocks), z filter taps
+	float4 amb;           // x ambient attenuation at full sun and sky light, y filter radius (blocks), z filter taps, w sky fill
 };
 #endif
 
@@ -2343,7 +2343,9 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 		float ndl = saturate(dot(n, sf.sunDir.xyz));
 		float dir = sf.sunDir.w * access * ndl;
 		float lit = dir > 0.002 ? shShadow(sf, shadowMap, in.shPos, n, ndl, in.pos.xy) : 1.0;
-		color.rgb *= lm.rgb * (1.0 - sf.amb.x * sf.sunDir.w * access) + sf.sunColor.rgb * (dir * lit);
+		// ambient (the vanilla lightmap, partly replaced by the sun) + sun x shadow + a sky fill (up-facing more) that keeps shaded faces near vanilla
+		float fill = sf.amb.w * sf.sunDir.w * access * (0.5 + 0.5 * n.y);
+		color.rgb *= lm.rgb * (1.0 - sf.amb.x * sf.sunDir.w * access) + sf.sunColor.rgb * (dir * lit) + fill;
 	}
 #endif
 	// F_LEAN: the chunk visibility is 1 (mix(x, y, 1) is y), the render-distance fog value 0 (max(e, 0) is e for e >= 0)

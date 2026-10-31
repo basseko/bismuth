@@ -31,8 +31,9 @@ public final class OwnShade {
 	/** Soft edge radius (blocks) and the ambient light the sun replaces at full sun and sky light. */
 	static final int TAPS = Integer.getInteger("mcopt.shaders.shadow.taps", 12);
 	static final float SOFT = Float.parseFloat(System.getProperty("mcopt.shaders.shadow.soft", "0.10"));
-	static final float AMBIENT_CUT = Float.parseFloat(System.getProperty("mcopt.shaders.ambientCut", "0.48"));
-	static final float SUN_AMP = Float.parseFloat(System.getProperty("mcopt.shaders.sunAmp", "0.62"));
+	static final float AMBIENT_CUT = Float.parseFloat(System.getProperty("mcopt.shaders.ambientCut", "0.20"));
+	static final float FILL = Float.parseFloat(System.getProperty("mcopt.shaders.fill", "0.09"));
+	static final float SUN_AMP = Float.parseFloat(System.getProperty("mcopt.shaders.sunAmp", "0.68"));
 	/** The light-space depth range: blocks toward the light that still cast, and beyond the box's centre plane. */
 	private static final double CASTER = 320.0, BEYOND = 192.0, DEPTH = CASTER + BEYOND;
 	private static final int FRAME_BYTES = 288, CULL_BYTES = 160, CULLFRAME_BYTES = 144, DRAW_BYTES = OwnTerrain.DRAW_FRAME_BYTES;
@@ -74,6 +75,7 @@ public final class OwnShade {
 	static void frame(OwnTerrain t, CameraRenderState camera, long u, long d, long atlas, long atlasSampler, long light, long lightSampler, int k, int atlasW, int atlasH,
 		boolean cpuClip, boolean fat) {
 		frameActive = false;
+		if (t.changedCount() > 0) geomDirty = true;
 		if (failed) return;
 		Minecraft mc = Minecraft.getInstance();
 		SkyRenderState sky = mc.gameRenderer.gameRenderState().levelRenderState.skyRenderState;
@@ -94,13 +96,74 @@ public final class OwnShade {
 		}
 	}
 
+	/** A cascade's light-space frame: the basis and the snapped origin it was last (re)built for, and which ring slots hold a map rendered for it. */
+	private static final class Casc {
+		final Vector3d L = new Vector3d(), R = new Vector3d(), U = new Vector3d(), F = new Vector3d();
+		double sx, sy, sf;
+		boolean valid;
+		int version = 1;
+		int[] slot;
+	}
+
+	private static Casc[] casc;
+	/** The geometry (a section table entry) changed since the cached cascades were last invalidated for it. */
+	private static boolean geomDirty;
+	/** The cached cascades (all but the nearest) are rebuilt when the sun moves by more than this (cosine of 0.3 degrees), the camera drifts from the centre by more than DRIFT x radius. */
+	private static final double REBUILD_COS = Math.cos(Math.toRadians(0.3)), DRIFT = 0.12, DRIFT_DEPTH = 64.0;
+	/** The snapping quantum of a cached cascade's origin, in texels. */
+	private static final int CACHE_QUANTUM = 16;
+	static final boolean CACHE = !"false".equals(System.getProperty("mcopt.shaders.shadow.cache"));
+	private static final boolean ALWAYS = Boolean.getBoolean("mcopt.shaders.always");
+
+	private static void basis(Casc s, Vector3d L) {
+		s.L.set(L);
+		s.F.set(L).negate();
+		Vector3d up = Math.abs(s.F.y) > 0.98 ? new Vector3d(1, 0, 0) : new Vector3d(0, 1, 0);
+		up.cross(s.F, s.R).normalize();
+		s.F.cross(s.R, s.U).normalize();
+	}
+
+	/** A shaded draw could not build its pipeline (OwnNative.draw already fell back to the plain kind for it): no shading from now on. */
+	static void drawFailed(RuntimeException e) {
+		if (!failed) System.out.println("mcopt-shaders: disabled: shaded terrain variant failed: " + e.getMessage());
+		failed = true;
+		frameActive = false;
+	}
+
 	private static void frame0(OwnTerrain t, CameraRenderState camera, SkyRenderState sky, long u, long d, long atlas, long atlasSampler, long light, long lightSampler, int k,
 		int atlasW, int atlasH, boolean cpuClip) {
+		// ---- the light ----
+		double sa = sky.sunAngle, ma = sky.moonAngle;
+		Vector3d sun = new Vector3d(-Math.sin(sa), Math.cos(sa), 0), moon = new Vector3d(-Math.sin(ma), Math.cos(ma), 0);
+		float clear = Math.max(0, Math.min(1, sky.rainBrightness));
+		float sunStr = smooth(0.0f, 0.12f, (float) sun.y) * clear * clear;
+		float moonStr = 0.22f * smooth(0.0f, 0.2f, (float) moon.y) * (1 - smooth(0.0f, 0.12f, (float) sun.y)) * clear;
+		boolean useSun = sunStr >= moonStr;
+		Vector3d L = useSun ? sun : moon;
+		float strength = useSun ? sunStr : moonStr;
+		boolean sunOn = strength > 0.01f && OwnProbe.bool("shaders.sun", true);
+		// nothing to add without direct light (night, heavy rain): the plain terrain variants draw, at no cost
+		if (!sunOn && !ALWAYS) return;
+		float el = (float) L.y;
+		float cr, cg, cb;
+		if (useSun) {
+			float w = smooth(0.04f, 0.45f, el);
+			cr = 1.0f;
+			cg = 0.46f + (0.95f - 0.46f) * w;
+			cb = 0.20f + (0.88f - 0.20f) * w;
+		} else {
+			cr = 0.55f;
+			cg = 0.68f;
+			cb = 1.0f;
+		}
+		float amp = useSun ? SUN_AMP : 0.45f;
+
 		long own = t.shadeOwn(), enc = t.shadeEnc(), ctx = t.shadeCtx();
 		int frames = OwnTerrain.FRAMES;
 		if (owner != t) {
 			owner = t;
 			args = null;  // (a new terrain renderer: its own buffers)
+			casc = null;
 		}
 		if (!OwnNative.shadeInit(own, RES, CASCADES, frames)) throw new IllegalStateException("shadow map allocation failed");
 		if (ring != frames || args == null) {
@@ -116,6 +179,14 @@ public final class OwnShade {
 				}
 			ring = frames;
 			listCap = 0;
+			casc = null;
+		}
+		if (casc == null) {
+			casc = new Casc[CASCADES];
+			for (int c = 0; c < CASCADES; c++) {
+				casc[c] = new Casc();
+				casc[c].slot = new int[frames];
+			}
 		}
 		int cap = t.shadeListCap();
 		if (cap != listCap) {
@@ -129,75 +200,77 @@ public final class OwnShade {
 		}
 		if (!said) {
 			said = true;
-			System.out.println("mcopt-shaders: on, shadow map " + RES + "x" + RES + " x" + CASCADES + " cascades, distance " + DISTANCE + " blocks");
+			System.out.println("mcopt-shaders: on, shadow map " + RES + "x" + RES + " x" + CASCADES + " cascades, distance " + DISTANCE + " blocks, far cascades "
+				+ (CACHE ? "cached" : "every frame"));
 		}
-
-		// ---- the light ----
-		double sa = sky.sunAngle, ma = sky.moonAngle;
-		Vector3d sun = new Vector3d(-Math.sin(sa), Math.cos(sa), 0), moon = new Vector3d(-Math.sin(ma), Math.cos(ma), 0);
-		float clear = Math.max(0, Math.min(1, sky.rainBrightness));
-		float sunStr = smooth(0.0f, 0.12f, (float) sun.y) * clear * clear;
-		float moonStr = 0.22f * smooth(0.0f, 0.2f, (float) moon.y) * (1 - smooth(0.0f, 0.12f, (float) sun.y)) * clear;
-		boolean useSun = sunStr >= moonStr;
-		Vector3d L = useSun ? sun : moon;
-		float strength = useSun ? sunStr : moonStr;
-		float el = (float) L.y;
-		float cr, cg, cb;
-		if (useSun) {
-			float w = smooth(0.04f, 0.45f, el);
-			cr = 1.0f;
-			cg = 0.46f + (0.95f - 0.46f) * w;
-			cb = 0.20f + (0.88f - 0.20f) * w;
-		} else {
-			cr = 0.55f;
-			cg = 0.68f;
-			cb = 1.0f;
+		if (geomDirty) {
+			for (Casc s : casc) s.version++;
+			geomDirty = false;
 		}
-		float amp = useSun ? SUN_AMP : 0.45f;
 
 		try (MemoryStack stack = MemoryStack.stackPush()) {
 			long fb = stack.ncalloc(16, 1, FRAME_BYTES);
 			boolean render = OwnProbe.bool("shaders.render", true), far = OwnProbe.bool("shaders.far", true);
-			if (strength > 0.01f) {
-				// light basis: F away from the light
-				Vector3d F = new Vector3d(L).negate();
-				Vector3d up = Math.abs(F.y) > 0.98 ? new Vector3d(1, 0, 0) : new Vector3d(0, 1, 0);
-				Vector3d R = up.cross(F, new Vector3d()).normalize();
-				Vector3d U = F.cross(R, new Vector3d()).normalize();
+			if (sunOn) {
 				double[] radius = CASCADES == 1 ? new double[] {DISTANCE} : CASCADES == 2 ? new double[] {DISTANCE * 0.3, DISTANCE}
 					: new double[] {DISTANCE * 0.12, DISTANCE * 0.35, DISTANCE};
 				double yaw = Math.toRadians(camera.yRot);
 				double fx = -Math.sin(yaw), fz = Math.cos(yaw);
-				Vector3d C = new Vector3d(camera.pos.x, camera.pos.y, camera.pos.z);
-				double cR = C.dot(R), cU = C.dot(U);
+				double cx = camera.pos.x, cy = camera.pos.y, cz = camera.pos.z;
 				long cf = stack.ncalloc(16, 1, CULLFRAME_BYTES), sc = stack.ncalloc(16, 1, CULL_BYTES), df = stack.ncalloc(16, 1, DRAW_BYTES), uu = stack.ncalloc(8, 1, 64);
 				MemoryUtil.memPutInt(cf + 120, listCap);
 				MemoryUtil.memPutInt(cf + 128, OwnTerrain.RUN);
 				Matrix4f m = new Matrix4f();
+				boolean[] need = new boolean[CASCADES];
 				for (int c = 0; c < CASCADES; c++) {
+					Casc s = casc[c];
 					double r = radius[c], tw = 2 * r / RES;
-					double wx = camera.pos.x + fx * 0.3 * r, wz = camera.pos.z + fz * 0.3 * r;
-					double sx = Math.floor((wx * R.x + camera.pos.y * R.y + wz * R.z) / tw) * tw, sy = Math.floor((wx * U.x + camera.pos.y * U.y + wz * U.z) / tw) * tw;
-					double tx = cR - sx, ty = cU - sy;
+					boolean cached = CACHE && c > 0;
+					if (!cached) {
+						// the nearest cascade: rebuilt every frame, centred ahead of the camera, its origin snapped to texels
+						basis(s, L);
+						double wx = cx + fx * 0.3 * r, wz = cz + fz * 0.3 * r;
+						s.sx = Math.floor((wx * s.R.x + cy * s.R.y + wz * s.R.z) / tw) * tw;
+						s.sy = Math.floor((wx * s.U.x + cy * s.U.y + wz * s.U.z) / tw) * tw;
+						s.sf = cx * s.F.x + cy * s.F.y + cz * s.F.z;
+						s.valid = true;
+					} else {
+						double dR = cx * s.R.x + cy * s.R.y + cz * s.R.z - s.sx, dU = cx * s.U.x + cy * s.U.y + cz * s.U.z - s.sy;
+						double dF = cx * s.F.x + cy * s.F.y + cz * s.F.z - s.sf;
+						if (!s.valid || s.L.dot(L) < REBUILD_COS || Math.abs(dR) > DRIFT * r || Math.abs(dU) > DRIFT * r || Math.abs(dF) > DRIFT_DEPTH) {
+							// the sun moved or the camera drifted: a new frame, snapped to a multiple of CACHE_QUANTUM texels (centred on the camera: turning does not matter)
+							basis(s, L);
+							double q = tw * CACHE_QUANTUM;
+							s.sx = Math.floor((cx * s.R.x + cy * s.R.y + cz * s.R.z) / q) * q;
+							s.sy = Math.floor((cx * s.U.x + cy * s.U.y + cz * s.U.z) / q) * q;
+							s.sf = Math.floor((cx * s.F.x + cy * s.F.y + cz * s.F.z) / q) * q;
+							s.valid = true;
+							s.version++;
+						}
+					}
+					double cR = cx * s.R.x + cy * s.R.y + cz * s.R.z, cU = cx * s.U.x + cy * s.U.y + cz * s.U.z, cF = cx * s.F.x + cy * s.F.y + cz * s.F.z;
+					double tx = cR - s.sx, ty = cU - s.sy, tf = cF - s.sf + CASTER;
+					need[c] = !cached || s.slot[k] != s.version;
 					m.identity();
-					m.m00((float) (R.x / r)).m01((float) (U.x / r)).m02((float) (F.x / DEPTH)).m03(0);
-					m.m10((float) (R.y / r)).m11((float) (U.y / r)).m12((float) (F.y / DEPTH)).m13(0);
-					m.m20((float) (R.z / r)).m21((float) (U.z / r)).m22((float) (F.z / DEPTH)).m23(0);
-					m.m30((float) (tx / r)).m31((float) (ty / r)).m32((float) (CASTER / DEPTH)).m33(1);
+					m.m00((float) (s.R.x / r)).m01((float) (s.U.x / r)).m02((float) (s.F.x / DEPTH)).m03(0);
+					m.m10((float) (s.R.y / r)).m11((float) (s.U.y / r)).m12((float) (s.F.y / DEPTH)).m13(0);
+					m.m20((float) (s.R.z / r)).m21((float) (s.U.z / r)).m22((float) (s.F.z / DEPTH)).m23(0);
+					m.m30((float) (tx / r)).m31((float) (ty / r)).m32((float) (tf / DEPTH)).m33(1);
 					m.getToAddress(fb + c * 64L);
 					// info: blocks per texel, 1 / depth range, 1 / res, normal offset
 					MemoryUtil.memPutFloat(fb + 192 + c * 16L, (float) tw);
 					MemoryUtil.memPutFloat(fb + 192 + c * 16L + 4, (float) (1.0 / DEPTH));
 					MemoryUtil.memPutFloat(fb + 192 + c * 16L + 8, 1.0f / RES);
 					MemoryUtil.memPutFloat(fb + 192 + c * 16L + 12, (float) (tw * 1.2));
-					// cull volume: p.R + tx in [-r, r], p.U + ty in [-r, r], p.F + CASTER in [0, DEPTH] (+ margin)
+					if (!need[c] || !render || (!far && c > 0)) continue;
+					// cull volume: p.R + tx in [-r, r], p.U + ty in [-r, r], p.F + tf in [0, DEPTH] (+ margin)
 					double mg = 1.0 + SOFT * 4;
-					plane(sc, 0, R.x, R.y, R.z, tx + r + mg);
-					plane(sc, 1, -R.x, -R.y, -R.z, -tx + r + mg);
-					plane(sc, 2, U.x, U.y, U.z, ty + r + mg);
-					plane(sc, 3, -U.x, -U.y, -U.z, -ty + r + mg);
-					plane(sc, 4, F.x, F.y, F.z, CASTER + mg);
-					plane(sc, 5, -F.x, -F.y, -F.z, DEPTH - CASTER + mg);
+					plane(sc, 0, s.R.x, s.R.y, s.R.z, tx + r + mg);
+					plane(sc, 1, -s.R.x, -s.R.y, -s.R.z, -tx + r + mg);
+					plane(sc, 2, s.U.x, s.U.y, s.U.z, ty + r + mg);
+					plane(sc, 3, -s.U.x, -s.U.y, -s.U.z, -ty + r + mg);
+					plane(sc, 4, s.F.x, s.F.y, s.F.z, tf + mg);
+					plane(sc, 5, -s.F.x, -s.F.y, -s.F.z, DEPTH - tf + mg);
 					int bx = camera.blockPos.getX(), by = camera.blockPos.getY(), bz = camera.blockPos.getZ();
 					MemoryUtil.memPutInt(sc + 96, bx);
 					MemoryUtil.memPutInt(sc + 100, by);
@@ -205,13 +278,13 @@ public final class OwnShade {
 					MemoryUtil.memPutFloat(sc + 112, (float) (bx - camera.pos.x));
 					MemoryUtil.memPutFloat(sc + 116, (float) (by - camera.pos.y));
 					MemoryUtil.memPutFloat(sc + 120, (float) (bz - camera.pos.z));
-					MemoryUtil.memPutFloat(sc + 128, (float) L.x);
-					MemoryUtil.memPutFloat(sc + 132, (float) L.y);
-					MemoryUtil.memPutFloat(sc + 136, (float) L.z);
+					MemoryUtil.memPutFloat(sc + 128, (float) s.L.x);
+					MemoryUtil.memPutFloat(sc + 132, (float) s.L.y);
+					MemoryUtil.memPutFloat(sc + 136, (float) s.L.z);
 					MemoryUtil.memPutInt(sc + 144, t.shadeSectionCount());
 					MemoryUtil.memPutInt(sc + 148, listCap);
 					MemoryUtil.memPutInt(sc + 152, t.shadeRecCapacity());
-					if (render && (far || c == 0) && !OwnNative.shadeCull(own, enc, cf, CULLFRAME_BYTES, sc, CULL_BYTES, t.shadeSections(k), t.shadeRecs(), args[k][c], lists[k][c], t.shadeRecCapacity()))
+					if (!OwnNative.shadeCull(own, enc, cf, CULLFRAME_BYTES, sc, CULL_BYTES, t.shadeSections(k), t.shadeRecs(), args[k][c], lists[k][c], t.shadeRecCapacity()))
 						throw new IllegalStateException("shade_cull missing");
 					// the cascade's Projection and Terrain blocks for its draws
 					long pa = OwnNative.contents(proj[k][c]), ta = OwnNative.contents(terr[k][c]);
@@ -221,6 +294,7 @@ public final class OwnShade {
 					MemoryUtil.memPutInt(ta + 68, atlasH);
 				}
 				for (int c = 0; c < CASCADES; c++) {
+					if (!need[c] || !render || (!far && c > 0)) continue;
 					MemoryUtil.memCopy(d, df, DRAW_BYTES);
 					if (cpuClip) {
 						MemoryUtil.memPutInt(df + 12, 1);
@@ -235,15 +309,16 @@ public final class OwnShade {
 					MemoryUtil.memPutLong(uu + 40, 0);
 					MemoryUtil.memPutLong(uu + 48, MemoryUtil.memGetLong(u + 48));
 					MemoryUtil.memPutLong(uu + 56, MemoryUtil.memGetLong(u + 56));
-					if (render && (far || c == 0)) OwnNative.shadePass(own, enc, k, c, df, DRAW_BYTES, t.shadeArena(), t.shadeSections(k), t.shadeRecs(), lists[k][c], args[k][c], listCap, uu, atlas,
+					OwnNative.shadePass(own, enc, k, c, df, DRAW_BYTES, t.shadeArena(), t.shadeSections(k), t.shadeRecs(), lists[k][c], args[k][c], listCap, uu, atlas,
 						atlasSampler, light, lightSampler);
+					casc[c].slot[k] = casc[c].version;
 				}
 			}
 			// sunDir, sunColor, amb
 			MemoryUtil.memPutFloat(fb + 240, (float) L.x);
 			MemoryUtil.memPutFloat(fb + 244, (float) L.y);
 			MemoryUtil.memPutFloat(fb + 248, (float) L.z);
-			MemoryUtil.memPutFloat(fb + 252, strength > 0.01f && OwnProbe.bool("shaders.sun", true) ? strength : 0f);
+			MemoryUtil.memPutFloat(fb + 252, sunOn ? strength : 0f);
 			MemoryUtil.memPutFloat(fb + 256, cr * amp);
 			MemoryUtil.memPutFloat(fb + 260, cg * amp);
 			MemoryUtil.memPutFloat(fb + 264, cb * amp);
@@ -251,6 +326,7 @@ public final class OwnShade {
 			MemoryUtil.memPutFloat(fb + 272, AMBIENT_CUT * (useSun ? smooth(0.02f, 0.45f, el) : 0.5f));
 			MemoryUtil.memPutFloat(fb + 276, SOFT);
 			MemoryUtil.memPutFloat(fb + 280, TAPS);
+			MemoryUtil.memPutFloat(fb + 284, FILL);
 			OwnNative.shadeFrame(own, k, fb, FRAME_BYTES, 0f, 0f);
 		}
 		frameActive = true;

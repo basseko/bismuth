@@ -649,7 +649,22 @@ final class OwnNative {
 	/** indices != 0: the per-quad path's GPU-built index list (u32 arena vertex indices). */
 	static int draw(long own, long enc, int kind, long frame, int frameLength, long arena, long sections, long recs, long lists, long args, long argsOffset,
 		long uniforms, long atlas, long atlasSampler, long light, long lightSampler, long indices) {
-		if (OwnShade.ON) kind = OwnShade.kind(kind);
+		if (OwnShade.ON) {
+			int shaded = OwnShade.kind(kind);
+			if (shaded != kind) {
+				try {
+					return draw0(own, enc, shaded, frame, frameLength, arena, sections, recs, lists, args, argsOffset, uniforms, atlas, atlasSampler, light, lightSampler, indices);
+				} catch (IllegalStateException e) {
+					// the shaded variant could not be built: back to the plain one for this draw and the rest of the session
+					OwnShade.drawFailed(e);
+				}
+			}
+		}
+		return draw0(own, enc, kind, frame, frameLength, arena, sections, recs, lists, args, argsOffset, uniforms, atlas, atlasSampler, light, lightSampler, indices);
+	}
+
+	private static int draw0(long own, long enc, int kind, long frame, int frameLength, long arena, long sections, long recs, long lists, long args, long argsOffset,
+		long uniforms, long atlas, long atlasSampler, long light, long lightSampler, long indices) {
 		try (MemoryStack stack = MemoryStack.stackPush()) {
 			long err = stack.nmalloc(1, 2048);
 			MemoryUtil.memPutByte(err, (byte) 0);
