@@ -207,6 +207,7 @@ final class MetalEncoder implements CommandEncoderBackend {
 		long cmd;
 		try {
 			if (GPU_TIMES) GpuTimes.submit(this.submitIndex, this.encoderIndex);
+			if (EntityShade.CAST) EntityShade.flush(this.enc);  // (shaders: the frame's entity casters into the shadow map, in the pre command buffer)
 			cmd = Native.encCommit(this.enc);
 		} finally {
 			MetalEvents.end(commitEvent);

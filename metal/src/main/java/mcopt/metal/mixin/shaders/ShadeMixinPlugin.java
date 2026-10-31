@@ -30,6 +30,8 @@ public final class ShadeMixinPlugin implements IMixinConfigPlugin {
 	public boolean shouldApplyMixin(String targetClassName, String mixinClassName) {
 		if (mixinClassName.endsWith(".ShadeLightmapMixin")) return ENABLED && !"false".equals(System.getProperty("mcopt.shaders.light"));
 		if (mixinClassName.endsWith(".ShadePostMixin")) return ENABLED && !"false".equals(System.getProperty("mcopt.shaders.grade"));
+		if (mixinClassName.endsWith(".ShadeHandMixin")) return ENABLED && !"false".equals(System.getProperty("mcopt.shaders.entities"));
+		if (mixinClassName.endsWith(".ShadeCloudMixin")) return ENABLED && Float.parseFloat(System.getProperty("mcopt.shaders.cloudTint", "0.5")) > 0;
 		return ENABLED;
 	}
 

@@ -53,6 +53,9 @@ final class MetalRenderPass implements RenderPassBackend {
 	private final @Nullable GpuBufferSlice[] vertexBuffers = new GpuBufferSlice[4];
 	private final byte[] pushConstants = new byte[128];
 	private int pushConstantsLength;
+	/** Shaders milestone 5 (EntityShade.CAST): what each uniform slot is bound to now (buffer or texture handle, offset, sampler), for recording casters. */
+	private final long @Nullable [] capH = EntityShade.CAST ? new long[MAX_UNIFORMS] : null, capO = EntityShade.CAST ? new long[MAX_UNIFORMS] : null,
+		capT = EntityShade.CAST ? new long[MAX_UNIFORMS] : null, capS = EntityShade.CAST ? new long[MAX_UNIFORMS] : null;
 
 	private final boolean hasDepth;
 	/** Shaderpack runtime: draws this pass's pipelines with its own (see MetalHooks); null on the backend's own path. */
@@ -256,8 +259,38 @@ final class MetalRenderPass implements RenderPassBackend {
 		Native.index(this.enc, this.indexHandle, this.indexInt);
 	}
 
+	/** Shaders milestone 5: a patched pipeline's draw binds the frame block and the shadow map (the buffer and texture slots are shared with other draws). */
+	private void bindLit() {
+		MetalPipeline p = this.pipeline;
+		if (p != null && p.shadeLit) EntityShade.bind(this.enc);
+	}
+
+	/** Shaders milestone 5: the current cast pipeline's bound state and this draw, for the replay into the shadow map. */
+	EntityShade.@Nullable Draw snapshot(MetalPipeline p, MetalEncoder encoder, int indexCount, int instanceCount, int firstIndex, int vertexOffset, int firstInstance) {
+		GpuBufferSlice vb = this.vertexBuffers[0];
+		if (vb == null || this.indexHandle == 0 || this.capH == null) return null;
+		int n = p.uniforms.size();
+		EntityShade.Draw d = new EntityShade.Draw();
+		d.p = p;
+		d.handle = Arrays.copyOf(this.capH, n);
+		d.offset = Arrays.copyOf(this.capO, n);
+		d.texture = Arrays.copyOf(this.capT, n);
+		d.sampler = Arrays.copyOf(this.capS, n);
+		d.vertex = encoder.use(vb.buffer()).handle;
+		d.vertexOffset = vb.offset();
+		d.index = this.indexHandle;
+		d.indexInt = this.indexInt;
+		d.count = indexCount;
+		d.instances = instanceCount;
+		d.first = firstIndex;
+		d.base = vertexOffset;
+		d.firstInstance = firstInstance;
+		return d;
+	}
+
 	private void bindUniforms(int drawCount) {
 		this.draws += drawCount;
+		if (EntityShade.RECEIVE) this.bindLit();
 		if (this.dirtyUpTo == 0) return;
 		if (MetalEncoder.LAZY_CLEARS) {
 			// a texture still pending its deferred clear is about to be sampled: write the clear first (splits this pass, then everything binds again)
@@ -287,11 +320,22 @@ final class MetalRenderPass implements RenderPassBackend {
 		switch (uniform.type()) {
 			case UNIFORM_BUFFER -> {
 				GpuBufferSlice slice = (GpuBufferSlice) value;
-				Native.buffer(this.enc, i, this.encoder.use(slice.buffer()).handle, slice.offset());
+				long handle = this.encoder.use(slice.buffer()).handle;
+				Native.buffer(this.enc, i, handle, slice.offset());
+				if (EntityShade.CAST) {
+					this.capH[i] = handle;
+					this.capO[i] = slice.offset();
+					this.capT[i] = 0;
+				}
 			}
 			case COMBINED_IMAGE_SAMPLER -> {
 				TextureViewAndSampler ts = (TextureViewAndSampler) value;
 				Native.texture(this.enc, i, ((MetalTexture.View) ts.view()).handle, ((MetalSampler) ts.sampler()).handle());
+				if (EntityShade.CAST) {
+					this.capH[i] = 0;
+					this.capT[i] = ((MetalTexture.View) ts.view()).handle;
+					this.capS[i] = ((MetalSampler) ts.sampler()).handle();
+				}
 				if (this.encoder.encLogOn()) this.encoder.encBind(((MetalTexture.View) ts.view()).metalTexture());
 				if (this.delegate != null) this.delegate.texture(this.enc, i, ts.view());
 			}
@@ -319,6 +363,7 @@ final class MetalRenderPass implements RenderPassBackend {
 		boolean clouds = name.equals("minecraft:pipeline/clouds") || name.equals("minecraft:pipeline/flat_clouds");
 		if (this.encoder.terrain.split && clouds && instanceCount == 1 && firstIndex == 0 && vertexOffset == 0 && this.drawClouds(indexCount / 6)) return;
 		Native.drawIndexed(this.enc, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
+		if (EntityShade.CAST && EntityShade.castActive && this.pipeline.shadowPso != 0) EntityShade.capture(this, this.pipeline, this.encoder, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
 	}
 
 	/**

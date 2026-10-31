@@ -1,5 +1,6 @@
 package mcopt.metal.own;
 
+import mcopt.metal.EntityShade;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.SkyRenderState;
@@ -85,6 +86,7 @@ public final class OwnShade {
 	static void frame(OwnTerrain t, CameraRenderState camera, long u, long d, long atlas, long atlasSampler, long light, long lightSampler, int k, int atlasW, int atlasH,
 		boolean cpuClip, boolean fat) {
 		frameActive = false;
+		if (EntityShade.ON) EntityShade.begin();  // (milestone 5: entities are re-lit only in the frames where the block below is published)
 		if (t.changedCount() > 0) geomDirty = true;
 		if (failed) return;
 		Minecraft mc = Minecraft.getInstance();
@@ -357,6 +359,8 @@ public final class OwnShade {
 				MemoryUtil.memPutFloat(fb + 304 + c * 4L, useSun ? OwnLight.ambient[c] : 0.84f + 0.08f * c);
 			}
 			OwnNative.shadeFrame(own, k, fb, FRAME_BYTES, 0f, 0f);
+			// milestone 5: entities and items (vanilla pipelines) take the same block and shadow map; cascade 0 also takes their casters
+			if (EntityShade.ON && OwnProbe.bool("shaders.entities", true)) EntityShade.publish(fb, k, sunOn && render);
 		}
 		frameActive = true;
 	}

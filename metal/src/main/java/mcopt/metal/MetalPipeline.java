@@ -56,6 +56,10 @@ final class MetalPipeline implements BackendRenderPipeline {
 	final int depthCompare;
 	/** Sodium solid/cutout terrain only, with MetalTerrain on: the same pipeline fetching its own vertices; 0 otherwise. */
 	final long pulled;
+	/** Shaders milestone 5: the pipeline's stages were patched to take the sun's shadows and light balance (ShadePatch). */
+	boolean shadeLit;
+	/** Shaders milestone 5: a depth-only twin (same vertex function, no fragment stage) for casting into the shadow map; 0 for none. */
+	long shadowPso;
 	private final MetalEncoder encoder;
 	private boolean closed;
 
@@ -97,6 +101,13 @@ final class MetalPipeline implements BackendRenderPipeline {
 				v = override(info.name() + ".vs.metal", v);
 				f = override(info.name() + ".fs.metal", f);
 			}
+			boolean lit = false;
+			String[] patched = ShadePatch.ON ? ShadePatch.patch(info.name(), v.msl, f.msl) : null;
+			if (patched != null) {
+				v = new Translated(patched[0], v.entry);
+				f = new Translated(patched[1], f.entry);
+				lit = true;
+			}
 			if (UNCACHED) {
 				v = new Translated("// " + UNCACHED_NONCE + "\n" + v.msl, v.entry);
 				f = new Translated("// " + UNCACHED_NONCE + "\n" + f.msl, f.entry);
@@ -122,6 +133,13 @@ final class MetalPipeline implements BackendRenderPipeline {
 			int compare = depth == null ? 7 : MetalConst.compare(depth.depthTest());
 			long depthState = Native.depthStateNew(ctx, compare, depth != null && depth.writeDepth() ? 1 : 0);
 			MetalPipeline pipeline = new MetalPipeline(encoder, withDepth, withoutDepth, pulled, depthState, compare, info);
+			pipeline.shadeLit = lit;
+			if (lit && EntityShade.CAST && ShadePatch.casts(info.name())) {
+				// the depth-only twin that casts into the shadow map (no fragment stage, no colour attachment); a failure only loses this pipeline's shadow
+				long twin = Native.pipelineNew(ctx, vlib, vname, 0, fname, describeDepthOnly(stack, info), err, 4096);
+				if (twin == 0) System.out.println("mcopt-shaders: shade-patch: no caster twin for " + info.name() + ": " + MemoryUtil.memUTF8(err));
+				pipeline.shadowPso = twin;
+			}
 			return pipeline;
 		} finally {
 			if (vlib != 0) Native.release(vlib);
@@ -227,6 +245,21 @@ final class MetalPipeline implements BackendRenderPipeline {
 			}
 		}
 		d.put(hasDepth ? MetalConst.pixelFormat(com.mojang.renderpearl.api.GpuFormat.D32_FLOAT) : 0);
+		d.put(MetalConst.topologyClass(info.primitiveTopology()));
+		return MemoryUtil.memAddress(d.flip());
+	}
+
+	/** The vertex layout of info with no colour attachment and the shadow map's depth format (EntityShade's caster twins). */
+	private static long describeDepthOnly(MemoryStack stack, CreateInfo info) {
+		IntBuffer d = stack.mallocInt(5 + info.vertexBuffers().size() * 3 + info.attribBindings().size() * 4);
+		d.put(info.vertexBuffers().size());
+		for (CreateInfo.VertexBuffer vb : info.vertexBuffers()) d.put(MetalConst.VERTEX_BUFFER_BASE + vb.bufferSlot()).put(vb.stride()).put(vb.stepRate());
+		d.put(info.attribBindings().size());
+		for (CreateInfo.AttribBinding a : info.attribBindings()) {
+			d.put(a.location()).put(MetalConst.VERTEX_BUFFER_BASE + a.bufferSlot()).put(a.offset()).put(MetalConst.vertexFormat(a.format()));
+		}
+		d.put(0);
+		d.put(MetalConst.pixelFormat(com.mojang.renderpearl.api.GpuFormat.D32_FLOAT));
 		d.put(MetalConst.topologyClass(info.primitiveTopology()));
 		return MemoryUtil.memAddress(d.flip());
 	}
@@ -356,6 +389,7 @@ final class MetalPipeline implements BackendRenderPipeline {
 			if (this.withoutDepth != 0) this.encoder.releaseLater(this.withoutDepth);
 			if (this.pulled != 0) this.encoder.releaseLater(this.pulled);
 			this.encoder.releaseLater(this.depthState);
+			if (this.shadowPso != 0) this.encoder.releaseLater(this.shadowPso);
 		}
 	}
 

@@ -146,6 +146,8 @@ static struct {
 	float biasC, biasS;               // the shadow draws' depth bias (constant units, slope scale)
 } sh;
 
+void mce_map(id<MTLTexture> map);  // mcentity.m (shaders milestone 5: entities read the same shadow map)
+
 static void ownErr(NSError *e, const char *what, char *err, int cap) {
 	if (err && cap > 0) snprintf(err, cap, "%s: %s", what, e ? e.description.UTF8String : "unknown error");
 }
@@ -2156,6 +2158,7 @@ void mcs_frame(Own *w, int k, const void *bytes, int length, float biasC, float 
 	memcpy(sh.frame, bytes, (size_t) length);
 	sh.frameLen = length;
 	sh.cur = sh.tex[k % (sh.ring ? sh.ring : 1)];
+	mce_map(sh.cur);
 	sh.biasC = biasC;
 	sh.biasS = biasS;
 }
