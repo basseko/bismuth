@@ -3,6 +3,7 @@
 // CPU-written shared buffers into a page store (64 KiB pages, deduplicated), and in a capture frame copies textures out of the open
 // level pass (split once, as the occlusion splits it). mcown.m and mcmetal.m are not changed by any of this.
 #import "mcmetal.h"
+#import "mce.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -211,7 +212,7 @@ static int texelBytes(MTLPixelFormat f) {
 
 // Every mip and slice of texture t into a new shared buffer (blit b); levels laid out one after another, rows tight. The bytes
 // per texel go to *bpp (Depth32Float_Stencil8: its depth only, 4). nil if the format isn't handled.
-static id<MTLBuffer> copyOut(id<MTLDevice> dev, id<MTLBlitCommandEncoder> b, id<MTLTexture> t, int *bpp) {
+static id<MTLBuffer> copyOut(id<MTLDevice> dev, id b, id<MTLTexture> t, int *bpp) {
 	int tb = texelBytes(t.pixelFormat);
 	if (!tb || t.storageMode == MTLStorageModeMemoryless) return nil;
 	MTLBlitOption opt = MTLBlitOptionNone;
@@ -223,11 +224,12 @@ static id<MTLBuffer> copyOut(id<MTLDevice> dev, id<MTLBlitCommandEncoder> b, id<
 	NSUInteger slices = t.textureType == MTLTextureTypeCube ? 6 : t.arrayLength, total = 0;
 	for (NSUInteger m = 0; m < t.mipmapLevelCount; m++) total += MAX(1, t.width >> m) * MAX(1, t.height >> m) * tb * slices;
 	id<MTLBuffer> out = [dev newBufferWithLength:total options:MTLResourceStorageModeShared];
+	mce_make_resident(out);
 	NSUInteger at = 0;
 	for (NSUInteger s = 0; s < slices; s++) {
 		for (NSUInteger m = 0; m < t.mipmapLevelCount; m++) {
 			NSUInteger w = MAX(1, t.width >> m), h = MAX(1, t.height >> m);
-			[b copyFromTexture:t sourceSlice:s sourceLevel:m sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1) toBuffer:out
+			[MCE_B(b) copyFromTexture:t sourceSlice:s sourceLevel:m sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1) toBuffer:out
 				destinationOffset:at destinationBytesPerRow:w * tb destinationBytesPerImage:w * h * tb options:opt];
 			at += w * h * tb;
 		}
@@ -241,11 +243,11 @@ static id<MTLBuffer> copyOut(id<MTLDevice> dev, id<MTLBlitCommandEncoder> b, id<
 int mcc_split_copy(Enc *enc, int n, id<MTLTexture> const *texs, const char *const *paths) {
 	if (!enc->render) return 0;
 	@autoreleasepool {
-	id<MTLComputeCommandEncoder> c = mc_render_suspend(enc);
-	[c endEncoding];
+	id c = mc_render_suspend(enc);
+	mce_end_encoder(c);
 	[c release];
-	id<MTLCommandBuffer> cmd = enc->cmd;
-	id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
+	id cmd = enc->cmd;
+	id b = mce_new_blit_encoder(cmd);
 	int ok = 1;
 	NSMutableArray *bufs = [NSMutableArray array], *heads = [NSMutableArray array], *names = [NSMutableArray array];
 	for (int i = 0; i < n; i++) {
@@ -261,21 +263,23 @@ int mcc_split_copy(Enc *enc, int n, id<MTLTexture> const *texs, const char *cons
 		int32_t head[7] = {0x5854434D, (int32_t) t.pixelFormat, (int32_t) t.width, (int32_t) t.height, (int32_t) t.mipmapLevelCount,
 			(int32_t) (t.textureType == MTLTextureTypeCube ? 6 : t.arrayLength), bpp};
 		[bufs addObject:out];
-		[out release];
 		[heads addObject:[NSData dataWithBytes:head length:sizeof head]];
 		[names addObject:[NSString stringWithUTF8String:paths[i]]];
 	}
-	[b endEncoding];
-	[cmd addCompletedHandler:^(id<MTLCommandBuffer> done) {
+	mce_end_encoder(b);
+	[b release];
+	mce_cmd_on_completed(cmd, ^(double gs, double ge) {
 		for (NSUInteger i = 0; i < bufs.count; i++) {
 			FILE *f = fopen([names[i] UTF8String], "wb");
-			if (!f) continue;
-			fwrite([heads[i] bytes], 1, [heads[i] length], f);
-			id<MTLBuffer> out = bufs[i];
-			fwrite(out.contents, 1, out.length, f);
-			fclose(f);
+			if (f) {
+				fwrite([heads[i] bytes], 1, [heads[i] length], f);
+				id<MTLBuffer> out = bufs[i];
+				fwrite(out.contents, 1, out.length, f);
+				fclose(f);
+			}
 		}
-	}];
+		for (id<MTLBuffer> out in bufs) mce_release(out);  // (the +1 from newBuffer; evicted first under Metal 4)
+	});
 	mc_render_resume(enc, mc_profiled_compute(enc, cmd, MTLDispatchTypeConcurrent));
 	return ok;
 	}
@@ -286,8 +290,8 @@ int mcc_split_copy(Enc *enc, int n, id<MTLTexture> const *texs, const char *cons
 // from. Each lands in paths[i] when done (textures as copyOut's .tex, buffers raw). 1 queued, -1 a texture format not handled.
 int mcc_copy_out(Ctx *ctx, int n, id const *objs, const int *kinds, const char *const *paths) {
 	@autoreleasepool {
-		id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
-		id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
+		id cmd = mce_new_cmd(ctx);
+		id b = mce_new_blit_encoder(cmd);
 		int ok = 1;
 		NSMutableArray *bufs = [NSMutableArray array], *heads = [NSMutableArray array], *names = [NSMutableArray array];
 		for (int i = 0; i < n; i++) {
@@ -297,7 +301,8 @@ int mcc_copy_out(Ctx *ctx, int n, id const *objs, const int *kinds, const char *
 			if (kinds[i] == 1) {
 				id<MTLBuffer> src = objs[i];
 				out = [ctx->device newBufferWithLength:src.length options:MTLResourceStorageModeShared];
-				[b copyFromBuffer:src sourceOffset:0 toBuffer:out destinationOffset:0 size:src.length];
+				mce_make_resident(out);
+				mce_copy_buffer(b, src, 0, out, 0, src.length);
 			} else {
 				id<MTLTexture> t = objs[i];
 				if (t.buffer) continue;  // (a texture over a buffer: its contents are the buffer's, captured as pages)
@@ -313,22 +318,25 @@ int mcc_copy_out(Ctx *ctx, int n, id const *objs, const int *kinds, const char *
 				head = [NSData dataWithBytes:h length:sizeof h];
 			}
 			[bufs addObject:out];
-			[out release];
 			[heads addObject:head];
 			[names addObject:[NSString stringWithUTF8String:paths[i]]];
 		}
-		[b endEncoding];
-		[cmd addCompletedHandler:^(id<MTLCommandBuffer> done) {
+		mce_end_encoder(b);
+		[b release];
+		mce_cmd_on_completed(cmd, ^(double gs, double ge) {
 			for (NSUInteger i = 0; i < bufs.count; i++) {
 				FILE *f = fopen([names[i] UTF8String], "wb");
-				if (!f) continue;
-				fwrite([heads[i] bytes], 1, [heads[i] length], f);
-				id<MTLBuffer> out = bufs[i];
-				fwrite(out.contents, 1, out.length, f);
-				fclose(f);
+				if (f) {
+					fwrite([heads[i] bytes], 1, [heads[i] length], f);
+					id<MTLBuffer> out = bufs[i];
+					fwrite(out.contents, 1, out.length, f);
+					fclose(f);
+				}
 			}
-		}];
-		[cmd commit];
+			for (id<MTLBuffer> out in bufs) mce_release(out);
+		});
+		mce_cmd_commit(cmd);
+		[cmd release];
 		return ok;
 	}
 }
@@ -340,35 +348,37 @@ int mcc_copy_out(Ctx *ctx, int n, id const *objs, const int *kinds, const char *
 int mcc_copy_buffers_completed(Ctx *ctx, int n, id<MTLBuffer> const *src, const char *const *paths) {
 	@autoreleasepool {
 		if (n <= 0 || n > 64) return -1;
-		id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
-		id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+		id cmd = mce_new_cmd(ctx);
+		id blit = mce_new_blit_encoder(cmd);
 		NSMutableArray *outputs = [NSMutableArray arrayWithCapacity:(NSUInteger) n];
+		int rc = 1;
 		for (int i = 0; i < n; i++) {
-			if (!src[i] || !paths[i] || !src[i].length) {
-				[blit endEncoding];
-				return -1;
-			}
+			if (!src[i] || !paths[i] || !src[i].length) { rc = -1; break; }
 			id<MTLBuffer> out = [ctx->device newBufferWithLength:src[i].length options:MTLResourceStorageModeShared];
-			if (!out) {
-				[blit endEncoding];
-				return -2;
-			}
-			[blit copyFromBuffer:src[i] sourceOffset:0 toBuffer:out destinationOffset:0 size:src[i].length];
+			if (!out) { rc = -2; break; }
+			mce_make_resident(out);
+			mce_copy_buffer(blit, src[i], 0, out, 0, src[i].length);
 			[outputs addObject:out];
-			[out release];
 		}
-		[blit endEncoding];
-		[cmd commit];
-		[cmd waitUntilCompleted];
-		if (cmd.status != MTLCommandBufferStatusCompleted) return -3;
-		for (int i = 0; i < n; i++) {
-			id<MTLBuffer> out = outputs[(NSUInteger) i];
-			FILE *f = fopen(paths[i], "wb");
-			if (!f) return -4;
-			size_t wrote = fwrite(out.contents, 1, out.length, f);
-			int closed = fclose(f);
-			if (wrote != out.length || closed) return -5;
+		mce_end_encoder(blit);
+		[blit release];
+		if (rc == 1) {
+			mce_cmd_commit(cmd);
+			mce_cmd_wait(cmd);
+			if (mce_metal4 ? !mce_cmd_done(cmd) : ((id<MTLCommandBuffer>) cmd).status != MTLCommandBufferStatusCompleted) rc = -3;
+			for (int i = 0; rc == 1 && i < n; i++) {
+				id<MTLBuffer> out = outputs[(NSUInteger) i];
+				FILE *f = fopen(paths[i], "wb");
+				if (!f) { rc = -4; break; }
+				size_t wrote = fwrite(out.contents, 1, out.length, f);
+				int closed = fclose(f);
+				if (wrote != out.length || closed) rc = -5;
+			}
+		} else if (mce_metal4) {
+			mce_cmd_commit(cmd);  // (an open-nothing command buffer: the layer wants every one it hands out committed)
 		}
-		return 1;
+		for (id<MTLBuffer> out in outputs) mce_release(out);
+		[cmd release];
+		return rc;
 	}
 }

@@ -4,6 +4,7 @@
 // and wakes the writer thread, which copies it out and frees it. The render thread never waits: with no free slot it skips
 // the frame (the writer repeats the previous one, so the video keeps real time).
 #import "mcmetal.h"
+#import "mce.h"
 #include <dispatch/dispatch.h>
 #include <stdatomic.h>
 #include <string.h>
@@ -48,6 +49,7 @@ Rec *mcr_new(Ctx *ctx, const char *source, int slots, uint64_t slotBytes, char *
 		r->slotCount = slots;
 		for (int i = 0; i < slots; i++) {
 			r->slots[i] = [ctx->device newBufferWithLength:slotBytes options:MTLResourceStorageModeShared];
+			mce_make_resident(r->slots[i]);
 			if (!r->slots[i]) {
 				snprintf(err, errCap, "slot buffer of %llu bytes failed", (unsigned long long) slotBytes);
 				return NULL;
@@ -82,33 +84,37 @@ int mcr_capture(Rec *r, Enc *enc, id<MTLTexture> src, int slot, int64_t frame, c
 		id<MTLTexture> t = src;
 		if (!(src.usage & MTLTextureUsageShaderRead)) {
 			if (!r->copy || r->copy.width != src.width || r->copy.height != src.height || r->copy.pixelFormat != src.pixelFormat) {
-				if (r->copy) [r->copy release];
+				if (r->copy) mce_release(r->copy);
 				MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:src.width height:src.height mipmapped:NO];
 				d.usage = MTLTextureUsageShaderRead;
 				d.storageMode = MTLStorageModePrivate;
 				r->copy = [r->ctx->device newTextureWithDescriptor:d];
+				mce_make_resident(r->copy);
 			}
-			id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
-			[b copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(src.width, src.height, 1)
-				toTexture:r->copy destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
-			[b endEncoding];
+			id b = mce_new_blit_encoder(cb);
+			mce_copy_texture(b, src, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(src.width, src.height, 1),
+				r->copy, 0, 0, MTLOriginMake(0, 0, 0));
+			mce_end_encoder(b);
+			[b release];
 			t = r->copy;
 		}
 		atomic_store(&r->frame[slot], frame);
-		id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
-		ce.label = @"mcopt rec";
-		[ce setComputePipelineState:r->pso];
-		[ce setTexture:t atIndex:0];
-		[ce setBuffer:r->slots[slot] offset:0 atIndex:0];
-		[ce setBytes:params length:paramsLength atIndex:1];
-		[ce dispatchThreads:MTLSizeMake((NSUInteger) gridW, (NSUInteger) gridH, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
-		[ce endEncoding];
+		id ce = mce_new_compute_encoder(cb, MTLDispatchTypeSerial);
+		[mce_raw(ce) setLabel:@"mcopt rec"];
+		[mce_raw(ce) setComputePipelineState:r->pso];
+		mce_set_compute_texture(ce, t, 0);
+		mce_set_compute_buffer(ce, r->slots[slot], 0, 0);
+		mce_set_compute_bytes(ce, params, paramsLength, 1);
+		mce_dispatch_threads(ce, MTLSizeMake((NSUInteger) gridW, (NSUInteger) gridH, 1), MTLSizeMake(16, 16, 1));
+		mce_end_encoder(ce);
+		[ce release];
 		Rec *rr = r;
 		int s = slot;
-		[cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
-			atomic_store(&rr->state[s], done.status == MTLCommandBufferStatusCompleted ? SLOT_READY : SLOT_FAILED);
+		id<MTLCommandBuffer> cbq = cb;  // (Metal 3: the status; Metal 4: the layer logs a failed command buffer)
+		mce_cmd_on_completed(cb, ^(double gs, double ge) {
+			atomic_store(&rr->state[s], mce_metal4 || cbq.status == MTLCommandBufferStatusCompleted ? SLOT_READY : SLOT_FAILED);
 			dispatch_semaphore_signal(rr->ready);
-		}];
+		});
 	}
 	return 0;
 }
@@ -467,19 +473,32 @@ int mcr_vt_capture(RecVT *v, Enc *enc, id<MTLTexture> src, int64_t frame, const 
 	}
 	@autoreleasepool {
 		id<MTLCommandBuffer> cb = mc_frame_cmd(enc);
-		id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
-		ce.label = @"mcopt rec";
-		[ce setComputePipelineState:v->pso];
-		[ce setTexture:src atIndex:0];
-		[ce setTexture:yt atIndex:1];
-		[ce setTexture:uvt atIndex:2];
-		[ce setBytes:params length:paramsLength atIndex:1];
-		[ce dispatchThreads:MTLSizeMake((NSUInteger) gridW, (NSUInteger) gridH, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
-		[ce endEncoding];
+		// the cache's textures: resident for this command buffer; evicted and released (our extra reference) once the GPU is done with it
+		if (mce_metal4) {
+			[yt retain];
+			[uvt retain];
+			mce_make_resident(yt);
+			mce_make_resident(uvt);
+		}
+		id ce = mce_new_compute_encoder(cb, MTLDispatchTypeSerial);
+		[mce_raw(ce) setLabel:@"mcopt rec"];
+		[mce_raw(ce) setComputePipelineState:v->pso];
+		mce_set_compute_texture(ce, src, 0);
+		mce_set_compute_texture(ce, yt, 1);
+		mce_set_compute_texture(ce, uvt, 2);
+		mce_set_compute_bytes(ce, params, paramsLength, 1);
+		mce_dispatch_threads(ce, MTLSizeMake((NSUInteger) gridW, (NSUInteger) gridH, 1), MTLSizeMake(16, 16, 1));
+		mce_end_encoder(ce);
+		[ce release];
 		atomic_fetch_add(&v->pending, 1);
 		RecVT *vv = v;
-		[cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
-			int ok = done.status == MTLCommandBufferStatusCompleted;
+		id<MTLCommandBuffer> cbq = cb;
+		mce_cmd_on_completed(cb, ^(double gs, double ge) {
+			int ok = mce_metal4 || cbq.status == MTLCommandBufferStatusCompleted;
+			if (mce_metal4) {
+				mce_release(yt);
+				mce_release(uvt);
+			}
 			CFRelease(ty);
 			CFRelease(tuv);
 			dispatch_async(vv->q, ^{
@@ -488,7 +507,7 @@ int mcr_vt_capture(RecVT *v, Enc *enc, id<MTLTexture> src, int64_t frame, const 
 				CVPixelBufferRelease(pb);
 				atomic_fetch_sub(&vv->pending, 1);
 			});
-		}];
+		});
 	}
 	return 0;
 }
