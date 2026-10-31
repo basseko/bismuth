@@ -26,16 +26,23 @@ public final class OwnShade {
 	public static final boolean ON = Boolean.getBoolean("mcopt.shaders");
 	/** Shadow map side, cascades and the farthest cascade's half extent (blocks). */
 	static final int RES = Integer.getInteger("mcopt.shaders.shadow.res", 2048);
-	static final int CASCADES = Math.max(1, Math.min(3, Integer.getInteger("mcopt.shaders.shadow.cascades", 2)));
+	static final int CASCADES = Math.max(1, Math.min(3, Integer.getInteger("mcopt.shaders.shadow.cascades", 3)));
 	static final double DISTANCE = Double.parseDouble(System.getProperty("mcopt.shaders.shadow.distance", "128"));
+	/** The third (far, cached) cascade's half extent: the whole loaded terrain at RD16 and beyond (blocks). */
+	static final double FAR = Double.parseDouble(System.getProperty("mcopt.shaders.shadow.far", "512"));
+	/** Frames between rebuilds of the far cascade after a geometry change (the camera leaving it or the sun moving rebuilds at once). */
+	static final int FAR_GAP = Integer.getInteger("mcopt.shaders.shadow.farGap", 30);
+	private static final boolean LOG = Boolean.getBoolean("mcopt.shaders.log");
 	/** Soft edge radius (blocks) and the ambient light the sun replaces at full sun and sky light. */
 	static final int TAPS = Integer.getInteger("mcopt.shaders.shadow.taps", 12);
 	static final float SOFT = Float.parseFloat(System.getProperty("mcopt.shaders.shadow.soft", "0.10"));
 	static final float AMBIENT_CUT = Float.parseFloat(System.getProperty("mcopt.shaders.ambientCut", "0.20"));
 	static final float FILL = Float.parseFloat(System.getProperty("mcopt.shaders.fill", "0.09"));
+	/** 1: the baked vanilla face shade is replaced by a hemisphere ambient (up 1, side 0.6, down 0.4) wherever the sun applies; 0: kept. */
+	static final float HEMI = Float.parseFloat(System.getProperty("mcopt.shaders.hemi", "1.0"));
 	static final float SUN_AMP = Float.parseFloat(System.getProperty("mcopt.shaders.sunAmp", "0.68"));
 	/** The light-space depth range: blocks toward the light that still cast, and beyond the box's centre plane. */
-	private static final double CASTER = 320.0, BEYOND = 192.0, DEPTH = CASTER + BEYOND;
+	private static final double CASTER = 320.0, BEYOND = 192.0;
 	private static final int FRAME_BYTES = 288, CULL_BYTES = 160, CULLFRAME_BYTES = 144, DRAW_BYTES = OwnTerrain.DRAW_FRAME_BYTES;
 
 	/** This frame draws the shaded terrain variant (set by {@link #frame}; read at the one choke point, OwnNative.draw). */
@@ -100,7 +107,8 @@ public final class OwnShade {
 	private static final class Casc {
 		final Vector3d L = new Vector3d(), R = new Vector3d(), U = new Vector3d(), F = new Vector3d();
 		double sx, sy, sf;
-		boolean valid;
+		boolean valid, dirty;
+		long built;
 		int version = 1;
 		int[] slot;
 	}
@@ -108,6 +116,7 @@ public final class OwnShade {
 	private static Casc[] casc;
 	/** The geometry (a section table entry) changed since the cached cascades were last invalidated for it. */
 	private static boolean geomDirty;
+	private static long frameNo;
 	/** The cached cascades (all but the nearest) are rebuilt when the sun moves by more than this (cosine of 0.3 degrees), the camera drifts from the centre by more than DRIFT x radius. */
 	private static final double REBUILD_COS = Math.cos(Math.toRadians(0.3)), DRIFT = 0.12, DRIFT_DEPTH = 64.0;
 	/** The snapping quantum of a cached cascade's origin, in texels. */
@@ -203,17 +212,19 @@ public final class OwnShade {
 			System.out.println("mcopt-shaders: on, shadow map " + RES + "x" + RES + " x" + CASCADES + " cascades, distance " + DISTANCE + " blocks, far cascades "
 				+ (CACHE ? "cached" : "every frame"));
 		}
+		frameNo++;
 		if (geomDirty) {
-			for (Casc s : casc) s.version++;
+			for (Casc s : casc) s.dirty = true;
 			geomDirty = false;
 		}
+		if (LOG && frameNo % 240 == 1) System.out.println("mcopt-shaders: sun " + (useSun ? "sun" : "moon") + " elevation " + Math.round(Math.toDegrees(Math.asin(L.y))) + " deg, strength " + strength);
 
 		try (MemoryStack stack = MemoryStack.stackPush()) {
 			long fb = stack.ncalloc(16, 1, FRAME_BYTES);
 			boolean render = OwnProbe.bool("shaders.render", true), far = OwnProbe.bool("shaders.far", true);
 			if (sunOn) {
 				double[] radius = CASCADES == 1 ? new double[] {DISTANCE} : CASCADES == 2 ? new double[] {DISTANCE * 0.3, DISTANCE}
-					: new double[] {DISTANCE * 0.12, DISTANCE * 0.35, DISTANCE};
+					: new double[] {DISTANCE * 0.3, DISTANCE, FAR};
 				double yaw = Math.toRadians(camera.yRot);
 				double fx = -Math.sin(yaw), fz = Math.cos(yaw);
 				double cx = camera.pos.x, cy = camera.pos.y, cz = camera.pos.z;
@@ -225,6 +236,7 @@ public final class OwnShade {
 				for (int c = 0; c < CASCADES; c++) {
 					Casc s = casc[c];
 					double r = radius[c], tw = 2 * r / RES;
+					double DEPTH = CASTER + Math.max(BEYOND, r * 1.05);
 					boolean cached = CACHE && c > 0;
 					if (!cached) {
 						// the nearest cascade: rebuilt every frame, centred ahead of the camera, its origin snapped to texels
@@ -237,7 +249,7 @@ public final class OwnShade {
 					} else {
 						double dR = cx * s.R.x + cy * s.R.y + cz * s.R.z - s.sx, dU = cx * s.U.x + cy * s.U.y + cz * s.U.z - s.sy;
 						double dF = cx * s.F.x + cy * s.F.y + cz * s.F.z - s.sf;
-						if (!s.valid || s.L.dot(L) < REBUILD_COS || Math.abs(dR) > DRIFT * r || Math.abs(dU) > DRIFT * r || Math.abs(dF) > DRIFT_DEPTH) {
+						if (!s.valid || s.L.dot(L) < REBUILD_COS || Math.abs(dR) > DRIFT * r || Math.abs(dU) > DRIFT * r || Math.abs(dF) > Math.max(DRIFT_DEPTH, DRIFT * r)) {
 							// the sun moved or the camera drifted: a new frame, snapped to a multiple of CACHE_QUANTUM texels (centred on the camera: turning does not matter)
 							basis(s, L);
 							double q = tw * CACHE_QUANTUM;
@@ -246,6 +258,12 @@ public final class OwnShade {
 							s.sf = Math.floor((cx * s.F.x + cy * s.F.y + cz * s.F.z) / q) * q;
 							s.valid = true;
 							s.version++;
+							s.dirty = false;
+							s.built = frameNo;
+						} else if (s.dirty && frameNo - s.built >= (c == CASCADES - 1 && c >= 2 ? FAR_GAP : 0)) {
+							s.version++;
+							s.dirty = false;
+							s.built = frameNo;
 						}
 					}
 					double cR = cx * s.R.x + cy * s.R.y + cz * s.R.z, cU = cx * s.U.x + cy * s.U.y + cz * s.U.z, cF = cx * s.F.x + cy * s.F.y + cz * s.F.z;
@@ -325,7 +343,7 @@ public final class OwnShade {
 			MemoryUtil.memPutFloat(fb + 268, CASCADES);
 			MemoryUtil.memPutFloat(fb + 272, AMBIENT_CUT * (useSun ? smooth(0.02f, 0.45f, el) : 0.5f));
 			MemoryUtil.memPutFloat(fb + 276, SOFT);
-			MemoryUtil.memPutFloat(fb + 280, TAPS);
+			MemoryUtil.memPutFloat(fb + 280, HEMI);
 			MemoryUtil.memPutFloat(fb + 284, FILL);
 			OwnNative.shadeFrame(own, k, fb, FRAME_BYTES, 0f, 0f);
 		}

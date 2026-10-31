@@ -1561,7 +1561,7 @@ struct ShadeFrame {
 	float4 info[3];       // x blocks per texel, y 1 / depth range (blocks), z uv margin where the next cascade takes over, w normal offset (blocks)
 	float4 sunDir;        // xyz unit vector to the light that casts shadows, w its strength 0..1 (0: no shadows this frame)
 	float4 sunColor;      // rgb direct light colour x amplitude, w cascade count
-	float4 amb;           // x ambient attenuation at full sun and sky light, y filter radius (blocks), z filter taps, w sky fill
+	float4 amb;           // x ambient attenuation at full sun and sky light, y filter radius (blocks), z hemisphere ambient strength (0: the vanilla face shade stays), w sky fill
 };
 #endif
 
@@ -2270,18 +2270,21 @@ static float3 shNormal(uint face, float3 p, bool foliage) {
 }
 
 // the lit fraction of cascade c at p (camera-relative), geometric normal n with n.l = ndl; edge: the distance to the cascade's border in uv
-static float shCascade(constant ShadeFrame &sf, depth2d_array<float> sm, uint c, float3 p, float3 n, float ndl, float rot, thread float &edge) {
+static float shCascade(constant ShadeFrame &sf, depth2d_array<float> sm, uint c, float3 p, float3 n, float ndl, float rot, int coarse, thread float &edge) {
 	float4 info = sf.info[c];
 	float slope = min(sqrt(max(1.0 - ndl * ndl, 0.0)) / max(ndl, 0.15), 4.0);
 	float4 q = sf.clip[c] * float4(p + n * (info.w * (1.0 + 0.35 * slope)), 1.0);
 	float2 uv = q.xy * 0.5 + 0.5;
 	float2 e = min(uv, 1.0 - uv);
 	edge = min(e.x, e.y);
+	if (edge <= 0.0) return 0.0;  // (outside this cascade: no taps; the caller's blend weight is 0 there too)
+	// beyond the cascade's depth range the map says nothing: lit
+	if (q.z >= 1.0 || q.z <= 0.0) return 1.0;
 	float z = q.z - info.x * (1.25 + 0.75 * slope) * info.y;
 	float radius = max(sf.amb.y * info.z / info.x, 1.2 * info.z);
 	// a disc of TAPS Vogel points (each a hardware 2x2 compare), the first quarter spread over it: when those agree (fully lit or fully
 	// shadowed, nearly every pixel) the rest is skipped
-	const int TAPS = OWN_SHADE_TAPS, STEP = 3;
+	const int TAPS = OWN_SHADE_TAPS, STEP = coarse == 2 ? 6 : 3;
 	float lit = 0.0;
 	for (int i = 0; i < TAPS; i += STEP) {
 		float r = sqrt((float(i) + 0.5) / float(TAPS));
@@ -2289,7 +2292,7 @@ static float shCascade(constant ShadeFrame &sf, depth2d_array<float> sm, uint c,
 		lit += sm.sample_compare(shCmp, uv + float2(cos(a), sin(a)) * (r * radius), c, z);
 	}
 	const float FIRST = float((TAPS + STEP - 1) / STEP);
-	if (lit < 0.001 || lit > FIRST - 0.001) return lit / FIRST;
+	if (coarse != 0 || lit < 0.001 || lit > FIRST - 0.001) return lit / FIRST;  // (coarse: the far cascade, texels of half a block: the spread taps alone)
 	for (int i = 0; i < TAPS; i++) {
 		if (i % STEP == 0) continue;
 		float r = sqrt((float(i) + 0.5) / float(TAPS));
@@ -2299,13 +2302,18 @@ static float shCascade(constant ShadeFrame &sf, depth2d_array<float> sm, uint c,
 	return lit / float(TAPS);
 }
 
-static float shShadow(constant ShadeFrame &sf, depth2d_array<float> sm, float3 p, float3 n, float ndl, float2 pix) {
+static float shShadow(constant ShadeFrame &sf, depth2d_array<float> sm, float3 p, float3 n, float ndl, float2 pix, int coarse) {
 	float rot = shIgn(pix);
 	uint count = uint(sf.sunColor.w);
 	float acc = 0.0, remaining = 1.0;
-	for (uint c = 0; c < count; c++) {
+	// start at the first cascade that can still hold the point: a cascade of half extent r (info.x / info.z / 2: blocks per texel x res / 2) around the camera
+	// (the nearest one centred 0.3 r ahead) misses everything farther than 1.35 r
+	float dist = length(p);
+	uint c0 = 0;
+	while (c0 + 1 < count && dist > 1.35 * 0.5 * sf.info[c0].x / sf.info[c0].z) c0++;
+	for (uint c = c0; c < count; c++) {
 		float edge;
-		float s = shCascade(sf, sm, c, p, n, ndl, rot, edge);
+		float s = shCascade(sf, sm, c, p, n, ndl, rot, coarse == 2 ? 2 : (coarse != 0 || c >= 2 ? 1 : 0), edge);
 		float t = saturate(edge / 0.08);
 		acc += remaining * t * s;
 		remaining *= 1.0 - t;
@@ -2336,16 +2344,28 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 		* getColor(in);
 #ifdef OWN_SHADE
 	if (F_SHADE) {
+		// alpha holes (leaves) leave before any lighting or shadow work (the alpha only ever shrinks in the code below, so this discards exactly what the late test would)
+		if (CUTOUT && color.a < CUTOUT_LIMIT) discard_fragment();
 		float3 n = shNormal(in.shFace, in.shPos, CUTOUT && in.shFace == 6);
 		float4 lm = shLightmap.sample(shLmSmp, float2(in.shLight), level(0.0));
 		float sky = saturate((float(in.shLight.y) - 0.03125) / 0.9375);
 		float access = saturate((sky - 0.35) / 0.55);
 		float ndl = saturate(dot(n, sf.sunDir.xyz));
-		float dir = sf.sunDir.w * access * ndl;
-		float lit = dir > 0.002 ? shShadow(sf, shadowMap, in.shPos, n, ndl, in.pos.xy) : 1.0;
-		// ambient (the vanilla lightmap, partly replaced by the sun) + sun x shadow + a sky fill (up-facing more) that keeps shaded faces near vanilla
-		float fill = sf.amb.w * sf.sunDir.w * access * (0.5 + 0.5 * n.y);
-		color.rgb *= lm.rgb * (1.0 - sf.amb.x * sf.sunDir.w * access) + sf.sunColor.rgb * (dir * lit) + fill;
+		float S = sf.sunDir.w * access;
+		// foliage (cutout) is lit wrapped around the terminator and its ambient lifted (leaves are thin and translucent), terrain is plain N.L
+		const bool foliage = CUTOUT && CUTOUT_LIMIT > 0.2;
+		float dir = S * (foliage ? saturate((ndl + 0.3) / 1.3) : ndl);
+		float lit = dir > 0.002 ? shShadow(sf, shadowMap, in.shPos, n, ndl, in.pos.xy, foliage ? 2 : 0) : 1.0;
+		// the baked vanilla face shade (top 1, bottom 0.5, z 0.8, x 0.6) is replaced, in proportion to the direct light, by a hemisphere
+		// ambient (up 1, side 0.6, down 0.4): the sun supplies the contrast that the old fixed per-face factors faked
+		float vs = in.shFace == 2 ? 1.0 : in.shFace == 3 ? 0.5 : in.shFace < 2 ? 0.6 : in.shFace < 6 ? 0.8 : 1.0;
+		float hemi = n.y >= 0.0 ? 0.6 + 0.4 * n.y : 0.6 + 0.2 * n.y;
+		if (foliage) hemi = mix(hemi, 1.0, 0.45);
+		color.rgb *= mix(1.0, hemi / vs, S * sf.amb.z);
+		// ambient (the vanilla lightmap, partly replaced by the sun, cooler where the sun does not reach) + sun x shadow + a sky fill
+		const float3 cool = float3(0.84, 0.92, 1.0);
+		float fill = sf.amb.w * S * (0.5 + 0.5 * n.y);
+		color.rgb *= lm.rgb * mix(float3(1.0), cool, S * (1.0 - dir * lit) * 0.7) * (1.0 - sf.amb.x * S) + sf.sunColor.rgb * (dir * lit) + fill * cool;
 	}
 #endif
 	// F_LEAN: the chunk visibility is 1 (mix(x, y, 1) is y), the render-distance fog value 0 (max(e, 0) is e for e >= 0)
