@@ -28,7 +28,7 @@ public final class OwnSky {
 	static final float HAZE_CLEAR = Float.parseFloat(System.getProperty("mcopt.shaders.haze", "700"));
 	static final float HAZE_RAIN = Float.parseFloat(System.getProperty("mcopt.shaders.hazeRain", "170"));
 	static final float HAZE_STRENGTH = Float.parseFloat(System.getProperty("mcopt.shaders.hazeStrength", "1.0"));
-	private static final int PARAM_BYTES = 512, LUT_BYTES = 32;
+	private static final int PARAM_BYTES = 512, LUT_BYTES = 32, SH_BYTES = 112;
 
 	/** The dome drew this frame (the shaded terrain may read the table, vanilla's sun and sunrise fan are skipped). */
 	static boolean active;
@@ -206,12 +206,16 @@ public final class OwnSky {
 			slotMs[k] = ms;
 			if (!OwnNative.skyLut(own, enc, k, lp, LUT_BYTES, compute)) throw new IllegalStateException("sky_lut missing");
 			// the sky ambient (mcopt.shaders.ambient.sh): the table projected onto L2 SH when it is rebuilt or the rain (which dims the displayed sky) has changed
+			// the new sky and fog (OwnFog): this frame's values, before the sky ambient (which then follows the same display path as the dome) and the dome
+			if (fog) OwnFog.update();
 			if (AMBIENT_SH && OwnProbe.bool("shaders.ambient.sh", true)) {
-				int key = version * 64 + Math.round(rain * 32f);
+				// (merge: with the skyfog sky the SH samples its display path, skfLin / analytic fog / skfDisp, so the key also follows the fog's state)
+				int key = (version * 64 + Math.round(rain * 32f)) * 2 + (fog ? 1 : 0);
+				if (fog) key = key * 31 + Math.round(OwnFog.v[7] * 2e4f) * 1009 + Math.round(OwnFog.v[6] * 2e4f) * 17 + Math.round(OwnFog.v[1] / 8f);
 				boolean sh = compute || shKey[k] != key || shUnset[k];
 				shKey[k] = key;
 				shUnset[k] = false;
-				long sp = stack.ncalloc(16, 1, 48);
+				long sp = stack.ncalloc(16, 1, SH_BYTES);
 				MemoryUtil.memPutFloat(sp, sinEl);
 				MemoryUtil.memPutFloat(sp + 4, (float) Math.sqrt(Math.max(0, 1 - sinEl * sinEl)));
 				MemoryUtil.memPutFloat(sp + 16, exposure);
@@ -219,7 +223,11 @@ public final class OwnSky {
 				MemoryUtil.memPutFloat(sp + 24, SH_GROUND);
 				for (int c = 0; c < 3; c++) MemoryUtil.memPutFloat(sp + 32 + c * 4L, warmTint[c]);
 				MemoryUtil.memPutFloat(sp + 44, warm);
-				if (!OwnNative.skySh(own, enc, k, sp, 48, sh)) throw new IllegalStateException("sky_sh missing");
+				if (fog) {
+					MemoryUtil.memPutFloat(sp + 28, 1f);  // (SkyShP.misc.w: the skyfog display path)
+					OwnFog.put(sp + 48);                  // (SkyShP.fogA .. fogD)
+				}
+				if (!OwnNative.skySh(own, enc, k, sp, SH_BYTES, sh)) throw new IllegalStateException("sky_sh missing");
 				shReady = true;
 			} else {
 				shReady = false;
@@ -330,8 +338,7 @@ public final class OwnSky {
 			}
 			cloudPrev = clouds;
 			if (fog) {
-				// the new sky and fog (OwnFog; SkyFrame bytes 384..447; the sun disc's boost at sunrise and sunset 448)
-				OwnFog.update();
+				// the new sky and fog (OwnFog; SkyFrame bytes 384..447, updated above; the sun disc's boost at sunrise and sunset 448)
 				OwnFog.put(p + 384);
 				MemoryUtil.memPutFloat(p + 448, OwnFog.SUN_BOOST);
 			}

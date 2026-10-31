@@ -5076,8 +5076,9 @@ kernel void sky_lut(texture2d<float, access::write> out [[texture(0)]], texture2
 // Technique: Ramamoorthi and Hanrahan 2001 (irradiance environment maps); structure after Photon Shaders d4a_generate_sky_sh (c) Benjamin Stott, Photon licence.
 struct SkyShP {
 	float4 sun;    // x sin(sun elevation), y cos, z unused, w unused
-	float4 misc;   // x sky exposure, y rain, z ground albedo, w unused
+	float4 misc;   // x sky exposure, y rain, z ground albedo, w 1: the skyfog sky (-Dmcopt.shaders.skyfog), the display path of the dome's new model (fog* below)
 	float4 warm;   // rgb the sun's colour at the camera (normalised), w how far the sky is pulled toward it
+	float4 fogA, fogB, fogC, fogD;  // (48..111) as SkyFrame's / ShadeFrame's, when misc.w is 1
 };
 
 static float3 skAmbDisp(texture2d<float> lut, float3 V, float3 S, constant SkyShP &P) {
@@ -5087,6 +5088,15 @@ static float3 skAmbDisp(texture2d<float> lut, float3 V, float3 S, constant SkySh
 	float cs = dot(V, S);
 	float e = max(sE, 0.0);
 	float3 rad = lut.sample(skSmp, uv, level(0.0)).rgb * P.misc.x;
+	if (P.misc.w > 0.5) {
+		// the skyfog sky (as sky_fs draws it): the table tinted and scaled to linear, fogged along the ray by the analytic fog (as long as the render distance),
+		// the fog's colour with the Mie halo, then the soft display curve; overcast as the dome
+		float wM;
+		float3 T = skfT(P.fogA, P.fogB, e, P.fogA.w, wM);
+		float3 L = skfLin(rad, S.y, P.fogD.w);
+		float3 Lh = skfHaze(lut, V, S, P.misc.x, P.fogC, P.fogD.w, wM);
+		return skOvercast(skfDisp(L * T + Lh * (1.0 - T)), P.misc.y);
+	}
 	return skOvercast(skWarm(skTone(skLift(skBlue(rad, e, cs, S.y, P.misc.y), e, S.y, cs)), P.warm), P.misc.y);
 }
 

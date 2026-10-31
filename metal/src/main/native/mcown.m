@@ -2734,12 +2734,12 @@ int mcs_sky_lut(Own *w, Enc *enc, int k, const void *p, int length, int compute)
 }
 
 // The sky ambient's SH coefficients of ring slot k (terrain.metal sky_sh): projects the displayed sky of the table of slot k, in the pre command buffer after
-// mcs_sky_lut. compute 0: the slot still holds them. p: a SkyShP (48 bytes).
+// mcs_sky_lut. compute 0: the slot still holds them. p: a SkyShP (48 or 112 bytes).
 int mcs_sky_sh(Own *w, Enc *enc, int k, const void *p, int length, int compute) {
 	id<MTLComputePipelineState> pso = ownLazyKernel(w, &sk.shPso, "sky_sh");
 	id<MTLTexture> t = sk.lut[k % SKY_RING];
 	id<MTLBuffer> b = sk.sh[k % SKY_RING];
-	if (!pso || !t || !b || length > 64) return 0;
+	if (!pso || !t || !b || length > 128) return 0;  // (SkyShP: 48 bytes, 112 with the skyfog sky's fog block)
 	if (compute) {
 		mc_pre_end_encoders(enc);
 		@autoreleasepool {
