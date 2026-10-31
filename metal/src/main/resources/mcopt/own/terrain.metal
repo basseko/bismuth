@@ -1578,6 +1578,11 @@ struct ShadeFrame {
 	float4 haze;          // x aerial perspective density (1 / blocks), y haze strength 0..1 (0: vanilla's fog colour), z sky exposure, w height falloff (1 / blocks)
 	float4 sunTrue;       // xyz the true sun direction (the sky look-up table's azimuth origin), w rain
 	float4 skyWarm;       // rgb the sun's colour at the camera (normalised), w how far the sky is pulled toward it (a low sun's aerosol glow)
+	// -Dmcopt.shaders.skyfog (OwnFog; bytes 368..431, the same four float4 as SkyFrame's at 384): the analytic height fog
+	float4 fogA;          // x camera height above the Rayleigh layer's base (blocks), y above the Mie layer's, z 1: the analytic fog is on, w the dome's ray length (render distance)
+	float4 fogB;          // rgb Rayleigh extinction (1 / block at the layer's base), w Mie extinction
+	float4 fogC;          // rgb the sun's light colour for the Mie halo (phase x this), w unused
+	float4 fogD;          // rgb unused, w the display gain of the linear sky radiance
 };
 #endif
 
@@ -2431,6 +2436,69 @@ static float3 skHaze(texture2d<float> lut, float3 dir, float3 sunDir, float expo
 	float3 h = skOvercast(skWarm(skTone(skLift(skBlue(lut.sample(skSmp, skUvS(dir.xz, sy, sunDir), level(0.0)).rgb * exposure, sy, dot(dir, sunDir), sunDir.y, rain), sy, sunDir.y, dot(dir, sunDir))), warm), rain);
 	return h * mix(float3(1.0), float3(0.9, 0.96, 1.06), skMorn(sunDir.y) * (1.0 - rain));  // (the far hills of a morning go a little blue, not white)
 }
+
+// ---- sky model and fog (-Dmcopt.shaders.skyfog; OwnFog): one tone curve for the sky and the scene, twilight tints, analytic height fog ----
+// The table's radiance (now with the multiple scattering table) is turned linear -> display by a soft shoulder and a square root: the same gamma-2 encoding
+// the terrain's colours are in, so post_fs's one curve (decode, ACES, encode) treats sky and scene alike, instead of the sky's own 1 - exp(-x) first.
+// The fog is closed form (two exponential height falloffs: Rayleigh with a 30 block half-life, Mie with 7), after the public technique of analytic
+// exponential height fog (Quilez 2010, "Better fog"); the Mie phase is the Henyey-Greenstein pair of Photon Shaders' analytic air fog with four
+// multiple-scattering octaves (adapted from Photon Shaders (c) Benjamin Stott, Photon licence).
+static float3 skfTint(float sy) {
+	// the sun's light tint of a morning / evening (peaking at a sun height of 0.17 to 0.40) and of the blue hour (Photon's light_color.glsl constants)
+	float bh = saturate((exp(-190.0 * (sy + 0.09604) * (sy + 0.09604)) - 0.05) * (1.0 / 0.95));
+	float p = smoothstep(0.05, 0.17, sy) * (1.0 - smoothstep(0.40, 0.60, sy));
+	return mix(float3(1.0), float3(1.05, 0.84, 0.93) * 1.2, p * p) * mix(float3(1.0), float3(0.95, 0.80, 1.0), bh) * (1.0 + 2.0 * bh);
+}
+
+static float3 skfLin(float3 rad, float sy, float gain) {
+	float3 c = rad * skfTint(sy);
+	float lum = dot(c, float3(0.3, 0.59, 0.11));
+	return max(mix(float3(lum), c, 1.1), 0.0) * gain;  // (a mild saturation boost)
+}
+
+static float3 skfDisp(float3 L) {
+	L = max(L, 0.0);
+	float3 s = select(L, 0.8 + 0.2 * (1.0 - exp(-(L - 0.8) * 5.0)), L > 0.8);  // (a soft shoulder: no hard clip into the 8-bit target)
+	return sqrt(s);
+}
+
+static float skfAirmass(float h, float k, float dy, float len) {
+	float hk = max(h * k, -1.5);  // (below the layer's base the density is capped at 4.5 times: a cave or a valley floor is not an infinite fog)
+	float x = max(k * dy * len, -2.0);
+	float g = abs(x) < 1e-3 ? 1.0 - 0.5 * x : (1.0 - exp(-x)) / x;
+	return exp(-hk) * len * g;
+}
+
+// the transmittance along a ray of `len` blocks in direction y-component dy, and the Mie share of the optical depth
+static float3 skfT(float4 A, float4 B, float dy, float len, thread float &wM) {
+	float aR = skfAirmass(A.x, 0.0231049, dy, len), aM = skfAirmass(A.y, 0.0990210, dy, len);
+	float3 tR = B.rgb * aR;
+	float tM = B.w * aM;
+	wM = tM / max(dot(tR, float3(0.3333333)) + tM, 1e-6);
+	return exp(-(tR + tM));
+}
+
+static float skfHG(float c, float g) {
+	float d = 1.0 + g * g - 2.0 * g * c;
+	return (1.0 - g * g) * rsqrt(d) / d;  // (normalised so that an isotropic phase is 1)
+}
+
+static float skfPhase(float c) {
+	float s = 0.0, a = 1.0, g = 1.0;
+	for (int i = 0; i < 4; i++) {
+		s += a * (0.7 * skfHG(c, 0.5 * g) + 0.3 * skfHG(c, -0.2 * g));
+		a *= 0.5;
+		g *= 0.7;
+	}
+	return s * (1.0 / 1.875);
+}
+
+// the fog's colour (linear) toward dir: the table's sky a little above the horizon in that azimuth, plus the sun's Mie halo
+static float3 skfHaze(texture2d<float> lut, float3 dir, float3 sunDir, float exposure, float4 C, float gain, float wM) {
+	float sy = clamp(dir.y, 0.025, 0.29);
+	float3 rad = lut.sample(skSmp, skUvS(dir.xz, sy, sunDir), level(0.0)).rgb * exposure;
+	return skfLin(rad, sunDir.y, gain) + C.rgb * (wM * skfPhase(dot(dir, sunDir)));
+}
 #endif
 
 #ifdef OWN_WATER
@@ -2657,6 +2725,7 @@ static float3 wSkyAt(float3 d, float3 horizon, constant WaterFrame &wf, constant
 	if (F_SHADE) {
 		float e = max(d.y, 0.012);
 		float3 rad = lut.sample(skSmp, skUvS(d.xz, e, sf.sunTrue.xyz), level(0.0)).rgb * sf.haze.z;
+		if (sf.fogA.z > 0.5) return skOvercast(skfDisp(skfLin(rad, sf.sunTrue.y, sf.fogD.w)), sf.sunTrue.w) * wf.skyTop.w;
 		return skOvercast(skWarm(skTone(skLift(skBlue(rad, e, dot(d, sf.sunTrue.xyz), sf.sunTrue.y, sf.sunTrue.w), e, sf.sunTrue.y, dot(d, sf.sunTrue.xyz))), sf.skyWarm), sf.sunTrue.w) * wf.skyTop.w;
 	}
 	return skyRadiance(d, horizon, wf);
@@ -2926,12 +2995,24 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 		// aerial perspective (milestone 3): in air the fog's colour is the sky's own colour toward the pixel (the table, the same the dome draws), and an
 		// exponential extinction thickens the haze with distance (the stronger of it and vanilla's linear fog, which still fades the render distance's edge)
 		float dist = length(in.shPos);
+		if (sf.fogA.z > 0.5) {
+			// the analytic height fog (-Dmcopt.shaders.skyfog): per channel transmittance, the sky's own colour (and the sun's Mie halo) as the in-scatter
+			float3 dir = in.shPos / max(dist, 1e-3);
+			float wM;
+			float3 T = skfT(sf.fogA, sf.fogB, dir.y, dist, wM);
+			if (any(T < 0.996) || fogValue > 0.004) {
+				float3 hz = skOvercast(skfDisp(skfHaze(skLut, dir, sf.sunTrue.xyz, sf.haze.z, sf.fogC, sf.fogD.w, wM)), sf.sunTrue.w);
+				color.rgb = mix(color.rgb, hz, 1.0 - T);
+				fogRgb = hz;  // (vanilla's render distance fade goes to the same colour)
+			}
+		} else {
 		float hv = (1.0 - exp(-dist * sf.haze.x)) * sf.haze.y;
 		if (hv > 0.004 || fogValue > 0.004) {  // (near the camera the haze is nothing: skip the table lookup and the colour maths)
 			float3 hz = skHaze(skLut, in.shPos / max(dist, 1e-3), sf.sunTrue.xyz, sf.haze.z, sf.sunTrue.w, sf.skyWarm);
 			fogRgb = mix(fogRgb, hz, sf.haze.y);
 		}
 		fogValue = max(fogValue, hv);
+		}
 	}
 #endif
 #ifdef OWN_WTILE
@@ -4353,7 +4434,7 @@ kernel void bloom_clear(texture2d<float, access::write> dst [[texture(0)]], uint
 // absorption and a cheap isotropic multiple scattering term (Hillaire 2020), a Cornette-Shanks / Henyey-Greenstein Mie phase.
 struct SkyLutP {
 	float4 sun;    // x sin(sun elevation), y cos, z camera altitude (km), w sun intensity
-	float4 misc;   // x multiple scattering factor
+	float4 misc;   // x multiple scattering factor, y 1: the multiple scattering table (texture 1) replaces the isotropic term
 };
 
 constant float SK_RG = 6360.0, SK_RT = 6420.0;
@@ -4386,7 +4467,52 @@ static float3 skOptical(float3 p, float3 d, float len, int n) {
 	return tau;
 }
 
-kernel void sky_lut(texture2d<float, access::write> out [[texture(0)]], constant SkyLutP &P [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+// The multiple scattering table (Hillaire 2020, "A Scalable and Production Ready Sky and Atmosphere Rendering Technique"): for a sun cosine at a point (u) and the
+// point's altitude (v, quadratic), the isotropic second order in-scatter Psi = L2 / (1 - fms) of the whole sphere of directions (64) around it: L2 the mean single
+// scattered radiance with an isotropic phase (plus the ground's bounce), fms the mean fraction scattered again. Independent of the sun's elevation and of the
+// camera: computed once (32 x 32), read by sky_lut at every step of its march.
+kernel void sky_ms(texture2d<float, access::write> out [[texture(0)]], uint2 gid [[thread_position_in_grid]]) {
+	if (gid.x >= 32 || gid.y >= 32) return;
+	float cS = (float(gid.x) + 0.5) / 32.0 * 2.0 - 1.0, v = (float(gid.y) + 0.5) / 32.0;
+	float h = v * v * 60.0;
+	float3 S = float3(sqrt(max(1.0 - cS * cS, 0.0)), cS, 0.0);
+	float3 o = float3(0.0, SK_RG + max(h, 0.002), 0.0);
+	float3 lum = float3(0.0), fms = float3(0.0);
+	const int ND = 64, NS = 16;
+	for (int d = 0; d < ND; d++) {
+		float z = 1.0 - (2.0 * float(d) + 1.0) / float(ND), r = sqrt(max(1.0 - z * z, 0.0)), ph = float(d) * 2.3999632;
+		float3 V = float3(r * cos(ph), z, r * sin(ph));
+		float tAtm = skHit(o, V, SK_RT), tG = skHit(o, V, SK_RG);
+		bool hitG = V.y < 0.0 && tG > 0.0;
+		float tMax = hitG ? tG : tAtm, dt = tMax / float(NS);
+		float3 tauV = float3(0.0), X = float3(0.0), F = float3(0.0);
+		for (int i = 0; i < NS; i++) {
+			float3 p = o + V * ((float(i) + 0.5) * dt);
+			float dr, dm;
+			float3 ext = skExtinction(length(p) - SK_RG, dr, dm);
+			float3 Tv = exp(-(tauV + 0.5 * ext * dt));
+			tauV += ext * dt;
+			float3 sc = SK_BR * dr + float3(SK_BMS * dm);
+			float vis = skHit(p, S, SK_RG) > 0.0 ? 0.0 : 1.0;
+			float3 Ts = exp(-skOptical(p, S, skHit(p, S, SK_RT), 4));
+			X += Tv * sc * Ts * (vis * dt);
+			F += Tv * sc * dt;
+		}
+		float3 L1 = X * 0.0795775;
+		if (hitG) {
+			float3 pg = o + V * tG, up = normalize(pg);
+			float nl = max(dot(up, S), 0.0);
+			L1 += exp(-tauV) * exp(-skOptical(pg, S, skHit(pg, S, SK_RT), 4)) * (nl * 0.3 * 0.3183099);
+		}
+		lum += L1;
+		fms += F;
+	}
+	lum *= 1.0 / float(ND);
+	fms *= 1.0 / float(ND);
+	out.write(float4(lum / max(1.0 - fms, 0.05), 1.0), gid);
+}
+
+kernel void sky_lut(texture2d<float, access::write> out [[texture(0)]], texture2d<float> msT [[texture(1)]], constant SkyLutP &P [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
 	uint W = out.get_width(), H = out.get_height();
 	if (gid.x >= W || gid.y >= H) return;
 	float u = (float(gid.x) + 0.5) / float(W), v = (float(gid.y) + 0.5) / float(H);
@@ -4418,9 +4544,14 @@ kernel void sky_lut(texture2d<float, access::write> out [[texture(0)]], constant
 		float3 sc = SK_BR * dr, sm = float3(SK_BMS * dm);
 		float lit = skHit(p, S, SK_RG) > 0.0 ? 0.0 : 1.0;
 		L += Tv * (sc * phR + sm * phM) * Ts * (lit * dt);
-		Lms += Tv * (sc + sm) * Ts * dt;
+		if (P.misc.y > 0.5) {
+			float rp = length(p);
+			Lms += Tv * (sc + sm) * msT.sample(skSmp, float2(dot(p, S) / rp * 0.5 + 0.5, sqrt(saturate((rp - SK_RG) * (1.0 / 60.0)))), level(0.0)).rgb * dt;
+		} else {
+			Lms += Tv * (sc + sm) * Ts * dt * 0.0795775;
+		}
 	}
-	float3 c = (L + Lms * (0.0795775 * P.misc.x)) * P.sun.w;
+	float3 c = (L + Lms * P.misc.x) * P.sun.w;
 	out.write(float4(c, 1.0), gid);
 }
 
@@ -4441,6 +4572,14 @@ struct SkyFrame {
 	float4 pRight;
 	float4 pUp;
 	float4 cloudT;    // x this frame's quarter (0..3: which pixel of each 2 x 2 is marched), y 1: the previous frame's cloud target is valid (texture 3)
+	float4 reservedClouds[8];  // bytes 256..383: the clouds track's
+	// bytes 384..511: the sky model and fog (OwnFog, -Dmcopt.shaders.skyfog)
+	float4 fogA;      // as ShadeFrame's: x, y the camera's height above the Rayleigh / Mie layer, z 1: the new sky and fog are on, w the render distance
+	float4 fogB;
+	float4 fogC;
+	float4 fogD;      // w the display gain
+	float4 skf;       // x sun disc boost, y..w unused
+	float4 skfReserved[3];
 };
 
 
@@ -4581,14 +4720,27 @@ fragment float4 sky_fs(SkyV in [[stage_in]], constant SkyFrame &f [[buffer(0)]],
 		cl = 0.25 * (cloudTex.sample(skSmp, cuv + tx * float2(-1.0, -1.0), level(0.0)) + cloudTex.sample(skSmp, cuv + tx * float2(1.0, -1.0), level(0.0))
 			+ cloudTex.sample(skSmp, cuv + tx * float2(-1.0, 1.0), level(0.0)) + cloudTex.sample(skSmp, cuv + tx * float2(1.0, 1.0), level(0.0)));
 	}
+	float3 sky;
+	if (f.fogA.z > 0.5) {
+		// the new sky model: the table (with its multiple scattering) tinted by the twilight constants, fogged by the same analytic fog as the terrain with the ray
+		// as long as the render distance, then one soft curve: none of the compensating patches (skBlue, skLift, the violet of the twilight) is needed
+		float wM;
+		float3 T = skfT(f.fogA, f.fogB, e, f.fogA.w, wM);
+		float3 L = skfLin(rad, S.y, f.fogD.w);
+		float3 Lh = skfHaze(lut, dir, S, exposure, f.fogC, f.fogD.w, wM);
+		L = L * T + Lh * (1.0 - T);
+		sunTerm *= T * mix(1.0, 1.0 + f.skf.x, 1.0 - smoothstep(0.0, 0.35, S.y));
+		sky = skfDisp(L);
+	} else {
 	float3 c = skLift(skBlue(rad, e, cs, S.y, f.sunCol.w), e, S.y, cs);
 	// twilight: away from a low sun the sky is violet and pink (the Earth's shadow band), not the sun's orange: the warm desaturation fades there and a violet cast
 	// takes its place (OwnSky.horizon, the CPU twin for the haze, is left as it is)
 	float anti = saturate(0.85 - 0.85 * cs) * (1.0 - f.sunCol.w);
 	float twi = (1.0 - smoothstep(0.0, 0.25, S.y)) * smoothstep(-0.14, -0.02, S.y);
-	float3 sky = skWarm(skTone(c), float4(f.sunCol.rgb / max(max(f.sunCol.r, f.sunCol.g), max(f.sunCol.b, 1e-3)), f.cloudAmb.w * (1.0 - 0.85 * twi * anti)));
+	sky = skWarm(skTone(c), float4(f.sunCol.rgb / max(max(f.sunCol.r, f.sunCol.g), max(f.sunCol.b, 1e-3)), f.cloudAmb.w * (1.0 - 0.85 * twi * anti)));
 	sky *= mix(float3(1.0), float3(1.7, 0.9, 1.75), twi * anti * smoothstep(-0.1, 0.2, e));
 	sky += float3(0.17, 0.10, 0.22) * (twi * anti * smoothstep(-0.05, 0.3, e));  // (the Earth's shadow band is dim but not black: BSL's twilight sky is a clear violet)
+	}
 	// night: a faint blue gradient where the sun's light has faded
 	float3 nightC = mix(f.nightH.rgb, f.night.rgb, saturate(e * 2.5)) * f.night.w;
 	sky = sky + nightC * (1.0 - sky);

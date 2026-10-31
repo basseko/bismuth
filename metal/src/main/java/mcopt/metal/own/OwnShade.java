@@ -45,7 +45,7 @@ public final class OwnShade {
 	static final float SUN_AMP = Float.parseFloat(System.getProperty("mcopt.shaders.sunAmp", "0.72"));
 	/** The light-space depth range: blocks toward the light that still cast, and beyond the box's centre plane. */
 	private static final double CASTER = 320.0, BEYOND = 192.0;
-	private static final int FRAME_BYTES = 368, CULL_BYTES = 160, CULLFRAME_BYTES = 144, DRAW_BYTES = OwnTerrain.DRAW_FRAME_BYTES;
+	private static final int FRAME_BYTES = 432, CULL_BYTES = 160, CULLFRAME_BYTES = 144, DRAW_BYTES = OwnTerrain.DRAW_FRAME_BYTES;
 
 	/** This frame draws the shaded terrain variant (set by {@link #frame}; read at the one choke point, OwnNative.draw). */
 	static boolean frameActive;
@@ -376,6 +376,11 @@ public final class OwnShade {
 			MemoryUtil.memPutFloat(fb + 348, OwnSky.rain);
 			for (int c = 0; c < 3; c++) MemoryUtil.memPutFloat(fb + 352 + c * 4L, OwnSky.warmTint[c]);
 			MemoryUtil.memPutFloat(fb + 364, OwnSky.warm);
+			// the sky model and fog (OwnFog): bytes 368..431
+			if (haze && OwnFog.active()) {
+				OwnFog.update();
+				OwnFog.put(fb + 368);
+			}
 			OwnNative.shadeFrame(own, k, fb, FRAME_BYTES, 0f, 0f);
 			// milestone 5: entities and items (vanilla pipelines) take the same block and shadow map; cascade 0 also takes their casters
 			if (EntityShade.ON && OwnProbe.bool("shaders.entities", true)) EntityShade.publish(fb, k, sunOn && render);
