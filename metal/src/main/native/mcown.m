@@ -522,7 +522,8 @@ static id<MTLFunction> ownStage(Own *w, int kind, int vertex, char *err, int err
 		fogvert = (kind >> 14) & 1, fogvertAll = (kind >> 15) & 1, fogvertT = (kind >> 13) & 1,  // (bits 14, 15, 13: F_FOGVERT, F_FOGVERT_ALL, F_FOGVERT_T)
 		qflat = (kind >> 12) & 1,  // (bit 12, a1Exact: F_QFLAT, the vertex stage reads its unit and quad from the per-quad table)
 		group = vertex == 1 && ((kind >> 11) & 1),  // (bit 11, -Dmcopt.own.frag.vGroup: F_GROUP, instances of several units)
-		shade = (kind >> 8) & 1;  // (bit 8, -Dmcopt.shaders: F_SHADE, constant 30)
+		shade = (kind >> 8) & 1,  // (bit 8, -Dmcopt.shaders: F_SHADE, constant 30)
+		water = (kind >> 10) & 1;  // (bit 10, -Dmcopt.shaders.water: F_WATER, constant 35)
 	NSString *name = vertex == 2 ? ((kind >> 29) & 1 ? @"own_mesh_q" : (kind >> 23) & 1 ? @"own_mesh4" : @"own_mesh") : vertex ? @"own_vs" : oracle ? @"own_fs_oracle"
 		: frag == 10 ? @"own_fs_nofog"
 		: frag == 9 ? @"own_fs_nofade"
@@ -530,8 +531,9 @@ static id<MTLFunction> ownStage(Own *w, int kind, int vertex, char *err, int err
 		: frag == 7 ? @"own_fs_pos"
 		: frag == 6 ? @"own_fs_alpha"
 		: frag == 2 ? @"own_fs_flat" : @"own_fs";
-	NSString *key = [NSString stringWithFormat:@"%@ %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d%@", name, vertex ? vsMode | translucent << 2 | quads << 3 : frag, half, lean, nonidx,
-		rev, tight, posonly, occA, occB, (kind >> 29) & 1, oracle, fogvert, fogvertAll, fogvertT, qflat, group ? (shade ? @" g s" : @" g") : shade ? @" s" : @""];
+	NSString *key = [NSString stringWithFormat:@"%@ %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d%@%@", name, vertex ? vsMode | translucent << 2 | quads << 3 : frag, half, lean, nonidx,
+		rev, tight, posonly, occA, occB, (kind >> 29) & 1, oracle, fogvert, fogvertAll, fogvertT, qflat, group ? (shade ? @" g s" : @" g") : shade ? @" s" : @"",
+		water ? @" w" : @""];
 	id<MTLFunction> fn = w->functions[key];
 	if (fn) return fn;
 	MTLFunctionConstantValues *cv = [[MTLFunctionConstantValues new] autorelease];
@@ -551,6 +553,7 @@ static id<MTLFunction> ownStage(Own *w, int kind, int vertex, char *err, int err
 	[cv setConstantValue:&fogvertT type:MTLDataTypeBool atIndex:20];
 	if (group) [cv setConstantValue:&group type:MTLDataTypeBool atIndex:25];
 	if (shade) [cv setConstantValue:&shade type:MTLDataTypeBool atIndex:30];
+	if (water) [cv setConstantValue:&water type:MTLDataTypeBool atIndex:35];
 	if (vertex) {
 		bool cmp = w->compact != 0, fatv = w->fat != 0, clipv = w->cpuClip != 0, tr = translucent != 0;
 		[cv setConstantValue:&cmp type:MTLDataTypeBool atIndex:1];
@@ -606,7 +609,7 @@ static id<MTLRenderPipelineState> ownPipeline(Own *w, Enc *enc, int cutout, char
 		pd.fragmentFunction = frag == 6 ? w->fsAlpha : frag == 5 ? w->fsCutoutLevel : frag == 4 ? w->fsSolidLevel : frag == 3 ? w->fsTranslucent : frag == 2 ? w->fsFlat
 			: frag ? w->fsCutout : w->fsSolid;
 		// (bit 12, a1Exact / a2Exact's table draw: its vertex stage must be the F_QFLAT variant; a plain one would read the table as a list)
-		if ((cutout & ((0x1f << 18) | (0x3f << 25) | (7 << 13) | (1 << 12) | (1 << 11) | (3 << 8))) || frag >= 8) {  // (kinds 8-10: own_fs_tex / _nofade / _nofog, made only as variants)
+		if ((cutout & ((0x1f << 18) | (0x3f << 25) | (7 << 13) | (1 << 12) | (1 << 11) | (7 << 8))) || frag >= 8) {  // (kinds 8-10: own_fs_tex / _nofade / _nofog, made only as variants)
 			// frag variants: both stages specialized alike (the vertex outputs and fragment inputs must match)
 			pd.vertexFunction = ownStage(w, cutout, 1, err, errCap);
 			// (K_SHADOW: the solid caster has no fragment stage at all, the cutout one is own_fs_alpha's alpha test)
@@ -671,6 +674,28 @@ static id<MTLRenderPipelineState> ownPipeline(Own *w, Enc *enc, int cutout, char
 		k->pso = pso;
 		return pso;
 	}
+}
+
+// ---- shaders: water (-Dmcopt.shaders.water; OwnWater) ----
+// kind bit 10 (K_WATER): function constant 35. The water frame block (terrain.metal WaterFrame) is bound at fragment buffer 12, the scene behind the water
+// (the opaque pass's colour and depth, stored by the split mcs_water_split) at fragment textures 25 and 26, the lightmap at 17 as in the shaded variant.
+// Without a scene (no split this frame) 1 x 1 dummies are bound and the block's flags say so.
+static struct {
+	uint8_t frame[384];
+	int frameLen;
+	id<MTLTexture> scene, depth;        // this frame's scene (nil: none)
+	id<MTLTexture> copyCol, copyDepth;  // mcs_water_split's copy mode: a copy of the pass's colour and depth
+	id<MTLTexture> dummyCol, dummyDepth;
+} wat;
+
+extern int mc_tl_restart_ok(Enc *enc);
+
+static void ownBindWater(id<MTLRenderCommandEncoder> r, id<MTLTexture> light, id<MTLSamplerState> lightSampler) {
+	[r setFragmentBytes:wat.frame length:(NSUInteger) wat.frameLen atIndex:12];
+	[r setFragmentTexture:wat.scene ?: wat.dummyCol atIndex:25];
+	[r setFragmentTexture:wat.depth ?: wat.dummyDepth atIndex:26];
+	[r setFragmentTexture:light atIndex:17];
+	[r setFragmentSamplerState:lightSampler atIndex:15];
 }
 
 // The frag occlusion's mesh-stage resources for a draw of kind (bit 27 phase A, 28 phase B; bit 0 the layer): terrain.metal FragOcc.
@@ -836,6 +861,7 @@ drawCall:
 		[r setFragmentTexture:light atIndex:17];
 		[r setFragmentSamplerState:lightSampler atIndex:15];
 	}
+	if (cutout & (1 << 10)) ownBindWater(r, light, lightSampler);
 	if (w->vcount && !mesh) [r setVertexBuffer:w->vcount offset:0 atIndex:28];
 	if (cutout & (1 << 30)) {
 		// the visibility oracle: the drawn units (vertex stage) and the units with a visible pixel (fragment stage), this sample's number
@@ -2294,6 +2320,79 @@ int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int le
 		[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 		[r popDebugGroup];
 		w->lastPso = nil;
+	}
+	return 1;
+}
+
+// ---- shaders: water (-Dmcopt.shaders.water; OwnWater) ----
+
+// This frame's WaterFrame block (terrain.metal; fragment buffer 12 of K_WATER draws). Also makes the 1 x 1 dummy scene textures.
+void mcs_water_frame(Own *w, const void *bytes, int length) {
+	if (length > (int) sizeof wat.frame) length = (int) sizeof wat.frame;
+	memcpy(wat.frame, bytes, (size_t) length);
+	wat.frameLen = length;
+	if (!wat.dummyCol) {
+		@autoreleasepool {
+			MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
+			d.usage = MTLTextureUsageShaderRead;
+			d.storageMode = MTLStorageModePrivate;
+			wat.dummyCol = [w->ctx->device newTextureWithDescriptor:d];
+			wat.dummyCol.label = @"shade water dummy colour";
+			d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:1 height:1 mipmapped:NO];
+			d.usage = MTLTextureUsageShaderRead;
+			d.storageMode = MTLStorageModePrivate;
+			wat.dummyDepth = [w->ctx->device newTextureWithDescriptor:d];
+			wat.dummyDepth.label = @"shade water dummy depth";
+		}
+	}
+}
+
+// A copy texture of src's size and format (made again when they change).
+static id<MTLTexture> watCopyTex(Own *w, id<MTLTexture> *slot, id<MTLTexture> src, NSString *label) {
+	id<MTLTexture> t = *slot;
+	if (t && t.width == src.width && t.height == src.height && t.pixelFormat == src.pixelFormat) return t;
+	[t release];
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:src.width height:src.height mipmapped:NO];
+	d.usage = MTLTextureUsageShaderRead;
+	d.storageMode = MTLStorageModePrivate;
+	t = [w->ctx->device newTextureWithDescriptor:d];
+	t.label = label;
+	*slot = t;
+	return t;
+}
+
+// The split before the translucent draw: the open render encoder (the world pass on `target`, the main colour) ends with colour and depth stored and
+// reopens with both loaded, so what the opaque pass drew is in memory for the water's pixels to read (the stale contents: this pass's later writes stay in
+// tile memory until it ends). copy 0: those very textures are bound at 25 / 26 (the cheapest; reading an attachment is formally undefined, and works because
+// the tile's writes reach memory only at the end of the pass); copy 1: a blit of both into textures of their own first (about one more colour + depth round
+// trip of bandwidth). Returns 1 done (the scene is bound by the following K_WATER draws), 0 the pass has the wrong shape (nothing was changed),
+// -1 the attachments cannot be read as textures (nothing changed).
+int mcs_water_split(Own *w, Enc *enc, id<MTLTexture> target, int copy) {
+	wat.scene = nil;
+	wat.depth = nil;
+	if (!enc->render || enc->colorCount != 1 || !enc->colors[0] || enc->colors[0] != target || !enc->depth || mc_tl_restart_ok(enc) != 0) return 0;
+	if (!(enc->colors[0].usage & MTLTextureUsageShaderRead) || !(enc->depth.usage & MTLTextureUsageShaderRead)) return -1;
+	@autoreleasepool {
+		id<MTLTexture> col = enc->colors[0], dep = enc->depth;
+		id<MTLComputeCommandEncoder> c = mc_render_suspend(enc);
+		if (copy) {
+			[c endEncoding];
+			[c release];
+			id<MTLTexture> cc = watCopyTex(w, &wat.copyCol, col, @"shade water scene colour");
+			id<MTLTexture> cd = watCopyTex(w, &wat.copyDepth, dep, @"shade water scene depth");
+			id<MTLBlitCommandEncoder> b = [enc->cmd blitCommandEncoder];
+			b.label = @"shade water scene copy";
+			[b copyFromTexture:col toTexture:cc];
+			[b copyFromTexture:dep toTexture:cd];
+			[b endEncoding];
+			mc_render_resume(enc, nil);
+			wat.scene = cc;
+			wat.depth = cd;
+		} else {
+			mc_render_resume(enc, c);
+			wat.scene = col;
+			wat.depth = dep;
+		}
 	}
 	return 1;
 }
