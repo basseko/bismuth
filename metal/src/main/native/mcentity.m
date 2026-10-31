@@ -5,6 +5,7 @@
 //   cast:    mce_begin opens a depth-only render pass on slice `slice` of that map in the pre command buffer, loading what the terrain's shadow pass
 //            wrote there, and returns an Enc the usual mc_r_* calls encode into; mce_end closes it.
 #import "mcmetal.h"
+#import "mce.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -49,12 +50,13 @@ void mce_bind(Enc *enc) {
 			d.usage = MTLTextureUsageShaderRead;
 			d.storageMode = MTLStorageModePrivate;
 			ent.dummy = [enc->ctx->device newTextureWithDescriptor:d];
+			mce_make_resident(ent.dummy);
 			ent.dummy.label = @"shade entity dummy shadow map";
 		}
 		t = ent.dummy;
 	}
-	[r setFragmentBytes:ent.on ? ent.block : zero length:MCE_BLOCK atIndex:29];
-	[r setFragmentTexture:t atIndex:24];
+	mce_set_fragment_bytes(r, ent.on ? ent.block : zero, MCE_BLOCK, 29);
+	mce_set_fragment_texture(r, t, 24);
 }
 
 // A depth-only render pass on `slice` of the shadow map (contents loaded) in the pre command buffer; the Enc to encode into (NULL: no shadow map).
@@ -75,14 +77,14 @@ Enc *mce_begin(Enc *enc, int slice) {
 		rp.depthAttachment.slice = (NSUInteger) slice;
 		rp.depthAttachment.loadAction = MTLLoadActionLoad;
 		rp.depthAttachment.storeAction = MTLStoreActionStore;
-		id<MTLRenderCommandEncoder> r = [mc_pre(enc) renderCommandEncoderWithDescriptor:rp];
+		id<MTLRenderCommandEncoder> r = mce_new_render_encoder(mc_pre(enc), rp);
 		if (!r) return NULL;
 		[r retain];
-		r.label = [NSString stringWithFormat:@"shade entity shadow c%d", slice];
-		[r setViewport:(MTLViewport) {0, 0, (double) map.width, (double) map.height, 0, 1}];
-		[r setDepthClipMode:MTLDepthClipModeClamp];
-		[r setDepthStencilState:ent.depthLess];
-		[r setCullMode:MTLCullModeNone];
+		[mce_raw(r) setLabel:[NSString stringWithFormat:@"shade entity shadow c%d", slice]];
+		[mce_raw(r) setViewport:(MTLViewport) {0, 0, (double) map.width, (double) map.height, 0, 1}];
+		[mce_raw(r) setDepthClipMode:MTLDepthClipModeClamp];
+		[mce_raw(r) setDepthStencilState:ent.depthLess];
+		[mce_raw(r) setCullMode:MTLCullModeNone];
 		Enc *f = calloc(1, sizeof(Enc));
 		f->ctx = enc->ctx;
 		f->render = r;
@@ -96,7 +98,7 @@ Enc *mce_begin(Enc *enc, int slice) {
 
 void mce_end(Enc *f) {
 	if (!f) return;
-	[f->render endEncoding];
+	mce_end_encoder(f->render);
 	[f->render release];
 	free(f);
 }
