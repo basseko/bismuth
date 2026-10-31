@@ -2549,10 +2549,20 @@ static float4 wSsr(float3 p, float3 r, float jitter, constant WaterFrame &wf, te
 	return float4(scene.sample(wLin, qh * wf.screen.zw, level(0.0)).rgb, conf);
 }
 
+// the sky seen along d: the milestone 3 table (the shaded variant has it) or the zenith-to-horizon blend of the frame block
+static float3 wSkyAt(float3 d, float3 horizon, constant WaterFrame &wf, constant ShadeFrame &sf, texture2d<float> lut) {
+	if (F_SHADE) {
+		float e = max(d.y, 0.012);
+		float3 rad = lut.sample(skSmp, skUvS(d.xz, e, sf.sunTrue.xyz), level(0.0)).rgb * sf.haze.z;
+		return skOvercast(skWarm(skTone(skLift(rad, e, sf.sunTrue.y)), sf.skyWarm), sf.sunTrue.w) * wf.skyTop.w;
+	}
+	return skyRadiance(d, horizon, wf);
+}
+
 // The water surface: tint = the vertex colour (the biome's water colour, no light in it), lm the lightmap at the quad, access its sky exposure 0..1, gnRaw the
 // derivative normal of the position (taken by the caller in uniform control flow). rgb and the alpha the blend applies (1 with a scene to refract).
 static float4 waterSurface(VOut in, float3 gnRaw, float3 tint, float3 lm, float access, constant WaterFrame &wf, constant Fog &fog,
-	texture2d<float> scene, depth2d<float, access::read> sdepth) {
+	texture2d<float> scene, depth2d<float, access::read> sdepth, constant ShadeFrame &sf, texture2d<float> lut) {
 	const uint flags = uint(wf.misc.w);
 	float3 p = in.shPos;
 	float dist = max(length(p), 1e-3);
@@ -2579,7 +2589,7 @@ static float4 waterSurface(VOut in, float3 gnRaw, float3 tint, float3 lm, float 
 	float3 r = reflect(v, Nf);
 	if (!vertical && !below && r.y < 0.015) r = normalize(float3(r.x, 0.015, r.z));
 	float3 horizon = fog.FogColor.rgb;
-	float3 refl = below ? horizon : skyRadiance(r, horizon, wf) * mix(0.25, 1.0, access);
+	float3 refl = below ? horizon : wSkyAt(r, horizon, wf, sf, lut) * mix(0.25, 1.0, access);
 	if ((flags & 1u) != 0u && wf.misc.z > 0.5 && F > 0.04) {
 		float4 h = wSsr(p, r, shIgn(in.pos.xy), wf, scene, sdepth);
 		refl = mix(refl, h.rgb, h.w);
@@ -2591,7 +2601,7 @@ static float4 waterSurface(VOut in, float3 gnRaw, float3 tint, float3 lm, float 
 	if (below) {
 		// from under the surface: the sky through the window (refracted), total internal reflection of the scene beyond the critical angle
 		float3 rt = refract(v, Nf, 1.33);
-		float3 sky = dot(rt, rt) > 1e-6 ? skyRadiance(rt, horizon, wf) * float3(0.55, 0.80, 0.90) * mix(0.3, 1.0, access) : refl;
+		float3 sky = dot(rt, rt) > 1e-6 ? wSkyAt(rt, horizon, wf, sf, lut) * float3(0.55, 0.80, 0.90) * mix(0.3, 1.0, access) : refl;
 		col = mix(sky, refl, F);
 	} else {
 		float3 tintN = tint / max(max(tint.r, tint.g), max(tint.b, 0.01));
@@ -2617,6 +2627,7 @@ static float4 waterSurface(VOut in, float3 gnRaw, float3 tint, float3 lm, float 
 				}
 			}
 			float3 bed = scene.sample(wLin, uv, level(0.0)).rgb;
+			bed = mix(bed, float3(dot(bed, float3(0.3, 0.59, 0.11))), 0.35) * 0.62;  // (a lit bed seen through water is duller and greyer than in air)
 			float3 T = exp(-wf.sigma.rgb * dUse);
 			trans = bed * T + scatter * (1.0 - T);
 		} else {
@@ -2685,7 +2696,7 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 		}
 		if (isWater) {
 			float access = saturate((skyw - 0.35) / 0.55);
-			color = waterSurface(in, gnRaw, color.rgb, lmw, access, wf, fog, wScene, wDepth);
+			color = waterSurface(in, gnRaw, color.rgb, lmw, access, wf, fog, wScene, wDepth, sf, skLut);
 		} else if (translucent && !F_SHADE) {
 			color.rgb *= lmw;  // (the vertex stage left the lightmap out of the colour, as in the shaded variant)
 		}

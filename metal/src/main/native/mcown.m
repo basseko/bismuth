@@ -2569,12 +2569,12 @@ int mcs_water_split(Own *w, Enc *enc, id<MTLTexture> target, int copy) {
 		if (copy) {
 			[c endEncoding];
 			[c release];
-			id<MTLTexture> cc = watCopyTex(w, &wat.copyCol, col, @"shade water scene colour");
-			id<MTLTexture> cd = watCopyTex(w, &wat.copyDepth, dep, @"shade water scene depth");
+			id<MTLTexture> cc = (copy & 1) ? watCopyTex(w, &wat.copyCol, col, @"shade water scene colour") : col;
+			id<MTLTexture> cd = (copy & 2) ? watCopyTex(w, &wat.copyDepth, dep, @"shade water scene depth") : dep;
 			id<MTLBlitCommandEncoder> b = [enc->cmd blitCommandEncoder];
 			b.label = @"shade water scene copy";
-			[b copyFromTexture:col toTexture:cc];
-			[b copyFromTexture:dep toTexture:cd];
+			if (copy & 1) [b copyFromTexture:col toTexture:cc];
+			if (copy & 2) [b copyFromTexture:dep toTexture:cd];
 			[b endEncoding];
 			mc_render_resume(enc, nil);
 			wat.scene = cc;

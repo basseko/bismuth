@@ -48,12 +48,18 @@ public final class OwnWater {
 	/** Split the world pass for the scene's colour and depth (false: no scene, the fallback look). */
 	static final boolean SPLIT = !"false".equals(System.getProperty("mcopt.shaders.water.split"));
 	/** Blit colour and depth at the split instead of reading the attachments themselves. */
-	static final boolean COPY = Boolean.getBoolean("mcopt.shaders.water.copy");
+	static final int COPY = "false".equals(System.getProperty("mcopt.shaders.water.copy")) ? 0 : "both".equals(System.getProperty("mcopt.shaders.water.copy")) ? 3 : "depth".equals(System.getProperty("mcopt.shaders.water.copy")) ? 2 : 1;
 	/** Keep vanilla's blue screen overlay under water. */
 	public static final boolean OVERLAY = Boolean.getBoolean("mcopt.shaders.water.overlay");
 	static final float WAVES = prop("mcopt.shaders.water.waves", 0.6f), ABSORB = prop("mcopt.shaders.water.absorb", 1.0f), GLITTER = prop("mcopt.shaders.water.glitter", 0.7f),
 		BODY = prop("mcopt.shaders.water.body", 1.0f), SKY = prop("mcopt.shaders.water.sky", 1.0f), MURK = prop("mcopt.shaders.water.murk", 1.0f),
 		CAUSTIC = prop("mcopt.shaders.water.caustic", 0.5f), THICK = prop("mcopt.shaders.water.thick", 0.6f);
+	static final float[] FOG = parse3(System.getProperty("mcopt.shaders.water.fog", "0.20,0.27,0.28"));
+
+	private static float[] parse3(String s) {
+		String[] p = s.split(",");
+		return new float[] {Float.parseFloat(p[0]), Float.parseFloat(p[1]), Float.parseFloat(p[2])};
+	}
 	private static final int FRAME_BYTES = 320;
 	/** kind bit 10 */
 	static final int K_WATER = 1 << 10;
@@ -131,7 +137,7 @@ public final class OwnWater {
 			surface = true;
 			if (!said) {
 				said = true;
-				System.out.println("mcopt-shaders: water on (" + (scene ? "split pass, " + (COPY ? "scene copied" : "scene read in place") + ", " + (STEPS > 0 ? "SSR " + STEPS + " steps" : "no SSR")
+				System.out.println("mcopt-shaders: water on (" + (scene ? "split pass, " + (COPY == 0 ? "scene read in place" : "scene copied: " + (COPY == 1 ? "colour" : COPY == 2 ? "depth" : "colour and depth")) + ", " + (STEPS > 0 ? "SSR " + STEPS + " steps" : "no SSR")
 					: "no scene") + ")");
 			}
 		} catch (RuntimeException | LinkageError e) {
@@ -208,8 +214,8 @@ public final class OwnWater {
 			float rb = clear, grey = (top[0] * 0.3f + top[1] * 0.59f + top[2] * 0.11f) * (0.75f + 0.25f * rb);
 			for (int c = 0; c < 3; c++) top[c] = (grey + (top[c] - grey) * (0.4f + 0.6f * rb)) * (0.7f + 0.3f * rb);
 			put4(b + 160, top[0], top[1], top[2], SKY);
-			put4(b + 176, 0.34f * ABSORB, 0.10f * ABSORB, 0.07f * ABSORB, 48.0f);
-			put4(b + 192, 0.16f, 0.26f, 0.31f, BODY);
+			put4(b + 176, 0.50f * ABSORB, 0.24f * ABSORB, 0.18f * ABSORB, 48.0f);
+			put4(b + 192, 0.20f, 0.27f, 0.31f, BODY);
 			put4(b + 208, (float) mod(camera.pos.x, 1024.0), (float) mod(camera.pos.y, 1024.0), (float) mod(camera.pos.z, 1024.0), (float) mod(System.nanoTime() * 1e-9, 4096.0));
 			put4(b + 224, w, h, 1.0f / w, 1.0f / h);
 			float[] rc = rects();
@@ -242,9 +248,11 @@ public final class OwnWater {
 	 */
 	public static Vector3fc fogColor(Vector3fc c) {
 		float day = Math.max(0.0f, Math.min(1.0f, (OwnLight.el + 0.15f) / 0.5f));
-		float k = (0.45f + 0.55f * day) * (1.0f - 0.35f * Math.min(1, OwnLight.rain));
-		// (mild: the grade's underwater row (OwnLight) was fitted against vanilla's colour; the murk is mostly the medium's absorption in the terrain shader)
-		return new Vector3f(c.x() * 0.85f * k, c.y() * 1.0f * k, c.z() * 0.90f * k);
+		float k = (0.35f + 0.65f * day) * (1.0f - 0.35f * Math.min(1, OwnLight.rain));
+		// a teal-grey (BSL's murk) taking a little of the biome's water colour (vanilla's is a saturated (0.2, 0.2, 1)); the grade's underwater row is mild
+		float m = Math.max(0.05f, (c.x() + c.y() + c.z()) / 3.0f);
+		float tr = 0.90f + 0.10f * c.x() / m, tg = 0.90f + 0.10f * c.y() / m, tb = 0.90f + 0.10f * c.z() / m;
+		return new Vector3f(FOG[0] * tr * k, FOG[1] * tg * k, FOG[2] * tb * k);
 	}
 
 	/** Whether the data mixins (fog colour, the screen overlay) apply this frame. */

@@ -98,11 +98,11 @@ public final class OwnLight {
 			grade[LIFT + 2] = Math.max(grade[LIFT + 2], 0.06f * r);
 		}
 		if (inWater) {
-			grade[EXPO] *= 0.75f;
-			grade[SAT] *= 0.72f;
-			grade[GAIN] *= 0.72f;
-			grade[GAIN + 1] *= 0.72f;
-			grade[GAIN + 2] *= 0.40f;
+			grade[EXPO] *= 0.9f;
+			grade[SAT] *= 0.85f;
+			grade[GAIN] *= 0.9f;
+			grade[GAIN + 1] *= 0.95f;
+			grade[GAIN + 2] *= 0.9f;
 		}
 	}
 

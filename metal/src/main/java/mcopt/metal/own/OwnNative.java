@@ -91,9 +91,9 @@ final class OwnNative {
 	}
 
 	/** The split before the translucent draw (mcs_water_split): 1 done, 0 the open pass is not the plain main pass, -1 its attachments are not shader readable. */
-	static int waterSplit(long own, long enc, long target, boolean copy) {
+	static int waterSplit(long own, long enc, long target, int copy) {
 		try {
-			return (int) WATER_SPLIT.invokeExact(own, enc, target, copy ? 1 : 0);
+			return (int) WATER_SPLIT.invokeExact(own, enc, target, copy);
 		} catch (Throwable t) {
 			throw rethrow(t);
 		}
