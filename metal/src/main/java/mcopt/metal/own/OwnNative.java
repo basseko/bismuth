@@ -70,6 +70,7 @@ final class OwnNative {
 
 	private static final MethodHandle SKY_INIT = OwnShade.ON ? fn("mcs_sky_init", false, JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_INT) : null;
 	private static final MethodHandle SKY_LUT = OwnShade.ON ? fn("mcs_sky_lut", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT) : null;
+	private static final MethodHandle SKY_COV = OwnShade.ON ? fn("mcs_sky_cov", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT) : null;
 	private static final MethodHandle SKY_CLOUDS = OwnShade.ON ? fn("mcs_sky_clouds", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_INT) : null;
 	private static final MethodHandle SKY_DRAW = OwnShade.ON ? fn("mcs_sky_draw", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT) : null;
 	// water (-Dmcopt.shaders.water): mcown.m mcs_water_*
@@ -148,6 +149,15 @@ final class OwnNative {
 	static boolean skyLut(long own, long enc, int k, long params, int length, boolean compute) {
 		try {
 			return (int) SKY_LUT.invokeExact(own, enc, k, params, length, compute ? 1 : 0) == 1;
+		} catch (Throwable t) {
+			throw rethrow(t);
+		}
+	}
+
+	/** The clouds track: the coverage map (mcs_sky_cov), computed in the pre command buffer before the cloud pass. */
+	static boolean skyCov(long own, long enc, long params, int length) {
+		try {
+			return (int) SKY_COV.invokeExact(own, enc, params, length) == 1;
 		} catch (Throwable t) {
 			throw rethrow(t);
 		}

@@ -28,7 +28,7 @@ public final class OwnSky {
 	static final float HAZE_CLEAR = Float.parseFloat(System.getProperty("mcopt.shaders.haze", "700"));
 	static final float HAZE_RAIN = Float.parseFloat(System.getProperty("mcopt.shaders.hazeRain", "170"));
 	static final float HAZE_STRENGTH = Float.parseFloat(System.getProperty("mcopt.shaders.hazeStrength", "1.0"));
-	private static final int PARAM_BYTES = 256, LUT_BYTES = 32;
+	private static final int PARAM_BYTES = 384, LUT_BYTES = 32;
 
 	/** The dome drew this frame (the shaded terrain may read the table, vanilla's sun and sunrise fan are skipped). */
 	static boolean active;
@@ -160,6 +160,7 @@ public final class OwnSky {
 	public static boolean draw() {
 		active = false;
 		boolean cloudsBefore = cloudPrev;
+		shadowK = 0f;
 		cloudPrev = false;  // (set again below once this frame's clouds are drawn: a frame without them breaks the history)
 		if (!ON || failed || !OwnProbe.bool("shaders", true) || !OwnProbe.bool("shaders.sky", true)) return false;
 		OwnTerrain t = OwnShade.lastOwner;
@@ -248,17 +249,50 @@ public final class OwnSky {
 			put3(p, 96, nightFog[0], nightFog[1], nightFog[2]);
 			MemoryUtil.memPutFloat(p + 108, exposure);
 			if (clouds) {
-				int cw = Math.max(64, (int) Math.ceil(screenW() / (double) CLOUD_DIV)), ch = Math.max(64, (int) Math.ceil(screenH() / (double) CLOUD_DIV));
+				// the clouds track: the coverage map (one bilinear sample per density evaluation, and the terrain's cloud shadows), shaped and lit clouds, accumulated history
+				boolean wantMap = OwnProbe.bool("shaders.clouds.map", MAP) && (OwnProbe.bool("shaders.clouds.shape", SHAPE) || OwnProbe.bool("shaders.clouds.shadows", SHADOWS));
+				boolean shape = OwnProbe.bool("shaders.clouds.shape", SHAPE), accum = ACCUM && OwnProbe.bool("shaders.clouds.accum", true);
+				// the camera's turn since the last cloud frame: fast turns shorten the history and march more pixels per frame
+				float turn = cloudView[0] * -view.m02() + cloudView[1] * -view.m12() + cloudView[2] * -view.m22();
+				float fast = cloudPrev0 ? smooth(0.002f, 0.02f, (float) Math.acos(Math.max(-1f, Math.min(1f, turn)))) : 0f;
+				int div = accum ? ACCUM_DIV : CLOUD_DIV;
+				int cw = Math.max(64, (int) Math.ceil(screenW() / (double) div)), ch = Math.max(64, (int) Math.ceil(screenH() / (double) div));
+				MemoryUtil.memPutFloat(p + 256, COV_R);
+				MemoryUtil.memPutFloat(p + 272, LIGHT_GAIN);
+				MemoryUtil.memPutFloat(p + 276, ACCUM_AGE + (3.0f - ACCUM_AGE) * fast);
+				MemoryUtil.memPutFloat(p + 280, (float) ((frameCtr++ * 0.6180339887) % 1.0));
+				MemoryUtil.memPutFloat(p + 288, (float) (cam.pos.x - cloudPos[0]));
+				MemoryUtil.memPutFloat(p + 292, (float) (cam.pos.y - cloudPos[1]));
+				MemoryUtil.memPutFloat(p + 296, (float) (cam.pos.z - cloudPos[2]));
+				MemoryUtil.memPutFloat(p + 304, (float) (time * WIND - cloudWind[0]));
+				MemoryUtil.memPutFloat(p + 308, (float) (time * WIND * 0.3 - cloudWind[1]));
+				cloudWind[0] = time * WIND;
+				cloudWind[1] = time * WIND * 0.3;
+				boolean covOk = false;
+				if (wantMap) {
+					MemoryUtil.memPutFloat(p + 260, 0f);
+					covOk = OwnNative.skyCov(own, enc, p, PARAM_BYTES);
+				}
+				shape &= covOk;
+				MemoryUtil.memPutFloat(p + 260, (shape ? 1f : 0f) + (accum ? 2f : 0f));
+				MemoryUtil.memPutFloat(p + 264, fast > 0.5f ? 2f : ACCUM_N);
+				if (covOk && OwnProbe.bool("shaders.clouds.shadows", SHADOWS)) {
+					shadowK = SHADOW_STRENGTH * (1.0f - rain);
+					shadowCover = cover;
+					shadowDens = 1.0f + rain;
+				}
 				// temporal: a quarter of the pixels marched per frame, the rest reprojected from the previous frame's target (same size, drawn last frame, no jump)
-				boolean hist = TEMPORAL && OwnProbe.bool("shaders.clouds.temporal", true) && cloudsBefore && cw == cloudW && ch == cloudH
+				boolean hist = TEMPORAL && OwnProbe.bool("shaders.clouds.temporal", true) && cloudsBefore && cw == cloudW && ch == cloudH && accum == cloudAccum
 					&& Math.abs(cam.pos.x - cloudPos[0]) + Math.abs(cam.pos.y - cloudPos[1]) + Math.abs(cam.pos.z - cloudPos[2]) < 16.0;
 				for (int i = 0; i < 12; i++) MemoryUtil.memPutFloat(p + 192 + i * 4 + (i / 3) * 4, cloudView[i]);
-				MemoryUtil.memPutFloat(p + 240, (float) (cloudPhase++ & 3));
+				MemoryUtil.memPutFloat(p + 240, (float) (cloudPhase++ % (accum ? 144 : 4)));
 				MemoryUtil.memPutFloat(p + 244, hist ? 1f : 0f);
 				if (!OwnNative.skyClouds(own, enc, k, p, PARAM_BYTES, cw, ch)) throw new IllegalStateException("cloud target missing");
 				for (int i = 0; i < 12; i++) cloudView[i] = MemoryUtil.memGetFloat(p + i * 4 + (i / 3) * 4);
 				cloudW = cw;
 				cloudH = ch;
+				cloudAccum = accum;
+				cloudPrev0 = true;
 				cloudPos[0] = cam.pos.x;
 				cloudPos[1] = cam.pos.y;
 				cloudPos[2] = cam.pos.z;
@@ -294,6 +328,28 @@ public final class OwnSky {
 	private static final float[] cloudView = new float[12];
 	private static final double[] cloudPos = new double[3];
 	private static int cloudW, cloudH, cloudPhase;
+	private static boolean cloudAccum, cloudPrev0;
+	private static final double[] cloudWind = new double[2];
+	private static long frameCtr;
+
+	// ---- the clouds track (sub-flags: .map the coverage map, .shape shaped and lit clouds, .accum the accumulated higher-resolution target, .shadows cloud shadows on terrain) ----
+	static final boolean MAP = !"false".equals(System.getProperty("mcopt.shaders.clouds.map"));
+	static final boolean SHAPE = !"false".equals(System.getProperty("mcopt.shaders.clouds.shape"));
+	static final boolean ACCUM = !"false".equals(System.getProperty("mcopt.shaders.clouds.accum"));
+	static final boolean SHADOWS = !"false".equals(System.getProperty("mcopt.shaders.clouds.shadows"));
+	static final float COV_R = Float.parseFloat(System.getProperty("mcopt.shaders.clouds.mapRadius", "9000"));
+	static final float LIGHT_GAIN = Float.parseFloat(System.getProperty("mcopt.shaders.clouds.gain", "0.8"));
+	static final float SHADOW_STRENGTH = Float.parseFloat(System.getProperty("mcopt.shaders.clouds.shadowStrength", "0.8"));
+	/** The accumulated target is the screen divided by this; one pixel of each N x N block is marched per frame; the history holds up to ACCUM_AGE samples. */
+	static final int ACCUM_DIV = Integer.getInteger("mcopt.shaders.clouds.divAccum", 3);
+	static final int ACCUM_N = Integer.getInteger("mcopt.shaders.clouds.check", 3);
+	static final float ACCUM_AGE = Float.parseFloat(System.getProperty("mcopt.shaders.clouds.age", "12"));
+	/** This frame's cloud shadow state for the terrain (OwnShade.writeFrame): strength 0 = none. */
+	static float shadowK, shadowCover, shadowDens;
+
+	static float cloudMid() {
+		return 0.5f * (CLOUD_Y0 + CLOUD_Y1);
+	}
 	private static boolean cloudPrev;
 
 	private static int screenW() {

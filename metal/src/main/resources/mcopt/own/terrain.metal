@@ -1566,7 +1566,7 @@ constant bool F_WATER = false;
 constant bool F_SHW = F_SHADE;
 #endif
 
-// the per-frame block at fragment buffer 30 (OwnShade.writeFrame mirrors this layout, 288 bytes)
+// the per-frame block at fragment buffer 30 (OwnShade.writeFrame mirrors this layout, 672 bytes)
 struct ShadeFrame {
 	float4x4 clip[3];     // camera-relative world -> cascade clip (orthographic, standard Z; y as drawn is the negative of what is sampled)
 	float4 info[3];       // x blocks per texel, y 1 / depth range (blocks), z uv margin where the next cascade takes over, w normal offset (blocks)
@@ -1578,7 +1578,44 @@ struct ShadeFrame {
 	float4 haze;          // x aerial perspective density (1 / blocks), y haze strength 0..1 (0: vanilla's fog colour), z sky exposure, w height falloff (1 / blocks)
 	float4 sunTrue;       // xyz the true sun direction (the sky look-up table's azimuth origin), w rain
 	float4 skyWarm;       // rgb the sun's colour at the camera (normalised), w how far the sky is pulled toward it (a low sun's aerosol glow)
+	float4 _otherTracks[17];  // bytes 368..639: reserved for the other shader tracks
+	float4 cloudShA;      // (640) x the cloud layer's middle height above the camera (blocks), y cloud shadow strength 0..1 (0: off), z the coverage map's radius R (blocks), w coverage 0..1
+	float4 cloudShB;      // (656) x softness (as SkyFrame.cloudC.z), y density multiplier, z, w unused
 };
+
+// ---- clouds: the 2D coverage map (cloud_cov kernel) shared by the sky's march and the terrain's cloud shadows ----
+constexpr sampler skCov(coord::normalized, filter::linear, address::clamp_to_edge);
+
+// the cloud's density from a coverage-map sample s (x the 2D shape, y the detail), carved by the height fraction hf (0 base .. 1 top): only thick coverage reaches
+// the top (domed tops, wispy bottoms) (after Photon's altitude shaping, adapted from Photon Shaders (c) Benjamin Stott, Photon licence)
+static float cvDens(float2 s, float cover, float soft, float hf, float lod) {
+	if (hf <= 0.0 || hf >= 1.0) return 0.0;
+	float d = saturate((s.x - (1.0 - cover) + s.y * 0.28 * (1.0 - 0.5 * hf) * lod) * soft);
+	d -= smoothstep(0.2, 1.0, hf) * 0.6;
+	d = max(d, 0.0) * smoothstep(0.0, 0.2, hf);
+	d = mix(d, saturate(d * 1.7), hf);  // (edge sharpening: soft at the base, defined at the top)
+	return d * smoothstep(1.0, 0.8, hf);
+}
+
+// the coverage map's uv of a horizontal offset from the camera (the map is radially distorted: r = R u^2, more texels near the player)
+static float2 cvUv(float2 off, float R) {
+	return 0.5 + 0.5 * off * rsqrt(max(length(off) * R, 1e-3));
+}
+
+// the sun's transmittance through the clouds above a point (camera-relative position rel): the coverage map read where the ray to the sun crosses the layer
+static float cvShadow(texture2d<float> cv, constant ShadeFrame &sf, float3 rel) {
+	float el = sf.sunTrue.y;
+	float fadeEl = smoothstep(0.14, 0.4, el);
+	if (fadeEl <= 0.0) return 1.0;
+	float t = (sf.cloudShA.x - rel.y) / el;
+	if (t <= 0.0) return 1.0;
+	float2 off = rel.xz + sf.sunTrue.xz * t;
+	float R = sf.cloudShA.z;
+	float far = 1.0 - smoothstep(0.35, 0.9, length(off) / R);
+	float2 s = cv.sample(skCov, cvUv(off, R), level(0.0)).rg;
+	float d = cvDens(s, sf.cloudShA.w, sf.cloudShB.x, 0.5, 0.0) * sf.cloudShB.y;
+	return 1.0 - sf.cloudShA.y * fadeEl * far * smoothstep(0.02, 0.5, d);
+}
 #endif
 
 struct VOut {
@@ -2812,7 +2849,8 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 #ifdef OWN_SHADE
 	, constant ShadeFrame &sf [[buffer(30), function_constant(F_SHADE)]], depth2d_array<float> shadowMap [[texture(24), function_constant(F_SHADE)]],
 	texture2d<float> shLightmap [[texture(17), function_constant(F_SHW)]], sampler shLmSmp [[sampler(15), function_constant(F_SHW)]],
-	texture2d<float> skLut [[texture(25), function_constant(F_SHADE)]]
+	texture2d<float> skLut [[texture(25), function_constant(F_SHADE)]],
+	texture2d<float> cvMap [[texture(29), function_constant(F_SHADE)]]
 #ifdef OWN_WATER
 	, constant WaterFrame &wf [[buffer(12), function_constant(F_WATER)]], texture2d<float> wScene [[texture(27), function_constant(F_WATER)]],
 	texture2d<float, access::read> wDepth [[texture(28), function_constant(F_WATER)]]
@@ -2882,6 +2920,7 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 		const bool foliage = CUTOUT && CUTOUT_LIMIT > 0.2;
 		float dir = S * (foliage ? saturate((ndl + 0.3) / 1.3) : ndl);
 		float lit = dir > 0.002 ? shShadow(sf, shadowMap, in.shPos, n, ndl, in.pos.xy, foliage ? 2 : 0) : 1.0;
+		if (dir > 0.002 && sf.cloudShA.y > 0.0) lit *= cvShadow(cvMap, sf, in.shPos);  // (cloud shadows)
 		// the baked vanilla face shade (top 1, bottom 0.5, z 0.8, x 0.6) is replaced, in proportion to the direct light, by a hemisphere
 		// ambient (up 1, side 0.6, down 0.4): the sun supplies the contrast that the old fixed per-face factors faked
 		float vs = in.shFace == 2 ? 1.0 : in.shFace == 3 ? 0.5 : in.shFace < 2 ? 0.6 : in.shFace < 6 ? 0.8 : 1.0;
@@ -4441,6 +4480,15 @@ struct SkyFrame {
 	float4 pRight;
 	float4 pUp;
 	float4 cloudT;    // x this frame's quarter (0..3: which pixel of each 2 x 2 is marched), y 1: the previous frame's cloud target is valid (texture 3)
+	// (256..383: the clouds track)
+	float4 cloudM0;   // x the coverage map's radius R (blocks), y flags (bit 0 shaped clouds from the coverage map, bit 1 accumulated history), z checker size N, w unused
+	float4 cloudM1;   // x light gain, y the history's maximum age (samples), z this frame's jitter 0..1, w unused
+	float4 cloudM2;   // xyz the camera's movement since the previous cloud frame (world, blocks), w unused
+	float4 cloudM3;   // xy the wind offset's change since the previous cloud frame (blocks), zw unused
+	float4 cloudM4;
+	float4 cloudM5;
+	float4 cloudM6;
+	float4 cloudM7;
 };
 
 
@@ -4523,6 +4571,120 @@ static float4 skClouds(texture2d<float> nz, float3 dir, constant SkyFrame &f, fl
 	return float4(col * fade, (1.0 - T) * fade);
 }
 
+
+// ---- clouds track: the coverage map, shaped clouds, accumulated history ----
+
+// The 2D shape and detail of the cloud layer around the camera (512 x 512 RG16F): x the shape (what skCloudDensity's first noise gives), y the detail (second
+// noise, centred). Radially distorted, r = R rho^2, so that the clouds near the player get the texels. The march then needs one bilinear sample per point.
+// the noise with a quintic interpolation done in full float on four texel reads (the hardware's bilinear weights have 8 bits: contour steps in the smooth coverage)
+static float4 skNoiseF(texture2d<float> nz, float2 uv) {
+	int2 sz = int2(nz.get_width(), nz.get_height());
+	float2 q = uv * float2(sz) - 0.5, i = floor(q), fr = q - i;
+	fr = fr * fr * fr * (fr * (fr * 6.0 - 15.0) + 10.0);
+	int2 a = int2(i) & (sz - 1), b = (a + 1) & (sz - 1);
+	float4 v00 = nz.read(uint2(a)), v10 = nz.read(uint2(b.x, a.y)), v01 = nz.read(uint2(a.x, b.y)), v11 = nz.read(uint2(b));
+	return mix(mix(v00, v10, fr.x), mix(v01, v11, fr.x), fr.y);
+}
+
+kernel void cloud_cov(texture2d<float, access::write> out [[texture(0)]], texture2d<float> nz [[texture(1)]], constant SkyFrame &f [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+	uint W = out.get_width(), H = out.get_height();
+	if (gid.x >= W || gid.y >= H) return;
+	float2 q = (float2(gid) + 0.5) / float2(W, H) * 2.0 - 1.0;
+	float2 off = q * (f.cloudM0.x * length(q));
+	float2 uv = (off + f.cloudB.zw + f.cloudB.xy) * (1.0 / 1500.0);
+	float4 n = skNoiseF(nz, uv);
+	float4 m = skNoiseF(nz, uv * 3.3 + 0.37);
+	out.write(float4(n.r * 0.7 + n.g * 0.3, m.r - 0.5, 0.0, 0.0), gid);
+}
+
+static float skCvD(texture2d<float> cov, float2 off, constant SkyFrame &f, float hf, float lod) {
+	float2 s = cov.sample(skCov, cvUv(off, f.cloudM0.x), level(0.0)).rg;
+	return cvDens(s, f.cloudA.z, f.cloudC.z, hf, lod) * f.cloudA.w;
+}
+
+static float skHgN(float c, float g) {
+	return (1.0 - g * g) / (12.566 * pow(1.0 + g * g - 2.0 * g * c, 1.5));
+}
+
+// the single scattering phase: a forward lobe (the larger of a narrow and a wide Henyey-Greenstein) and a weak backward one (adapted from Photon Shaders
+// (c) Benjamin Stott, Photon licence, sky/clouds/common.glsl)
+static float skPhase1(float c) {
+	return 0.8 * max(0.45 * skHgN(c, 0.93), skHgN(c, 0.8)) + 0.2 * skHgN(c, -0.2);
+}
+
+// the shaped clouds: density from the coverage map carved by height, a light march of 5 doubling steps, a 4 octave multiple scattering approximation (each
+// octave: scattering x0.55, extinction x0.4, phase anisotropy x0.8), the powder term, aerial perspective toward the clear sky
+static float4 skClouds2(texture2d<float> cov, float3 dir, constant SkyFrame &f, float3 sunDir, float3 ambCol, float3 skyClear, float jit0) {
+	float y0 = f.cloudA.x, y1 = f.cloudA.y, cy = f.cloudC.x;
+	float fade = smoothstep(0.012, 0.1, dir.y) * (1.0 - smoothstep(y0 - 30.0, y0 + 10.0, cy));
+	if (fade <= 0.0) return float4(0.0);
+	float t0 = max(y0 - cy, 1.0) / dir.y, t1 = (y1 - cy) / dir.y;
+	int N = int(mix(14.0, 6.0, smoothstep(0.1, 0.7, dir.y)));  // (fewer steps toward the zenith)
+	float dt = (t1 - t0) / float(N);
+	float lod = 1.0 - smoothstep(600.0, 2500.0, t0);
+	float H = y1 - y0;
+	float cosS = dot(dir, sunDir);
+	float ph0 = skPhase1(cosS);
+	float rain = f.sunCol.w;
+	float3 sunC = f.cloudSun.rgb;
+	float3 twVio = float3(0.62, 0.36, 0.58) * (1.0 - smoothstep(0.0, 0.25, sunDir.y)) * smoothstep(-0.14, -0.02, sunDir.y) * (1.0 - rain);
+	float lowSun = (1.0 - smoothstep(0.0, 0.3, sunDir.y)) * smoothstep(-0.08, 0.0, sunDir.y) * (1.0 - rain);
+	float T = 1.0, tAcc = 0.0, wAcc = 0.0;
+	float3 col = float3(0.0);
+	for (int i = 0; i < N; i++) {
+		float t = t0 + (float(i) + jit0) * dt;
+		float2 off = dir.xz * t;
+		float hf = (cy + dir.y * t - y0) / H;
+		float d = skCvD(cov, off, f, hf, lod);
+		if (d > 0.003) {
+			// the sunlight that reaches the point: 5 samples toward the sun, each step twice the one before
+			float od = 0.0, sp = 0.0;
+			for (int j = 0; j < 5; j++) {
+				float stp = 14.0 * float(1 << j);
+				float sd = sp + 0.5 * stp;
+				od += skCvD(cov, off + sunDir.xz * sd, f, hf + sunDir.y * sd / H, lod) * stp * (j == 4 ? 1.5 : 1.0);
+				sp += stp;
+			}
+			od *= 0.04;
+			float3 L = float3(0.0);
+			float a = 1.0, b = 1.0, c = 1.0;
+			float sunL = 0.0;
+			for (int o = 0; o < 4; o++) {
+				float ph = o == 0 ? ph0 : skHgN(cosS, 0.8 * c);
+				sunL += a * exp(-od * b) * ph;
+				a *= 0.55;
+				b *= 0.4;
+				c *= 0.8;
+			}
+			float powder = mix(1.6 * d / (d + 0.15), 1.0, 0.8 * (cosS * 0.5 + 0.5) * (cosS * 0.5 + 0.5));
+			sunL *= 12.566 * f.cloudM1.x * powder;
+			sunL = mix(sunL, 0.45, 0.5 * lowSun);
+			float3 c3 = sunC * sunL + ambCol * (0.55 + 0.45 * hf) * (0.8 + 0.2 * exp(-od * 0.5));
+			c3 += twVio * (0.4 + 0.6 * hf);
+			c3 += sunC * (0.6 * lowSun * (1.0 - 0.4 * hf));
+			c3 = mix(c3, float3(0.50, 0.55, 0.58) * (0.8 + 0.2 * hf), rain * 0.9);
+			float al = 1.0 - exp(-d * min(dt, 140.0) * 0.07);
+			float w = T * al;
+			col += w * c3;
+			tAcc += w * t;
+			wAcc += w;
+			T *= 1.0 - al;
+			if (T < 0.05) break;  // (early exit)
+		}
+	}
+	float alpha = 1.0 - T;
+	// aerial perspective: the far clouds fade toward the clear sky
+	float tHit = tAcc / max(wAcc, 1e-4);
+	float ap = 1.0 - exp(-pow(tHit / mix(6500.0, 3500.0, rain), 1.5));
+	col = mix(col, skyClear * alpha, ap * 0.9);
+	return float4(col * fade, alpha * fade);
+}
+
+struct CloudOut {
+	float4 c [[color(0)]];
+	float age [[color(1)]];
+};
+
 vertex SkyV sky_vs(uint vid [[vertex_id]]) {
 	SkyV o;
 	float2 p = float2(float((vid << 1) & 2) * 2.0 - 1.0, float(vid & 2) * 2.0 - 1.0);
@@ -4534,29 +4696,72 @@ vertex SkyV sky_vs(uint vid [[vertex_id]]) {
 // the cloud layer into a small target (a quarter of the screen's pixels: clouds are soft), premultiplied colour and coverage
 // Temporal (OwnSky.TEMPORAL): each frame marches one pixel of every 2 x 2 block; the other three take the previous frame's target where their direction lies
 // on it (the clouds are hundreds of blocks away and move slowly: a direction reprojection, the camera's own movement in a frame is negligible against that).
-fragment float4 cloud_fs(SkyV in [[stage_in]], constant SkyFrame &f [[buffer(0)]], texture2d<float> lut [[texture(0)]], texture2d<float> noise [[texture(1)]],
-	texture2d<float> prevCl [[texture(3)]]) {
+fragment CloudOut cloud_fs(SkyV in [[stage_in]], constant SkyFrame &f [[buffer(0)]], texture2d<float> lut [[texture(0)]], texture2d<float> noise [[texture(1)]],
+	texture2d<float> prevCl [[texture(3)]], texture2d<float> cov [[texture(4)]], texture2d<float> prevAge [[texture(5)]]) {
 	float3 dir = normalize(f.fwd.xyz + f.right.xyz * in.ndc.x - f.up.xyz * in.ndc.y);
+	uint flags = uint(f.cloudM0.y);
+	bool shaped = (flags & 1u) != 0u, accum = (flags & 2u) != 0u;
+	float4 hist = float4(0.0);
+	float age = 0.0;
+	bool valid = false;
 	if (f.cloudT.y > 0.5) {
 		uint2 ip = uint2(in.pos.xy);
-		if (((ip.x & 1u) | ((ip.y & 1u) << 1)) != uint(f.cloudT.x)) {
-			// dir = F + R x - U y (unnormalised; F unit, R and U orthogonal to it): the previous frame's x, y of this direction
-			float df = dot(dir, f.pFwd.xyz);
-			if (df > 0.05) {
-				float x = dot(dir, f.pRight.xyz) / (dot(f.pRight.xyz, f.pRight.xyz) * df);
-				float y = -dot(dir, f.pUp.xyz) / (dot(f.pUp.xyz, f.pUp.xyz) * df);
-				float2 uv = float2(x * 0.5 + 0.5, 0.5 - y * 0.5);
-				float2 m = 1.0 / float2(prevCl.get_width(), prevCl.get_height());
-				if (all(uv >= m) && all(uv <= 1.0 - m)) return prevCl.sample(skSmp, uv, level(0.0));
+		bool marchHere = false;
+		float3 pd = dir;
+		if (accum) {
+			// the history by the cloud's distance: where the point of the layer's middle was in the previous frame's view (the camera moved, the wind carried it)
+			float tl = dir.y > 0.01 ? (0.5 * (f.cloudA.x + f.cloudA.y) - f.cloudC.x) / dir.y : 0.0;
+			if (tl > 0.0) pd = normalize(dir * tl + f.cloudM2.xyz + float3(f.cloudM3.x, 0.0, f.cloudM3.y));
+			uint N = uint(f.cloudM0.z), nn = N * N, stride = (nn >> 1) | 1u;
+			marchHere = ((ip.x % N) + (ip.y % N) * N) == ((uint(f.cloudT.x) * stride) % nn);
+		} else {
+			marchHere = ((ip.x & 1u) | ((ip.y & 1u) << 1)) == uint(f.cloudT.x);
+		}
+		// pd = F + R x - U y (unnormalised; F unit, R and U orthogonal to it): the previous frame's x, y of this direction
+		float df = dot(pd, f.pFwd.xyz);
+		if (df > 0.05) {
+			float x = dot(pd, f.pRight.xyz) / (dot(f.pRight.xyz, f.pRight.xyz) * df);
+			float y = -dot(pd, f.pUp.xyz) / (dot(f.pUp.xyz, f.pUp.xyz) * df);
+			float2 uv = float2(x * 0.5 + 0.5, 0.5 - y * 0.5);
+			float2 m = 1.0 / float2(prevCl.get_width(), prevCl.get_height());
+			if (all(uv >= m) && all(uv <= 1.0 - m)) {
+				hist = prevCl.sample(skSmp, uv, level(0.0));
+				valid = true;
+				if (accum) age = prevAge.sample(skSmp, uv, level(0.0)).r * 32.0;
 			}
+		}
+		if (valid && !marchHere) {
+			CloudOut o;
+			o.c = hist;
+			o.age = age / 32.0;
+			return o;
 		}
 	}
 	float3 S = f.sun.xyz;
 	float exposure = f.nightH.w;
 	float3 amb = (0.5 + 0.5 * skTone(lut.sample(skSmp, skUvS(float2(0.0, 1.0), 0.93, S), level(0.0)).rgb * exposure)) * f.cloudAmb.rgb * 0.85;
-	// the twilight: the sky overhead behind a low sun is violet and pink (the sunlit side of the atmosphere is far away, what is left is the Earth's shadow's
-	// blue-red band), so the shaded sides and the flat undersides of the clouds are lit violet, not brown
-	return skClouds(noise, dir, f, S, amb, in.pos.xy);
+	float4 r;
+	if (shaped) {
+		// the clear sky toward this direction (the dome's own chain), for the aerial perspective
+		float e = dir.y, cs = dot(dir, S);
+		float3 rad = lut.sample(skSmp, skUvS(dir.xz, max(e, 0.012), S), level(0.0)).rgb * exposure;
+		float3 clear = skTone(skLift(skBlue(rad, e, cs, S.y, f.sunCol.w), e, S.y, cs));
+		uint2 bp = uint2(in.pos.xy);
+		float ign = fract(52.9829189 * fract(dot(float2(bp), float2(0.06711056, 0.00583715))) + f.cloudM1.z);
+		r = skClouds2(cov, dir, f, S, amb, clear, ign);
+	} else {
+		r = skClouds(noise, dir, f, S, amb, in.pos.xy);
+	}
+	CloudOut o;
+	if (accum && valid) {
+		float w = max(1.0 / (age + 1.0), 1.0 / f.cloudM1.y);
+		o.c = mix(hist, r, w);
+		o.age = min(age + 1.0, 32.0) / 32.0;
+	} else {
+		o.c = r;
+		o.age = accum ? 1.0 / 32.0 : 0.0;
+	}
+	return o;
 }
 
 fragment float4 sky_fs(SkyV in [[stage_in]], constant SkyFrame &f [[buffer(0)]], texture2d<float> lut [[texture(0)]], texture2d<float> cloudTex [[texture(2)]]) {
@@ -4578,7 +4783,8 @@ fragment float4 sky_fs(SkyV in [[stage_in]], constant SkyFrame &f [[buffer(0)]],
 	float4 cl = float4(0.0);
 	if (f.cloudA.w > 0.0) {
 		float2 cuv = float2(in.ndc.x * 0.5 + 0.5, 0.5 - in.ndc.y * 0.5), tx = 1.0 / float2(cloudTex.get_width(), cloudTex.get_height());
-		cl = 0.25 * (cloudTex.sample(skSmp, cuv + tx * float2(-1.0, -1.0), level(0.0)) + cloudTex.sample(skSmp, cuv + tx * float2(1.0, -1.0), level(0.0))
+		if (uint(f.cloudM0.y) & 2u) cl = cloudTex.sample(skSmp, cuv, level(0.0));  // (accumulated: the jitter is averaged out in time, one bilinear tap keeps it sharp)
+		else cl = 0.25 * (cloudTex.sample(skSmp, cuv + tx * float2(-1.0, -1.0), level(0.0)) + cloudTex.sample(skSmp, cuv + tx * float2(1.0, -1.0), level(0.0))
 			+ cloudTex.sample(skSmp, cuv + tx * float2(-1.0, 1.0), level(0.0)) + cloudTex.sample(skSmp, cuv + tx * float2(1.0, 1.0), level(0.0)));
 	}
 	float3 c = skLift(skBlue(rad, e, cs, S.y, f.sunCol.w), e, S.y, cs);
