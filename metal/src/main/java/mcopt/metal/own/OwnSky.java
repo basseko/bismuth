@@ -43,18 +43,33 @@ public final class OwnSky {
 	private OwnSky() {
 	}
 
+	/**
+	 * The dome's flag is only reset by draw(), which does not run when vanilla skips the sky pass (lava, powder snow, blindness / darkness): so every reader
+	 * also checks the live camera (air only, no sky-blocking effect) and never trusts a stale "drew last frame".
+	 */
+	private static boolean live() {
+		if (!active) return false;
+		CameraRenderState cam = Minecraft.getInstance().gameRenderer.gameRenderState().levelRenderState.cameraRenderState;
+		boolean air = cam.fogType == FogType.ATMOSPHERIC || cam.fogType == FogType.NONE;
+		if (!air || cam.entityRenderState.doesMobEffectBlockSky) {
+			active = false;
+			return false;
+		}
+		return true;
+	}
+
 	public static boolean isActive() {
-		return active;
+		return live();
 	}
 
 	/** Our clouds replace vanilla's this frame. */
 	public static boolean ownClouds() {
-		return active && CLOUDS && OwnProbe.bool("shaders.clouds", true);
+		return live() && CLOUDS && OwnProbe.bool("shaders.clouds", true);
 	}
 
 	/** The shaded terrain applies the haze this frame: the dome drew and the camera is in air. */
 	static boolean hazeActive() {
-		return active && sinEl > -0.2f;
+		return live() && sinEl > -0.2f;
 	}
 
 	/** Sky colour state of this frame from the sky render state: sun direction and colour, the horizon colour, rain. */
@@ -85,7 +100,12 @@ public final class OwnSky {
 		for (int k = 0; k < 3; k++) warmTint[k] = sunTrans[k] / mx;
 		warm = WARM * (1.0f - smooth(0.0f, 0.42f, sinEl)) * smooth(-0.12f, 0.03f, sinEl);
 		float[] d = new float[3];
-		for (int k = 0; k < 3; k++) d[k] = 1.0f - (float) Math.exp(-acc[k] * exposure);
+		// the daytime grade (terrain.metal skLift) at the horizon's elevation of the table sample (0.05)
+		float day = smooth(0.12f, 0.55f, sinEl), lw = (float) Math.pow(0.95, 9);
+		for (int k = 0; k < 3; k++) {
+			float add = (LIFT_Z[k] + (LIFT_H[k] - LIFT_Z[k]) * lw) * day;
+			d[k] = 1.0f - (float) Math.exp(-(acc[k] * exposure + add));
+		}
 		float lum = d[0] * 0.3f + d[1] * 0.59f + d[2] * 0.11f;
 		for (int k = 0; k < 3; k++) horizon[k] = lum + (d[k] - lum) * SKY_SAT;
 		float hl = horizon[0] * 0.3f + horizon[1] * 0.59f + horizon[2] * 0.11f;
@@ -101,10 +121,11 @@ public final class OwnSky {
 	static final float[] warmTint = {1, 1, 1};
 	static final float WARM = Float.parseFloat(System.getProperty("mcopt.shaders.sky.warm", "0.55"));
 	static final float SKY_SAT = 0.95f;
+	private static final float[] LIFT_Z = {0.26f, 0.17f, 0.0f}, LIFT_H = {0.10f, 0.80f, 4.0f};
 
 	/** The fog colour of this frame (ShadeFogMixin): the sky's horizon by day, the old table's tint at night, grey in rain. */
 	public static org.joml.Vector3fc fogColor(org.joml.Vector3fc old) {
-		if (!ON || !active) return old;
+		if (!ON || !live()) return old;
 		System.arraycopy(new float[] {old.x(), old.y(), old.z()}, 0, nightFog, 0, 3);
 		float day = smooth(-0.14f, 0.06f, sinEl);
 		float lum = horizon[0] * 0.3f + horizon[1] * 0.59f + horizon[2] * 0.11f;

@@ -2351,6 +2351,15 @@ static float3 skTone(float3 c) {
 	return mix(float3(dot(d, float3(0.3, 0.59, 0.11))), d, SK_SAT);
 }
 
+// daytime sky grade: the table's single scattering is too grey at the horizon and too deeply blue at the zenith next to what the eye sees on a clear day
+// (the missing multiple scattering, aerosols and the ground's bounce): a radiance added before the tone curve, cyan-white toward the horizon, a soft
+// warm-blue overhead, fading out as the sun sets (so the twilight colours stay the table's own). OwnSky.liftAdd is its CPU twin.
+static float3 skLift(float3 c, float e, float sunY) {
+	float day = smoothstep(0.12, 0.55, sunY);
+	float w = pow(saturate(1.0 - e), 9.0);
+	return c + mix(float3(0.26, 0.17, 0.0), float3(0.10, 0.80, 4.0), w) * day;
+}
+
 // overcast: the sky's colour turns grey and dull in rain
 static float3 skOvercast(float3 sky, float rain) {
 	float lum = dot(sky, float3(0.3, 0.59, 0.11));
@@ -2365,7 +2374,7 @@ static float3 skWarm(float3 d, float4 warm) {
 
 static float3 skHaze(texture2d<float> lut, float3 dir, float3 sunDir, float exposure, float rain, float4 warm) {
 	float sy = clamp(dir.y, 0.025, 0.29);  // (sin of an elevation of 1.5 to 17 degrees)
-	return skOvercast(skWarm(skTone(lut.sample(skSmp, skUvS(dir.xz, sy, sunDir), level(0.0)).rgb * exposure), warm), rain);
+	return skOvercast(skWarm(skTone(skLift(lut.sample(skSmp, skUvS(dir.xz, sy, sunDir), level(0.0)).rgb * exposure, sy, sunDir.y)), warm), rain);
 }
 #endif
 
@@ -3835,10 +3844,19 @@ struct SkyV {
 // ---- clouds: a lit height-field slab marched in the dome (milestone 3) ----
 constexpr sampler skNoise(coord::normalized, filter::linear, address::repeat);
 
+// the noise texture with a quintic (C2) interpolation instead of the hardware's bilinear one, whose creases along the texel grid show as blocky facets once
+// the cloud's softness has amplified them (a cloud base near the camera is only a few dozen texels across)
+static float4 skNoiseS(texture2d<float> nz, float2 uv) {
+	float2 sz = float2(nz.get_width(), nz.get_height()), q = uv * sz - 0.5;
+	float2 i = floor(q), fr = q - i;
+	fr = fr * fr * fr * (fr * (fr * 6.0 - 15.0) + 10.0);
+	return nz.sample(skNoise, (i + 0.5 + fr) / sz, level(0.0));
+}
+
 static float skCloudDensity(texture2d<float> nz, float3 p, constant SkyFrame &f, float hf, float lod) {
 	float2 uv = (p.xz + f.cloudB.xy) * (1.0 / 1500.0);
-	float4 n = nz.sample(skNoise, uv, level(0.0));
-	float4 m = nz.sample(skNoise, uv * 3.3 + 0.37, level(0.0));
+	float4 n = skNoiseS(nz, uv);
+	float4 m = skNoiseS(nz, uv * 3.3 + 0.37);
 	float shape = n.r * 0.7 + n.g * 0.3 - (1.0 - f.cloudA.z);
 	float detail = (m.r - 0.5) * 0.4 * (1.0 - 0.5 * hf) * lod;
 	float d = saturate((shape + detail) * f.cloudC.z);
@@ -3856,10 +3874,14 @@ static float4 skClouds(texture2d<float> nz, float3 dir, constant SkyFrame &f, fl
 	float fade = smoothstep(0.02, 0.34, dir.y) * (1.0 - smoothstep(y0 - 30.0, y0 + 10.0, cy));
 	if (fade <= 0.0) return float4(0.0);
 	float t0 = max(y0 - cy, 1.0) / dir.y, t1 = (y1 - cy) / dir.y;
-	const int N = 6;
+	const int N = 12;
 	float dt = (t1 - t0) / float(N);
 	float lod = 1.0 - smoothstep(600.0, 2500.0, t0);  // the fine detail fades out with distance (it would alias to streaks near the horizon)
-	float jit = fract(52.9829189 * fract(dot(pix, float2(0.06711056, 0.00583715))));
+	// a 4x4 ordered (Bayer) jitter of the start of the march: the dome averages 4 bilinear taps over a 4 x 4 texel block, which holds each of the 16 offsets
+	// exactly once, so the jitter is gone after the upsample (a random per-pixel jitter showed as a hatch, no jitter as banding at the edges)
+	uint2 bp = uint2(pix) & 3u;
+	const float bayer[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
+	float jit = (bayer[bp.y * 4u + bp.x] + 0.5) * (1.0 / 16.0);
 	float cosS = dot(dir, sunDir);
 	float hgF = skHg(cosS, 0.62);  // the forward lobe: silver linings toward the sun
 	float3 sunC = f.cloudSun.rgb;
@@ -3874,10 +3896,10 @@ static float4 skClouds(texture2d<float> nz, float3 dir, constant SkyFrame &f, fl
 			// the sunlight that reaches the point: two samples toward the sun
 			float l1 = skCloudDensity(nz, p + sunDir * 70.0, f, saturate(hf + sunDir.y * 0.5), lod);
 			float l2 = skCloudDensity(nz, p + sunDir * 210.0, f, saturate(hf + sunDir.y * 1.2), lod);
-			float lightT = exp(-(l1 * 70.0 + l2 * 140.0) * 0.045);
-			float3 c = sunC * (lightT * (0.62 + 1.9 * hgF)) + ambCol * (0.38 + 0.62 * hf);
+			float lightT = exp(-(l1 * 70.0 + l2 * 140.0) * 0.032);
+			float3 c = sunC * (lightT * (0.62 + 2.2 * hgF)) + ambCol * (0.38 + 0.62 * hf);
 			c = mix(c, float3(0.50, 0.55, 0.58) * (0.8 + 0.2 * hf), f.sunCol.w * 0.9);  // overcast: even grey light
-			float a = 1.0 - exp(-d * dt * 0.05);
+			float a = 1.0 - exp(-d * min(dt, 140.0) * 0.05);  // (a long slanted path is not more cloud: the slab's horizontal variation is already in d)
 			col += T * a * c;
 			T *= 1.0 - a;
 		}
@@ -3914,12 +3936,17 @@ fragment float4 sky_fs(SkyV in [[stage_in]], constant SkyFrame &f [[buffer(0)]],
 	float visible = (1.0 - rain) * smoothstep(-0.02, 0.03, S.y);
 	float disc = smoothstep(f.sun.w - 0.00045, f.sun.w + 0.00030, cs);
 	float ang = sqrt(max(2.0 * (1.0 - cs), 0.0));
-	float glow = 0.55 * exp(-ang * 14.0) + 0.16 * exp(-ang * 4.5) + 0.05 * exp(-ang * 1.4);
-	float3 sunTerm = f.sunCol.rgb * ((disc * 60.0 + glow * 5.0) * visible) * smoothstep(-0.03, 0.05, e);
+	float glow = 1.4 * exp(-ang * 32.0) + 0.55 * exp(-ang * 14.0) + 0.16 * exp(-ang * 4.5) + 0.05 * exp(-ang * 1.4);
+	float3 sunW = float3(max(f.sunCol.r, max(f.sunCol.g, f.sunCol.b)));  // (the glow and the core go toward white: a low sun's disc is bright, not orange)
+	float3 sunTerm = (mix(f.sunCol.rgb, sunW, 0.45) * (glow * 9.0) + mix(f.sunCol.rgb, sunW, 0.65) * (disc * 60.0)) * visible * smoothstep(-0.03, 0.05, e);
 	// clouds: the small target, bilinear (it was drawn by cloud_fs, with the sunlight and the zenith as light)
 	float4 cl = float4(0.0);
-	if (f.cloudA.w > 0.0) cl = cloudTex.sample(skSmp, float2(in.ndc.x * 0.5 + 0.5, 0.5 - in.ndc.y * 0.5), level(0.0));
-	float3 c = rad + sunTerm * (1.0 - 0.7 * cl.a);
+	if (f.cloudA.w > 0.0) {
+		float2 cuv = float2(in.ndc.x * 0.5 + 0.5, 0.5 - in.ndc.y * 0.5), tx = 1.0 / float2(cloudTex.get_width(), cloudTex.get_height());
+		cl = 0.25 * (cloudTex.sample(skSmp, cuv + tx * float2(-1.0, -1.0), level(0.0)) + cloudTex.sample(skSmp, cuv + tx * float2(1.0, -1.0), level(0.0))
+			+ cloudTex.sample(skSmp, cuv + tx * float2(-1.0, 1.0), level(0.0)) + cloudTex.sample(skSmp, cuv + tx * float2(1.0, 1.0), level(0.0)));
+	}
+	float3 c = skLift(rad, e, S.y);
 	float3 sky = skWarm(skTone(c), float4(f.sunCol.rgb / max(max(f.sunCol.r, f.sunCol.g), max(f.sunCol.b, 1e-3)), f.cloudAmb.w));
 	// night: a faint blue gradient where the sun's light has faded
 	float3 nightC = mix(f.nightH.rgb, f.night.rgb, saturate(e * 2.5)) * f.night.w;
@@ -3927,6 +3954,8 @@ fragment float4 sky_fs(SkyV in [[stage_in]], constant SkyFrame &f [[buffer(0)]],
 	// overcast: the sky's colour turns grey and dull
 	if (rain > 0.0) sky = skOvercast(sky, rain);
 	sky = sky * (1.0 - cl.a) + cl.rgb;
+	// the sun on top of the clouds (its light shines through them: a thin cloud only dims it): 1 - (1 - sky) exp(-sun) keeps the glow from overshooting
+	sky = 1.0 - (1.0 - sky) * exp(-sunTerm * (1.0 - 0.45 * cl.a));
 	// a triangular dither of one 8-bit step: the colour grade after this stretches the gradient's steps
 	float2 pp = in.pos.xy;
 	float n = fract(52.9829189 * fract(dot(pp, float2(0.06711056, 0.00583715)))) + fract(52.9829189 * fract(dot(pp.yx + 19.0, float2(0.06711056, 0.00583715)))) - 1.0;
