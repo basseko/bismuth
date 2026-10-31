@@ -92,6 +92,8 @@ enum { MCE_KIND_RENDER = 1, MCE_KIND_SERIAL, MCE_KIND_CONCURRENT, MCE_KIND_BLIT 
 	id sync;  // MceSync, the record the resource map points at
 	id waits[16];
 	int nwaits;
+	int tsIndex;  // MCE_PASSTIME: its start timestamp's index in the command buffer's heap (-1 none)
+	int merged;  // its real encoder is shared with the previous compute encoder(s) of the command buffer
 }
 @end
 
@@ -105,6 +107,11 @@ enum { MCE_KIND_RENDER = 1, MCE_KIND_SERIAL, MCE_KIND_CONCURRENT, MCE_KIND_BLIT 
 	NSMutableArray *completed, *waits, *signals;  // completion blocks; {event, value} pairs to wait on before / signal after the commit
 	id drawable;  // id<CAMetalDrawable> to present with this commit
 	int opened;  // an encoder was opened on it (the first gets the queue barrier that orders it after earlier command buffers)
+	id heap;  // MCE_PASSTIME: id<MTL4CounterHeap> of its encoders' timestamps
+	// compute encoders merged (Apple: group compute-class work, every encoder boundary costs): a compute encoder that ended is kept open here
+	// until the next encoder of another kind, a commit, or mce4_cmd_flush; the next compute encoder continues in it after an intra-pass barrier
+	id openReal, openSync, openFence;
+	NSMutableArray *heapLabels;  // one label per encoder (timestamps 2i, 2i + 1)
 }
 @end
 
@@ -115,6 +122,7 @@ static inline id mce_raw(id h) { return mce_metal4 && h ? ((MceEncoder *) h)->re
 // ---- command buffers ----
 id mce4_new_cmd(Ctx *ctx);
 void mce4_cmd_commit(id c);
+void mce4_cmd_flush(id cmd);  // ends a compute encoder the layer kept open for merging (before encoding into the command buffer directly)
 void mce4_cmd_wait(id c);
 int mce4_cmd_done(id c);
 double mce4_cmd_gpu_start(id c);

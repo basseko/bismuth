@@ -40,6 +40,8 @@ static struct {
 	NSMutableArray *tablePool;  // argument tables not attached to an open encoder
 	id<MTLResidencySet> set;  // everything made resident through the layer
 	int setDirty;
+	int setRemoved;  // removals not committed yet
+	double setRemovedAt;
 	struct { id<MTLBuffer> buf; uint64_t size, used, last; int inFrame; } chunks[MAX_CHUNKS];
 	int nchunks, cur;
 	struct { id obj; uint64_t value; } *grave;  // value 0: released during the frame being encoded
@@ -47,6 +49,11 @@ static struct {
 	NSMutableSet *logged;
 	CAMetalLayer *layer;
 } M = {.lock = OS_UNFAIR_LOCK_INIT};
+
+// MEASUREMENT: MCE_STATS=1 prints the layer's per-frame counts every 2 s
+static struct { long commits, setCommits, encoders, fences, uploads, uploadBytes, resident, released, presents; double last; } ST;
+static int stats(void) { static int m = -1; if (m < 0) m = getenv("MCE_STATS") != NULL; return m; }
+
 
 static uint64_t completedValue(void) { return M.timeline.signaledValue; }
 
@@ -138,10 +145,40 @@ void mce4_layer(CAMetalLayer *layer) {
 }
 
 // ---- residency and deferred release ----
+static void churnNote(const char *what, id o) {
+	if (!stats()) return;
+	static NSMutableDictionary *seen;
+	static double last;
+	static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
+	os_unfair_lock_lock(&lk);
+	if (!seen) seen = [NSMutableDictionary new];
+	NSString *kind = [o conformsToProtocol:@protocol(MTLTexture)] ? [NSString stringWithFormat:@"tex %lux%lu fmt %lu", (unsigned long) ((id<MTLTexture>) o).width,
+		(unsigned long) ((id<MTLTexture>) o).height, (unsigned long) ((id<MTLTexture>) o).pixelFormat]
+		: [o conformsToProtocol:@protocol(MTLBuffer)] ? [NSString stringWithFormat:@"buf %lu", (unsigned long) ((id<MTLBuffer>) o).length] : NSStringFromClass([o class]);
+	NSString *k = [NSString stringWithFormat:@"%s %@ [%@]", what, kind, [o respondsToSelector:@selector(label)] ? [o label] : @""];
+	seen[k] = @([seen[k] longValue] + 1);
+	double now = CFAbsoluteTimeGetCurrent();
+	if (!last) last = now;
+	if (now - last > 5.0) {
+		NSArray *ks = [seen keysSortedByValueUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) { return [b compare:a]; }];
+		for (NSUInteger i = 0; i < ks.count && i < 12; i++) fprintf(stderr, "mcopt-metal4 churn 5s: %6ld  %s\n", [seen[ks[i]] longValue], [ks[i] UTF8String]);
+		[seen removeAllObjects];
+		last = now;
+	}
+	os_unfair_lock_unlock(&lk);
+}
+
 void mce4_make_resident(id allocation) {
+	ST.resident++;
+	churnNote("new", allocation);
+	// a texture view, or a texture over a buffer, shares its parent's allocation: the parent's residency covers it (and per-frame views would churn the set)
+	if ([allocation conformsToProtocol:@protocol(MTLTexture)] && (((id<MTLTexture>) allocation).parentTexture || ((id<MTLTexture>) allocation).buffer)) return;
 	os_unfair_lock_lock(&M.lock);
-	[M.set addAllocation:allocation];
-	M.setDirty = 1;
+	// (a pooled buffer handed out again is already resident: no commit of the set for it; a residency commit is a driver operation that stalls)
+	if (![M.set containsAllocation:allocation]) {
+		[M.set addAllocation:allocation];
+		M.setDirty = 1;
+	}
 	os_unfair_lock_unlock(&M.lock);
 }
 
@@ -156,7 +193,7 @@ static void collect(id *out, int *nout, int cap) {
 			id o = M.grave[i].obj;
 			if ([o conformsToProtocol:@protocol(MTLAllocation)] && [M.set containsAllocation:o]) {
 				[M.set removeAllocation:o];
-				M.setDirty = 1;
+				M.setRemoved++;  // (committed lazily: a freed allocation may stay resident a little longer, a new one must not wait)
 			}
 			out[(*nout)++] = o;
 		} else {
@@ -171,6 +208,8 @@ static void releaseAll(id *objs, int n) {
 }
 
 void mce4_release(id obj) {
+	ST.released++;
+	churnNote("free", obj);
 	if ([obj isKindOfClass:[MceCmd class]]) {  // a committed command buffer token: nothing the GPU holds
 		[obj release];
 		return;
@@ -239,6 +278,8 @@ static uint64_t ringAlloc(NSUInteger length, id<MTLBuffer> *buffer, NSUInteger *
 }
 
 static uint64_t upload(const void *bytes, NSUInteger length, id<MTLBuffer> *buffer, NSUInteger *offset) {
+	ST.uploads++;
+	ST.uploadBytes += (long) length;
 	NSUInteger padded = (length + 15) & ~(NSUInteger) 15;
 	uint8_t *p;
 	os_unfair_lock_lock(&M.lock);
@@ -422,30 +463,67 @@ void mce4_cmd_wait_event(id h, id<MTLEvent> e, uint64_t v) {
 	[c->waits addObject:@(v)];
 }
 
+static void ptResolve(id heapObj, NSArray *labels, int presented);
+@class MceCmd;
+static void closeOpen(MceCmd *c);
+
+static void statsTick(int presented) {
+	if (!stats()) return;
+	ST.presents += presented;
+	double now = CFAbsoluteTimeGetCurrent();
+	if (!ST.last) ST.last = now;
+	if (now - ST.last > 2.0 && ST.presents) {
+		double f = (double) ST.presents;
+		fprintf(stderr, "mcopt-metal4 stats per presented frame: commits %.2f, residency commits %.2f, encoders %.1f, fences %.1f, uploads %.1f (%.1f KB), made resident %.2f, released %.2f\n",
+			ST.commits / f, ST.setCommits / f, ST.encoders / f, ST.fences / f, ST.uploads / f, ST.uploadBytes / f / 1024.0, ST.resident / f, ST.released / f);
+		memset(&ST, 0, sizeof ST);
+		ST.last = now;
+	}
+}
+
 void mce4_cmd_commit(id h) {
 	MceCmd *c = h;
 	if (!c->cb) return;
 	@autoreleasepool {
+		closeOpen(c);
 		id<MTL4CommandBuffer> cb = c->cb;
 		[cb endCommandBuffer];
 		MTL4CommitOptions *o = [[MTL4CommitOptions new] autorelease];
 		NSArray *blocks = [[c->completed copy] autorelease];
 		MceCmd *me = [c retain];  // released by the feedback handler
+		id ptHeap = c->heap;
+		NSArray *ptLabels = [c->heapLabels copy];
+		int ptPresented = c->drawable != nil;
+		statsTick(ptPresented);
+		c->heap = nil;
+		[c->heapLabels release];
+		c->heapLabels = nil;
 		[o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
 			if (f.error) fprintf(stderr, "mcopt-metal4: command buffer failed: %s\n", f.error.description.UTF8String);
 			me->gpuStart = f.GPUStartTime;
 			me->gpuEnd = f.GPUEndTime;
 			__atomic_store_n(&me->timesReady, 1, __ATOMIC_RELEASE);
 			for (void (^b)(double, double) in blocks) b(f.GPUStartTime, f.GPUEndTime);
+			if (ptHeap) {
+				ptResolve(ptHeap, ptLabels, ptPresented);
+				[ptHeap release];
+			}
+			[ptLabels release];
 			[me release];
 		}];
 		os_unfair_lock_lock(&M.lock);
+		ST.commits++;
+		double nowc = CFAbsoluteTimeGetCurrent();
+		if (M.setRemoved && (M.setRemoved > 256 || nowc - M.setRemovedAt > 1.0)) M.setDirty = 1;
 		if (M.setDirty) {
+			ST.setCommits++;
+			M.setRemoved = 0;
+			M.setRemovedAt = nowc;
 			[M.set commit];
 			M.setDirty = 0;
 		}
 		for (NSUInteger i = 0; i + 1 < c->waits.count; i += 2) [M.queue waitForEvent:c->waits[i] value:[c->waits[i + 1] unsignedLongLongValue]];
-		if (c->drawable) [M.queue waitForDrawable:c->drawable];
+		if (c->drawable && !getenv("MCE_NODRAWWAIT")) [M.queue waitForDrawable:c->drawable];  // (MCE_NODRAWWAIT: MEASUREMENT only, may tear)
 		[M.queue commit:&cb count:1 options:o];
 		uint64_t v = ++M.submitted;
 		[M.queue signalEvent:M.timeline value:v];
@@ -664,6 +742,89 @@ static MTLStages encStages(MceEncoder *e) {
 }
 @end
 
+// ---- pass timing (MEASUREMENT: MCE_PASSTIME=1 in the environment) ----
+// Every encoder writes a timestamp into its command buffer's counter heap when it opens and when it ends; the commit's feedback handler (after the GPU
+// finished) resolves the heap and adds each encoder's duration to its label; every 2 s the mean GPU time per presented frame of each label is printed.
+#define PT_CAP 1024
+static int passTime(void) {
+	static int m = -1;
+	if (m < 0) { const char *v = getenv("MCE_PASSTIME"); m = v && atoi(v) > 0; if (m) fprintf(stderr, "mcopt-metal4: MEASUREMENT pass timing on\n"); }
+	return m;
+}
+static struct { os_unfair_lock lock; NSMutableDictionary *us, *n; uint64_t frames; double last; double freq; } PT = {.lock = OS_UNFAIR_LOCK_INIT};
+
+static void ptStart(MceEncoder *e) {
+	MceCmd *c = e->cmd;
+	e->tsIndex = -1;
+	if (!passTime() || !c) return;
+	if (!c->heap) {
+		MTL4CounterHeapDescriptor *d = [[MTL4CounterHeapDescriptor new] autorelease];
+		d.type = MTL4CounterHeapTypeTimestamp;
+		d.count = PT_CAP * 2;
+		NSError *err = nil;
+		c->heap = [M.device newCounterHeapWithDescriptor:d error:&err];
+		if (!c->heap) { mce_log_once("pass timing: no counter heap"); return; }
+		c->heapLabels = [NSMutableArray new];
+	}
+	NSUInteger i = c->heapLabels.count;
+	if (i >= PT_CAP) return;
+	[c->heapLabels addObject:@"?"];
+	e->tsIndex = (int) i;
+	if (e->kind == MCE_KIND_RENDER)
+		[(id<MTL4RenderCommandEncoder>) e->real writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed afterStage:MTLRenderStageVertex intoHeap:c->heap atIndex:i * 2];
+	else
+		[(id<MTL4ComputeCommandEncoder>) e->real writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed intoHeap:c->heap atIndex:i * 2];
+}
+
+static void ptEnd(MceEncoder *e) {
+	MceCmd *c = e->cmd;
+	if (e->tsIndex < 0 || !c || !c->heap) return;
+	NSString *l = [(id<MTL4CommandEncoder>) e->real label];
+	c->heapLabels[e->tsIndex] = l.length ? l : (e->kind == MCE_KIND_RENDER ? @"render (no label)" : @"compute (no label)");
+	NSUInteger i = (NSUInteger) e->tsIndex;
+	if (e->kind == MCE_KIND_RENDER)
+		[(id<MTL4RenderCommandEncoder>) e->real writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed afterStage:MTLRenderStageFragment intoHeap:c->heap atIndex:i * 2 + 1];
+	else
+		[(id<MTL4ComputeCommandEncoder>) e->real writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed intoHeap:c->heap atIndex:i * 2 + 1];
+}
+
+// on the feedback queue, after the GPU finished the command buffer
+static void ptResolve(id heapObj, NSArray *labels, int presented) {
+	id<MTL4CounterHeap> heap = heapObj;
+	if (!PT.freq) PT.freq = (double) [M.device queryTimestampFrequency];
+	NSData *d = labels.count ? [heap resolveCounterRange:NSMakeRange(0, labels.count * 2)] : nil;
+	const MTL4TimestampHeapEntry *t = d.bytes;
+	os_unfair_lock_lock(&PT.lock);
+	if (!PT.us) { PT.us = [NSMutableDictionary new]; PT.n = [NSMutableDictionary new]; }
+	for (NSUInteger i = 0; t && i < labels.count; i++) {
+		uint64_t a = t[i * 2].timestamp, b = t[i * 2 + 1].timestamp;
+		if (!a || !b || b < a) continue;
+		double us = (double) (b - a) * 1e6 / PT.freq;
+		NSString *k = labels[i];
+		PT.us[k] = @([PT.us[k] doubleValue] + us);
+		PT.n[k] = @([PT.n[k] longLongValue] + 1);
+	}
+	PT.frames += presented;
+	double now = CFAbsoluteTimeGetCurrent();
+	if (PT.last == 0) PT.last = now;
+	if (now - PT.last > 2.0 && PT.frames > 0) {
+		NSArray *keys = [PT.us keysSortedByValueUsingComparator:^NSComparisonResult(NSNumber *x, NSNumber *y) { return [y compare:x]; }];
+		double total = 0;
+		for (NSString *k in keys) total += [PT.us[k] doubleValue];
+		fprintf(stderr, "mcopt-metal4 passtime: %llu frames, sum of passes %.3f ms/frame\n", (unsigned long long) PT.frames, total / 1000.0 / PT.frames);
+		int shown = 0;
+		for (NSString *k in keys) {
+			if (shown++ >= 30) break;
+			fprintf(stderr, "mcopt-metal4 passtime:   %8.1f us/frame  %6.2f /frame  %s\n", [PT.us[k] doubleValue] / PT.frames, [PT.n[k] doubleValue] / PT.frames, k.UTF8String);
+		}
+		[PT.us removeAllObjects];
+		[PT.n removeAllObjects];
+		PT.frames = 0;
+		PT.last = now;
+	}
+	os_unfair_lock_unlock(&PT.lock);
+}
+
 static CFMutableDictionaryRef trackMap;  // canonical resource (unretained key) -> MceUse (retained)
 
 static void *canon(id obj) {
@@ -732,6 +893,7 @@ static void flushWaits(MceEncoder *e) {
 }
 
 static MceEncoder *wrap(id real, int kind) {
+	ST.encoders++;
 	MceEncoder *e = [MceEncoder new];
 	e->real = [real retain];
 	e->kind = kind;
@@ -751,12 +913,65 @@ static MceEncoder *wrap(id real, int kind) {
 	return e;
 }
 
+// fences are reused once the frame that last used them completed on the GPU (one per encoder: creating and freeing them was ~1600 objects a second)
+static struct { id f; MceCmd *cmd; } fencePool[512];
+static int nFencePool;
+
+static id takeFence(void) {
+	uint64_t done = completedValue();
+	for (int i = 0; i < nFencePool; i++) {
+		MceCmd *c = fencePool[i].cmd;
+		if (c && c->value && c->value <= done) {
+			id f = fencePool[i].f;
+			[c release];
+			fencePool[i] = fencePool[--nFencePool];
+			return f;
+		}
+	}
+	ST.fences++;
+	return [M.device newFence];
+}
+
+static void giveFence(id f, MceCmd *cmd) {
+	if (nFencePool < 512) {
+		fencePool[nFencePool].f = f;
+		fencePool[nFencePool].cmd = [cmd retain];
+		nFencePool++;
+	} else {
+		mce4_release(f);
+	}
+}
+
+static int mergeCompute(void) {
+	static int m = -1;
+	if (m < 0) { const char *v = getenv("MCE_MERGE"); m = !(v && strcmp(v, "0") == 0); }
+	return m && !syncBarriers() && !passTime();
+}
+
+// ends the compute encoder kept open on c (its fence updated: encoders that depend on what ran in it wait on it)
+static void closeOpen(MceCmd *c) {
+	if (!c || !c->openReal) return;
+	id<MTL4ComputeCommandEncoder> r = c->openReal;
+	[r updateFence:c->openFence afterEncoderStages:MTLStageDispatch | MTLStageBlit];
+	[r endEncoding];
+	[r release];
+	c->openReal = nil;
+	giveFence(c->openFence, c);
+	c->openFence = nil;
+	[(MceSync *) c->openSync release];
+	c->openSync = nil;
+}
+
+void mce4_cmd_flush(id cmd) {
+	closeOpen(cmd);
+}
+
 // the tracking state of a new encoder on command buffer cmd (wrap's caller)
 static MceEncoder *tracked(MceEncoder *e, id cmd) {
 	if (syncBarriers()) return e;
 	MceCmd *c = cmd;
 	e->cmd = cmd;
-	e->fence = [M.device newFence];
+	e->fence = takeFence();
 	MceSync *s = [MceSync new];
 	s->fence = [e->fence retain];
 	s->cmd = (__bridge void *) cmd;
@@ -766,6 +981,7 @@ static MceEncoder *tracked(MceEncoder *e, id cmd) {
 		c->opened = 1;
 		[(id<MTL4CommandEncoder>) e->real barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
 	}
+	ptStart(e);
 	return e;
 }
 
@@ -789,6 +1005,7 @@ id mce4_new_render_encoder(id cmd, MTLRenderPassDescriptor *rp) {
 		d.tileHeight = rp.tileHeight;
 		d.rasterizationRateMap = rp.rasterizationRateMap;
 		d.visibilityResultBuffer = rp.visibilityResultBuffer;
+		closeOpen(c);
 		id<MTL4RenderCommandEncoder> r = [c->cb renderCommandEncoderWithDescriptor:d];
 		if (!r) { fprintf(stderr, "mcopt-metal4: render encoder creation failed\n"); abort(); }
 		MceEncoder *e = tracked(wrap(r, MCE_KIND_RENDER), cmd);
@@ -803,11 +1020,35 @@ id mce4_new_render_encoder(id cmd, MTLRenderPassDescriptor *rp) {
 
 id mce4_new_compute_encoder(id cmd, MTLDispatchType type) {
 	MceCmd *c = cmd;
-	return tracked(wrap([c->cb computeCommandEncoder], type == MTLDispatchTypeConcurrent ? MCE_KIND_CONCURRENT : MCE_KIND_SERIAL), cmd);
+	int kind = type == MTLDispatchTypeConcurrent ? MCE_KIND_CONCURRENT : MCE_KIND_SERIAL;
+	if (mergeCompute() && c->openReal) {
+		// continue in the open encoder: one intra-pass barrier orders this encoder's commands after the previous one's (what separate encoders did)
+		id<MTL4ComputeCommandEncoder> r = c->openReal;
+		[r barrierAfterEncoderStages:MTLStageDispatch | MTLStageBlit beforeEncoderStages:MTLStageDispatch | MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
+		MceEncoder *e = wrap(r, kind);
+		e->merged = 1;
+		e->cmd = cmd;
+		e->fence = [c->openFence retain];
+		e->sync = [c->openSync retain];
+		return e;
+	}
+	closeOpen(c);
+	return tracked(wrap([c->cb computeCommandEncoder], kind), cmd);
 }
 
 id mce4_new_blit_encoder(id cmd) {
 	MceCmd *c = cmd;
+	if (mergeCompute() && c->openReal) {
+		id<MTL4ComputeCommandEncoder> r = c->openReal;
+		[r barrierAfterEncoderStages:MTLStageDispatch | MTLStageBlit beforeEncoderStages:MTLStageDispatch | MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
+		MceEncoder *e = wrap(r, MCE_KIND_BLIT);
+		e->merged = 1;
+		e->cmd = cmd;
+		e->fence = [c->openFence retain];
+		e->sync = [c->openSync retain];
+		return e;
+	}
+	closeOpen(c);
 	return tracked(wrap([c->cb computeCommandEncoder], MCE_KIND_BLIT), cmd);
 }
 
@@ -815,13 +1056,38 @@ void mce4_end_encoder(id h) {
 	MceEncoder *e = h;
 	if (e->ended) return;
 	e->ended = 1;
+	ptEnd(e);
+	if (mergeCompute() && e->kind != MCE_KIND_RENDER && e->cmd && ((MceCmd *) e->cmd)->cb) {
+		MceCmd *c = e->cmd;
+		if (!e->merged) {
+			// the first of a run: its real encoder, fence and record become the command buffer's open encoder
+			c->openReal = [e->real retain];
+			c->openFence = [e->fence retain];
+			c->openSync = [e->sync retain];
+		}
+		((MceSync *) e->sync)->ended = 1;  // (later encoders of another kind close it first, so its fence is updated before they wait on it)
+		[(MceSync *) e->sync release];
+		e->sync = nil;
+		[e->fence release];
+		e->fence = nil;
+		[e->real release];
+		e->real = nil;
+		os_unfair_lock_lock(&M.lock);
+		if (e->tables[0]) {
+			[M.tablePool addObject:e->tables[0]];
+			[e->tables[0] release];
+			e->tables[0] = nil;
+		}
+		os_unfair_lock_unlock(&M.lock);
+		return;
+	}
 	if (!syncBarriers() && e->fence) {
 		flushWaits(e);  // (waits for resources bound but never used by a command: harmless)
 		[(id<MTL4CommandEncoder>) e->real updateFence:e->fence afterEncoderStages:encStages(e)];
 		((MceSync *) e->sync)->ended = 1;
 		[(MceSync *) e->sync release];  // (the resource map keeps it while it is some resource's last user)
 		e->sync = nil;
-		mce4_release(e->fence);  // (deferred until the frame completed)
+		giveFence(e->fence, e->cmd);  // (reused once that command buffer completed)
 		e->fence = nil;
 	}
 	// and the other half of the conservative barrier: later encoders wait for all of this one

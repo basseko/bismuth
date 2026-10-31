@@ -68,6 +68,7 @@ int mcfx_spatial(Enc *enc, id<MTLTexture> in, id<MTLTexture> out) {
 			mce_barrier_full(e1);
 			mce_end_encoder(e1);
 			[e1 release];
+			mce4_cmd_flush(c);  // (the layer may keep a compute encoder open for merging: none may be open while MetalFX encodes)
 			[(id<MTL4FXSpatialScaler>) fxScaler encodeToCommandBuffer:c->cb];
 			id e2 = mce_new_compute_encoder(c, MTLDispatchTypeSerial);
 			mce_barrier_full(e2);
