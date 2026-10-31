@@ -132,6 +132,12 @@ public final class OwnSky {
 	private static final int[] slotVersion = new int[4];
 	private static final boolean[] slotMs = new boolean[4];
 	private static final float[] hAcc = new float[3];
+	/** mcopt.shaders.ambient.sh: the terrain's ambient light from the sky's own colour (L2 spherical harmonics of the displayed sky, sky_sh); shReady: this frame's coefficients exist. */
+	static final boolean AMBIENT_SH = Boolean.parseBoolean(System.getProperty("mcopt.shaders.ambient.sh", "true"));
+	static final float SH_GROUND = Float.parseFloat(System.getProperty("mcopt.shaders.ambient.ground", "0.3"));
+	static boolean shReady;
+	private static final int[] shKey = new int[4];
+	private static final boolean[] shUnset = {true, true, true, true};
 	static float exposure = EXPOSURE, warm;
 	static final float[] warmTint = {1, 1, 1};
 	static final float WARM = Float.parseFloat(System.getProperty("mcopt.shaders.sky.warm", "0.55"));
@@ -160,6 +166,7 @@ public final class OwnSky {
 	/** Draws the dome into the sky pass (called by the mixin at vanilla's sky disc). True: drawn, vanilla's disc, sunrise fan and sun are skipped. */
 	public static boolean draw() {
 		active = false;
+		shReady = false;
 		boolean cloudsBefore = cloudPrev;
 		cloudPrev = false;  // (set again below once this frame's clouds are drawn: a frame without them breaks the history)
 		if (!ON || failed || !OwnProbe.bool("shaders", true) || !OwnProbe.bool("shaders.sky", true)) return false;
@@ -197,6 +204,25 @@ public final class OwnSky {
 			slotVersion[k] = version;
 			slotMs[k] = ms;
 			if (!OwnNative.skyLut(own, enc, k, lp, LUT_BYTES, compute)) throw new IllegalStateException("sky_lut missing");
+			// the sky ambient (mcopt.shaders.ambient.sh): the table projected onto L2 SH when it is rebuilt or the rain (which dims the displayed sky) has changed
+			if (AMBIENT_SH && OwnProbe.bool("shaders.ambient.sh", true)) {
+				int key = version * 64 + Math.round(rain * 32f);
+				boolean sh = compute || shKey[k] != key || shUnset[k];
+				shKey[k] = key;
+				shUnset[k] = false;
+				long sp = stack.ncalloc(16, 1, 48);
+				MemoryUtil.memPutFloat(sp, sinEl);
+				MemoryUtil.memPutFloat(sp + 4, (float) Math.sqrt(Math.max(0, 1 - sinEl * sinEl)));
+				MemoryUtil.memPutFloat(sp + 16, exposure);
+				MemoryUtil.memPutFloat(sp + 20, rain);
+				MemoryUtil.memPutFloat(sp + 24, SH_GROUND);
+				for (int c = 0; c < 3; c++) MemoryUtil.memPutFloat(sp + 32 + c * 4L, warmTint[c]);
+				MemoryUtil.memPutFloat(sp + 44, warm);
+				if (!OwnNative.skySh(own, enc, k, sp, 48, sh)) throw new IllegalStateException("sky_sh missing");
+				shReady = true;
+			} else {
+				shReady = false;
+			}
 			long p = stack.ncalloc(16, 1, PARAM_BYTES);
 			Matrix4f proj = cam.projectionMatrix, view = cam.viewRotationMatrix;
 			float tx = 1.0f / proj.m00(), ty = 1.0f / proj.m11();

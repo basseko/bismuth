@@ -69,6 +69,7 @@ final class OwnNative {
 		JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT) : null;
 
 	private static final MethodHandle SKY_INIT = OwnShade.ON ? fn("mcs_sky_init", false, JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_INT) : null;
+	private static final MethodHandle SKY_SH = OwnShade.ON ? fn("mcs_sky_sh", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT) : null;
 	private static final MethodHandle SKY_LUT = OwnShade.ON ? fn("mcs_sky_lut", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT) : null;
 	private static final MethodHandle SKY_CLOUDS = OwnShade.ON ? fn("mcs_sky_clouds", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_INT) : null;
 	private static final MethodHandle SKY_DRAW = OwnShade.ON ? fn("mcs_sky_draw", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT) : null;
@@ -139,6 +140,15 @@ final class OwnNative {
 	static boolean skyInit(long own, int lw, int lh, long noise, int size) {
 		try {
 			return (int) SKY_INIT.invokeExact(own, lw, lh, noise, size) == 1;
+		} catch (Throwable t) {
+			throw rethrow(t);
+		}
+	}
+
+	/** The sky ambient's SH coefficients of ring slot k (mcs_sky_sh), after skyLut. */
+	static boolean skySh(long own, long enc, int k, long params, int length, boolean compute) {
+		try {
+			return (int) SKY_SH.invokeExact(own, enc, k, params, length, compute ? 1 : 0) == 1;
 		} catch (Throwable t) {
 			throw rethrow(t);
 		}
