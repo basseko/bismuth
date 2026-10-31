@@ -1563,7 +1563,7 @@ struct ShadeFrame {
 	float4 sunColor;      // rgb direct light colour x amplitude, w cascade count
 	float4 amb;           // x ambient attenuation at full sun and sky light, y filter radius (blocks), z hemisphere ambient strength (0: the vanilla face shade stays), w sky fill
 	float4 shade;         // rgb: the tint of surfaces the sun does not reach (the sky's colour, normalised), w unused
-	float4 fillc;         // rgb: the colour of the sky fill light, w unused
+	float4 fillc;         // rgb: the colour of the sky fill light, w the grade's red / blue gain ratio (water's tint)
 };
 #endif
 
@@ -2346,6 +2346,8 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 		* getColor(in);
 #ifdef OWN_SHADE
 	if (F_SHADE) {
+		// (water: how blue the texture times its tint is, before any lighting; glass and ice of other colours keep theirs)
+		const float blueW = saturate((color.b - color.r) * 4.0 - 0.3);
 		// alpha holes (leaves) leave before any lighting or shadow work (the alpha only ever shrinks in the code below, so this discards exactly what the late test would)
 		if (CUTOUT && color.a < CUTOUT_LIMIT) discard_fragment();
 		float3 n = shNormal(in.shFace, in.shPos, CUTOUT && in.shFace == 6);
@@ -2368,8 +2370,14 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 		const float3 cool = sf.shade.rgb;
 		float fill = sf.amb.w * S * (0.5 + 0.5 * n.y);
 		color.rgb *= lm.rgb * mix(float3(1.0), cool, S * (1.0 - dir * lit) * 0.7) * (1.0 - sf.amb.x * S) + sf.sunColor.rgb * (dir * lit) + fill * sf.fillc.rgb;
-		// water at night keeps a part of its colour (sf.shade.w, 1 by day): vanilla's water texture is much brighter than the land it lies in
-		if (CUTOUT && CUTOUT_LIMIT < 0.2 && sf.shade.w < 0.999) color.rgb = mix(float3(dot(color.rgb, float3(0.3, 0.5, 0.2))) * float3(0.7, 0.85, 1.0), color.rgb, 0.5) * sf.shade.w;
+		// water (blue translucent terrain) keeps only a part of its colour and brightness (sf.shade.w: the day's and the night's dimming): vanilla's
+		// water texture is much brighter and more saturated than the land it lies in, and lit by the sun it reads cyan. A dark grey-blue slate instead.
+		if (CUTOUT && CUTOUT_LIMIT < 0.2 && blueW > 0.0) {
+			// (sf.fillc.w: the grade's red / blue gain ratio, which the slate's tint cancels: a morning's warm gain would turn it brown)
+			float k = clamp(sf.fillc.w, 0.5, 2.5);
+			float3 slate = float3(dot(color.rgb, float3(0.3, 0.5, 0.2))) * float3(0.7 * rsqrt(k), 0.85, sqrt(k));
+			color.rgb = mix(color.rgb, mix(slate, color.rgb, 0.4) * sf.shade.w, blueW);
+		}
 	}
 #endif
 	// F_LEAN: the chunk visibility is 1 (mix(x, y, 1) is y), the render-distance fog value 0 (max(e, 0) is e for e >= 0)
@@ -3663,8 +3671,10 @@ fragment half4 post_fs(PostV in [[stage_in]], half4 dst [[color(0)]], constant P
 	half3 g = sqrt(mix(min(lin, 1.0h), saturate(mapped), half(f.gk.w)));
 	g = g * half3(f.la.rgb) + half3(f.lb.rgb);
 	half3 o = half3(dot(half3(f.m0.xyz), g) + half(f.m0.w), dot(half3(f.m1.xyz), g) + half(f.m1.w), dot(half3(f.m2.xyz), g) + half(f.m2.w));
-	// one interleaved-gradient noise as a dither, so the stretched dark steps do not band
-	float n = fract(52.9829189 * fract(dot(in.pos.xy, float2(0.06711056, 0.00583715)))) - 0.5;
+	// interleaved-gradient noise as a dither, so the stretched dark steps do not band
+	// (two of them: a triangular noise of +-1 step, which also hides the steps of the 8-bit sky once the grade has stretched them)
+	float2 pp = in.pos.xy;
+	float n = fract(52.9829189 * fract(dot(pp, float2(0.06711056, 0.00583715)))) + fract(52.9829189 * fract(dot(pp.yx + 19.0, float2(0.06711056, 0.00583715)))) - 1.0;
 	o += half(n * (f.la.w * (1.0 / 255.0)));
 	return half4(saturate(o), dst.a);
 }

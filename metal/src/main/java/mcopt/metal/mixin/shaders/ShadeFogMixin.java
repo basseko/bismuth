@@ -5,6 +5,7 @@ import mcopt.metal.own.OwnProbe;
 import net.minecraft.client.Camera;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.fog.environment.AtmosphericFogEnvironment;
+import net.minecraft.world.level.dimension.DimensionType;
 import org.joml.Vector3fc;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -16,7 +17,8 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 abstract class ShadeFogMixin {
 	@Inject(method = "getBaseColor", at = @At("RETURN"), cancellable = true)
 	private void mcopt$shadeFog(ClientLevel level, Camera camera, int renderDistance, float partialTicks, CallbackInfoReturnable<Vector3fc> cir) {
-		if (!OwnProbe.bool("shaders", true)) return;
+		// (the overworld's sky only: this is the fallback fog environment of every dimension, and the tint is that of the last overworld frame)
+		if (!OwnProbe.bool("shaders", true) || level == null || level.dimensionType().skybox() != DimensionType.Skybox.OVERWORLD) return;
 		cir.setReturnValue(OwnLight.tintFog(cir.getReturnValue()));
 	}
 }

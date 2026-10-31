@@ -34,7 +34,7 @@ public final class OwnLight {
 		{0.05f, 1f, 0.7f, 0.46f, 1f, 0.5f, 0.2f, 1f, 0.8f, 0.62f, 1.05f, 0.9f, 1.2f, 1.4f, 1.1f, 0.62f, 0.02f, 0.008f, 0.025f, 0, 0, 0, 0.75f, 0.5f, 0.38f, 0.36f},
 		{0.14f, 1f, 0.72f, 0.5f, 1f, 0.56f, 0.26f, 1f, 0.82f, 0.66f, 1f, 0.9f, 1.15f, 1.4f, 1.08f, 0.62f, 0.02f, 0.012f, 0.025f, 0, 0, 0, 0.75f, 0.46f, 0.4f, 0.41f},
 		{0.3f, 1f, 0.85f, 0.68f, 1f, 0.75f, 0.52f, 0.96f, 0.88f, 0.82f, 0.92f, 0.98f, 1f, 1.28f, 0.98f, 0.68f, 0.015f, 0.015f, 0.03f, 0, 0, 0, 0.75f, 0.45f, 0.43f, 0.47f},
-		{0.47f, 0.95f, 0.93f, 1f, 1f, 0.88f, 0.74f, 0.92f, 0.94f, 1f, 0.8f, 1.0f, 0.85f, 1.2f, 0.92f, 0.72f, 0.012f, 0.012f, 0.025f, 0, 0, 0, 0.75f, 0.257f, 0.393f, 0.712f},
+		{0.47f, 0.95f, 0.93f, 1f, 1f, 0.88f, 0.74f, 0.92f, 0.94f, 1f, 0.8f, 1.0f, 0.85f, 1.2f, 0.92f, 0.72f, 0.012f, 0.012f, 0.025f, 0, 0, 0, 0.75f, 0.217f, 0.398f, 0.814f},
 		{0.85f, 0.86f, 0.93f, 1f, 1f, 0.95f, 0.88f, 0.88f, 0.94f, 1f, 0.82f, 0.96f, 1.05f, 0.78f, 1.04f, 1.1f, 0, 0.005f, 0.03f, 0, 0, 0, 0.75f, 0.386f, 0.5f, 0.754f},
 	};
 
@@ -45,8 +45,8 @@ public final class OwnLight {
 		{1.0f, 1.0f, 1.0f},
 		{1.0f, 1.0f, 1.0f},
 		{1.0f, 1.0f, 1.0f},
-		{1.03f, 0.995f, 0.95f},
-		{1.07f, 0.99f, 0.89f},
+		{1.12f, 0.96f, 0.82f},
+		{1.2f, 0.94f, 0.72f},
 		{1.1f, 1.08f, 1.04f},
 	};
 
@@ -87,12 +87,12 @@ public final class OwnLight {
 				ambient[k] += (0.88f + 0.12f * ambient[k] - ambient[k]) * r * 0.6f;
 				shade[k] += (1.0f - shade[k]) * r * 0.6f;
 			}
-			grade[SAT] *= 1 - 0.5f * r;
+			grade[SAT] *= 1 - 0.55f * r;
 			grade[CONTRAST] *= 1 - 0.1f * r;
-			grade[EXPO] *= 1 + 0.0f * r;
+			grade[EXPO] *= 1 + 0.07f * r;
 			grade[GAIN] += (0.78f - grade[GAIN]) * r * 0.8f;
-			grade[GAIN + 1] += (1.12f - grade[GAIN + 1]) * r * 0.8f;
-			grade[GAIN + 2] += (1.18f - grade[GAIN + 2]) * r * 0.8f;
+			grade[GAIN + 1] += (1.22f - grade[GAIN + 1]) * r * 0.8f;
+			grade[GAIN + 2] += (1.16f - grade[GAIN + 2]) * r * 0.8f;
 			grade[LIFT] = Math.max(grade[LIFT], 0.04f * r);
 			grade[LIFT + 1] = Math.max(grade[LIFT + 1], 0.045f * r);
 			grade[LIFT + 2] = Math.max(grade[LIFT + 2], 0.06f * r);
@@ -119,11 +119,20 @@ public final class OwnLight {
 		return new org.joml.Vector3f(Math.min(1, c.x() * fogTint[0]), Math.min(1, c.y() * fogTint[1]), Math.min(1, c.z() * fogTint[2]));
 	}
 
-	/** How much of its colour water keeps at night (the moon's light is faint; vanilla's water texture is brighter than the land). */
+	/**
+	 * The brightness multiplier of translucent blue (water) in the shaded fragment path, which also desaturates it toward a dark slate:
+	 * vanilla's water texture is much brighter than the land it lies in, and under the sun's added light and the grade's lift it reads as a vivid cyan
+	 * (BSL's water is a dark, grey-blue slate). Darker still at night (the moon's light is faint). Rain keeps the day figure.
+	 */
 	static float waterDim() {
 		float night = 1.0f - Math.max(0.0f, Math.min(1.0f, (el + 0.12f) / 0.2f));
-		return 1.0f - 0.6f * night;
+		return WATER_DAY - (WATER_DAY - 0.4f) * night;
 	}
+	/** The grade's red / blue gain ratio: the water's slate tint is divided by it, so the graded water keeps its grey-blue by day and by sunset. */
+	static float waterTintK() {
+		return Math.max(0.5f, Math.min(2.5f, grade[GAIN] / Math.max(0.05f, grade[GAIN + 2])));
+	}
+	private static final float WATER_DAY = Float.parseFloat(System.getProperty("mcopt.shaders.waterDay", "0.62"));
 
 	/** The sky light colour the lightmap gets (relative, the brightest component 1). */
 	public static float[] ambient() {

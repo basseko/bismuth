@@ -350,6 +350,7 @@ public final class OwnShade {
 			MemoryUtil.memPutFloat(fb + 280, HEMI);
 			MemoryUtil.memPutFloat(fb + 284, FILL);
 			MemoryUtil.memPutFloat(fb + 300, OwnLight.waterDim());
+			MemoryUtil.memPutFloat(fb + 316, OwnLight.waterTintK());
 			// shade tint (what the sun does not reach) and the sky fill's colour
 			for (int c = 0; c < 3; c++) {
 				MemoryUtil.memPutFloat(fb + 288 + c * 4L, useSun ? OwnLight.shade[c] : 0.84f + 0.08f * c);
