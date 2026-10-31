@@ -41,6 +41,8 @@ public final class OwnPost {
 			java.nio.FloatBuffer b = MemoryUtil.memFloatBuffer(p, BYTES / 4);
 			RenderTarget main = renderer.mainRenderTarget();
 			OwnLight.postFrame(b, OwnProbe.bool("shaders.postnop", false), main.width, main.height, BLOOM_ON && OwnProbe.bool("shaders.bloom", true));
+			// volumetric light (OwnVolume): the pass composites it; the screen-space shafts (PostFrame.bl.y) are toned down so they do not double up
+			if (OwnVolume.ON && OwnVolume.prepare(t, renderer.gameRenderState().levelRenderState.cameraRenderState)) b.put(25, b.get(25) * OwnVolume.SHAFT_KEEP);
 			long target = MetalBridge.textureHandle(main.getColorTexture());
 			// the world's encoder is normally still open on the main target: draw straight into it. (If it is not, the vanilla pass API
 			// reopens one with the colour loaded: the split a plain post pass would always pay.)

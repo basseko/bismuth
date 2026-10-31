@@ -4203,6 +4203,9 @@ struct PostFrame {
 	float4 sz;      // x 1/width, y 1/height of the main target, z aspect (w / h), w 0
 	float4 sun;     // xy sun position in uv (v down), z in front of the camera (0..1 fade), w 0
 	float4 ws;      // x 1: write tile water's scene for the next frame (sceneSrc is bound)
+	float4 wx;      // 176..191: reserved for the water track
+	float4 vol0;    // 192: x 1: the volumetric light result is bound (volTex, volDist), y 1/quarter width, z 1/quarter height, w 0
+	float4 vol1;    // 208: x composite strength, y the march's maximum distance (blocks), z the strength over the sky, w 0
 };
 
 struct PostV {
@@ -4215,12 +4218,108 @@ vertex PostV post_vs(uint vid [[vertex_id]]) {
 	return o;
 }
 
+// ---- volumetric light (-Dmcopt.shaders.volumetric; OwnVolume, mcown.m mcs_post): shadow-mapped light shafts in an exponential height fog ----
+// vol_march (a compute kernel in the pre command buffer, a quarter of the screen) marches each pixel's ray from the camera to the scene distance of the
+// PREVIOUS frame (the half-size scene copy post_fs writes: colour, and the nearest distance in alpha), one hard compare against the frame's shadow cascades per
+// step, in a fog whose density falls off exponentially with height. Out: the in-scattered light (rgb) and the transmittance (a); the distance it marched in a
+// second texture for the depth-aware upsample. post_fs composites it in linear light before the grade: colour * T + in-scatter. The phase function is the
+// two-lobe Henyey-Greenstein (Henyey and Greenstein 1941) mix 0.7 HG(+0.5) + 0.3 HG(-0.2), the usual forward-peaked Mie look.
+struct VolFrame {
+	float4 fwd;    // xyz forward (world, as SkyFrame), w the camera's world y
+	float4 right;  // xyz right x tan(half fov x)
+	float4 up;     // xyz up x tan(half fov y)
+	float4 p0;     // x extinction per block at the reference height, y height scale (blocks), z reference height (world y), w maximum march distance (blocks)
+	float4 p1;     // x steps, y jitter phase (0..1, per frame), zw unused
+	float4 sunc;   // rgb the light's in-scatter colour (phase and shadow multiply it)
+	float4 ambc;   // rgb the sky's ambient in-scatter colour (no shadow)
+	float4 dims;   // unused
+};
+
+// the normalised two-lobe phase (4 pi x the density: an isotropic medium is 1)
+static float vlPhase(float c) {
+	float k1 = 1.25 - c, k2 = 1.04 + 0.4 * c;
+	return 0.7 * 0.75 / (k1 * sqrt(k1)) + 0.3 * 0.96 / (k2 * sqrt(k2));
+}
+
+// 1 lit, 0 in shadow: one hard compare in the first cascade that holds the point comfortably, lit outside all
+static float vlLit(constant ShadeFrame &sf, depth2d_array<float> sm, float3 p) {
+	uint count = uint(sf.sunColor.w);
+	for (uint c = 0; c < count; c++) {
+		float4 q = sf.clip[c] * float4(p, 1.0);
+		float2 uv = q.xy * 0.5 + 0.5;
+		float2 e = min(uv, 1.0 - uv);
+		if (min(e.x, e.y) > 0.02) {
+			if (q.z >= 1.0 || q.z <= 0.0) return 1.0;
+			return sm.sample_compare(shCmp, uv, c, q.z - sf.info[c].x * 1.6 * sf.info[c].y);
+		}
+	}
+	return 1.0;
+}
+
+kernel void vol_march(texture2d<float> scene [[texture(0)]], depth2d_array<float> sm [[texture(1)]], texture2d<float, access::write> outC [[texture(2)]],
+	texture2d<float, access::write> outD [[texture(3)]], constant VolFrame &v [[buffer(0)]], constant ShadeFrame &sf [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
+	uint W = outC.get_width(), H = outC.get_height();
+	if (gid.x >= W || gid.y >= H) return;
+	// the pixel's distance: the mean of the 2 x 2 scene texels it covers (each capped at the march's range; the sky is far)
+	uint2 sm0 = min(gid * 2, uint2(scene.get_width() - 1, scene.get_height() - 1)), sm1 = min(sm0 + 1, uint2(scene.get_width() - 1, scene.get_height() - 1));
+	float cap = v.p0.w;
+	float D = 0.25 * (min(scene.read(sm0).a, cap) + min(scene.read(uint2(sm1.x, sm0.y)).a, cap) + min(scene.read(uint2(sm0.x, sm1.y)).a, cap) + min(scene.read(sm1).a, cap));
+	float2 uv = (float2(gid) + 0.5) / float2(W, H);
+	float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+	float3 dir = normalize(v.fwd.xyz + v.right.xyz * ndc.x - v.up.xyz * ndc.y);
+	float phase = vlPhase(dot(dir, sf.sunDir.xyz));
+	const int N = 14;
+	float jit = fract(shIgn(float2(gid)) + v.p1.y);
+	float T = 1.0;
+	float3 acc = float3(0.0);
+	float b0 = 0.0;
+	for (int i = 0; i < N; i++) {
+		float b1 = D * pow(float(i + 1) / float(N), 1.5);
+		float ds = b1 - b0, t = b0 + ds * jit;
+		float3 p = dir * t;
+		float y = v.fwd.w + p.y;
+		float sig = v.p0.x * exp(min((v.p0.z - y) / v.p0.y, 2.0));
+		float tr = exp(-sig * ds);
+		float lit = vlLit(sf, sm, p);
+		acc += T * (1.0 - tr) * (v.sunc.rgb * (phase * lit) + v.ambc.rgb);
+		T *= tr;
+		b0 = b1;
+	}
+	outC.write(float4(acc, T), gid);
+	outD.write(float4(D), gid);
+}
+
+// the composite: the quarter-resolution result, weighted by how close each of the 4 nearest texels' marched distance is to this pixel's own (the alpha code)
+static half3 volComposite(half3 lin, texture2d<float> volTex, texture2d<float> volDist, constant PostFrame &f, float a, float2 pp) {
+	float dOwn = shDDecode(a);
+	if (dOwn < 0.0) return lin;  // (unknown distance: the hand, entities, the far terrain: no fog)
+	float dc = min(dOwn, f.vol1.y);
+	float2 q = pp * 0.25 - 0.5, fr = fract(q);
+	int2 i0 = int2(floor(q)), mx = int2(volTex.get_width() - 1, volTex.get_height() - 1);
+	float4 acc = float4(0.0);
+	float ws = 0.0;
+	for (int k = 0; k < 4; k++) {
+		int2 c = clamp(i0 + int2(k & 1, k >> 1), int2(0), mx);
+		float bw = ((k & 1) != 0 ? fr.x : 1.0 - fr.x) * ((k >> 1) != 0 ? fr.y : 1.0 - fr.y);
+		float de = (volDist.read(uint2(c)).r - dc) / (0.08 * dc + 0.5);
+		float w = bw / (0.01 + de * de);
+		acc += volTex.read(uint2(c)) * w;
+		ws += w;
+	}
+	acc /= max(ws, 1e-6);
+	float s = dOwn > 1e3 ? f.vol1.z : f.vol1.x;  // (the sky: the dome's own atmosphere is already in it, only a part of the fog counts)
+	float T = mix(1.0, acc.a, s);
+	float3 ins = acc.rgb / (1.0 + 0.7 * max(acc.r, max(acc.g, acc.b)));  // (a soft limit: looking into a low sun through a long fog must not burn the picture out)
+	return lin * half(T) + half3(ins * s) * half3(f.gk.rgb);
+}
+
 // The tone curve is Narkowicz's fit of the ACES filmic curve (public; 2015). Half precision: the target is 8 bits.
 // Bloom and light shafts (milestone 6): this pass also WRITES a half-resolution source texture (bright-pass colour + sky mask; a 2x2 quad average,
 // one write per quad) that compute kernels blur and march in the next frame's pre command buffer (bloom_down / bloom_up); this pass ADDS the
 // result of the previous frame (bloomTex, a quarter-resolution RGBA16F: bloom in rgb, shaft strength in a). One frame of lag, no pass split.
 fragment half4 post_fs(PostV in [[stage_in]], half4 dst [[color(0)]], constant PostFrame &f [[buffer(0)]], texture2d<half> bloomTex [[texture(0)]],
-	texture2d<half, access::write> bloomSrc [[texture(1)]], texture2d<float, access::write> sceneSrc [[texture(2)]], uint lane [[thread_index_in_quadgroup]]) {
+	texture2d<half, access::write> bloomSrc [[texture(1)]], texture2d<float, access::write> sceneSrc [[texture(2)]], texture2d<float> volTex [[texture(3)]],
+	texture2d<float> volDist [[texture(4)]], uint lane [[thread_index_in_quadgroup]]) {
 	if (f.ws.x > 0.5) {
 		// tile water's scene for the next frame (OwnWater.TILE, half size): the colour before the grade (a quad mean) and the quad's nearest distance from the
 		// alpha code (the sky and unknown: far)
@@ -4235,6 +4334,7 @@ fragment half4 post_fs(PostV in [[stage_in]], half4 dst [[color(0)]], constant P
 	if (f.lb.w > 0.5) return half4(dst.rgb, 1.0h);  // (probe shaders.postnop: the pass without its maths, to measure the pass's own cost)
 	// display -> linear with gamma 2 (a multiply instead of a pow), expose and balance, tone curve, back with a square root
 	half3 lin = dst.rgb * dst.rgb * half3(f.gk.rgb);
+	if (f.vol0.x > 0.5) lin = volComposite(lin, volTex, volDist, f, float(dst.a), in.pos.xy);
 	half3 mapped = (lin * (2.51h * lin + 0.03h)) / (lin * (2.43h * lin + 0.59h) + 0.14h);
 	half3 g = sqrt(mix(min(lin, 1.0h), saturate(mapped), half(f.gk.w)));
 	g = g * half3(f.la.rgb) + half3(f.lb.rgb);
