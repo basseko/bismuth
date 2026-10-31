@@ -39,13 +39,16 @@ public final class OwnShade {
 	static final int TAPS = Integer.getInteger("mcopt.shaders.shadow.taps", 12);
 	static final float SOFT = Float.parseFloat(System.getProperty("mcopt.shaders.shadow.soft", "0.10"));
 	static final float AMBIENT_CUT = Float.parseFloat(System.getProperty("mcopt.shaders.ambientCut", "0.25"));
+	static final float AMB_FLOOR = Float.parseFloat(System.getProperty("mcopt.shaders.ambient.floor", "0.55"));
+	static final float AMB_GAIN = Float.parseFloat(System.getProperty("mcopt.shaders.ambient.gain", "1.0"));
+	static final float AMB_FOLIAGE = Float.parseFloat(System.getProperty("mcopt.shaders.ambient.foliage", "0.6"));
 	static final float FILL = Float.parseFloat(System.getProperty("mcopt.shaders.fill", "0.09"));
 	/** 1: the baked vanilla face shade is replaced by a hemisphere ambient (up 1, side 0.6, down 0.4) wherever the sun applies; 0: kept. */
 	static final float HEMI = Float.parseFloat(System.getProperty("mcopt.shaders.hemi", "1.0"));
 	static final float SUN_AMP = Float.parseFloat(System.getProperty("mcopt.shaders.sunAmp", "0.72"));
 	/** The light-space depth range: blocks toward the light that still cast, and beyond the box's centre plane. */
 	private static final double CASTER = 320.0, BEYOND = 192.0;
-	private static final int FRAME_BYTES = 368, CULL_BYTES = 160, CULLFRAME_BYTES = 144, DRAW_BYTES = OwnTerrain.DRAW_FRAME_BYTES;
+	private static final int FRAME_BYTES = 640, CULL_BYTES = 160, CULLFRAME_BYTES = 144, DRAW_BYTES = OwnTerrain.DRAW_FRAME_BYTES;
 
 	/** This frame draws the shaded terrain variant (set by {@link #frame}; read at the one choke point, OwnNative.draw). */
 	static boolean frameActive;
@@ -376,6 +379,13 @@ public final class OwnShade {
 			MemoryUtil.memPutFloat(fb + 348, OwnSky.rain);
 			for (int c = 0; c < 3; c++) MemoryUtil.memPutFloat(fb + 352 + c * 4L, OwnSky.warmTint[c]);
 			MemoryUtil.memPutFloat(fb + 364, OwnSky.warm);
+			// bytes 512..527 (ambient track): the SH sky ambient on (only with the sun up: the moon keeps the lightmap), its gain, the foliage's share of the up irradiance
+			if (OwnSky.shReady && useSun) {
+				MemoryUtil.memPutFloat(fb + 512, 1f);
+				MemoryUtil.memPutFloat(fb + 516, AMB_GAIN);
+				MemoryUtil.memPutFloat(fb + 520, AMB_FOLIAGE);
+				MemoryUtil.memPutFloat(fb + 524, AMB_FLOOR);
+			}
 			OwnNative.shadeFrame(own, k, fb, FRAME_BYTES, 0f, 0f);
 			// milestone 5: entities and items (vanilla pipelines) take the same block and shadow map; cascade 0 also takes their casters
 			if (EntityShade.ON && OwnProbe.bool("shaders.entities", true)) EntityShade.publish(fb, k, sunOn && render);

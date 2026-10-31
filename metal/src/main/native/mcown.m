@@ -139,7 +139,7 @@ static struct {
 	id<MTLTexture> tex[SHADE_RING];
 	int res, layers, ring;
 	id<MTLTexture> cur;               // this frame's shadow map (bound at fragment texture 24 by shaded draws)
-	uint8_t frame[512];               // this frame's ShadeFrame block (fragment buffer 30)
+	uint8_t frame[640];               // this frame's ShadeFrame block (fragment buffer 30)
 	int frameLen;
 	id<MTLComputePipelineState> cull; // shade_cull
 	id<MTLDepthStencilState> depthLess;
@@ -153,7 +153,9 @@ static struct {
 	int lw, lh;
 	id<MTLTexture> cur;               // this frame's table
 	id<MTLTexture> noise;             // the cloud noise (RGBA8, tileable, bound at the dome's fragment texture 1)
-	id<MTLComputePipelineState> lutPso;
+	id<MTLComputePipelineState> lutPso, shPso;
+	id<MTLBuffer> sh[SKY_RING];       // the sky ambient's 9 SH coefficients (sky_sh), one per ring slot; bound at the terrain's fragment buffer 29
+	id<MTLBuffer> shCur;
 	id<MTLRenderPipelineState> dome[4];
 	MTLPixelFormat color[4], depth[4];
 	int n;
@@ -887,6 +889,7 @@ drawCall:
 		[r setFragmentBytes:sh.frame length:(NSUInteger) sh.frameLen atIndex:30];
 		[r setFragmentTexture:sh.cur atIndex:24];
 		[r setFragmentTexture:sk.cur atIndex:25];
+		if (sk.shCur) [r setFragmentBuffer:sk.shCur offset:0 atIndex:29];  // (the sky ambient's SH coefficients, mcopt.shaders.ambient.sh)
 		[r setFragmentTexture:light atIndex:17];
 		[r setFragmentSamplerState:lightSampler atIndex:15];
 	}
@@ -2494,6 +2497,14 @@ int mcs_sky_init(Own *w, int lw, int lh, const uint8_t *noise, int size) {
 			if (!sk.lut[i]) return 0;
 			sk.lut[i].label = [NSString stringWithFormat:@"shade sky table %d", i];
 		}
+		for (int i = 0; i < SKY_RING; i++) {
+			if (!sk.sh[i]) {
+				sk.sh[i] = [w->ctx->device newBufferWithLength:144 options:MTLResourceStorageModePrivate];
+				if (!sk.sh[i]) return 0;
+				sk.sh[i].label = @"shade sky SH";
+			}
+		}
+		if (!sk.shCur) sk.shCur = sk.sh[0];
 		sk.lw = lw;
 		sk.lh = lh;
 		sk.cur = sk.lut[0];
@@ -2530,6 +2541,30 @@ int mcs_sky_lut(Own *w, Enc *enc, int k, const void *p, int length, int compute)
 		[c endEncoding];
 	}
 	sk.cur = t;
+	return 1;
+}
+
+// The sky ambient's SH coefficients of ring slot k (terrain.metal sky_sh): projects the displayed sky of the table of slot k, in the pre command buffer after
+// mcs_sky_lut. compute 0: the slot still holds them. p: a SkyShP (48 bytes).
+int mcs_sky_sh(Own *w, Enc *enc, int k, const void *p, int length, int compute) {
+	id<MTLComputePipelineState> pso = ownLazyKernel(w, &sk.shPso, "sky_sh");
+	id<MTLTexture> t = sk.lut[k % SKY_RING];
+	id<MTLBuffer> b = sk.sh[k % SKY_RING];
+	if (!pso || !t || !b || length > 64) return 0;
+	if (compute) {
+		mc_pre_end_encoders(enc);
+		@autoreleasepool {
+			id<MTLComputeCommandEncoder> c = [mc_profiled_compute(enc, mc_pre(enc), MTLDispatchTypeSerial) autorelease];
+			c.label = @"shade sky SH";
+			[c setComputePipelineState:pso];
+			[c setBytes:p length:(NSUInteger) length atIndex:0];
+			[c setBuffer:b offset:0 atIndex:1];
+			[c setTexture:t atIndex:0];
+			[c dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+			[c endEncoding];
+		}
+	}
+	sk.shCur = b;
 	return 1;
 }
 

@@ -1578,6 +1578,9 @@ struct ShadeFrame {
 	float4 haze;          // x aerial perspective density (1 / blocks), y haze strength 0..1 (0: vanilla's fog colour), z sky exposure, w height falloff (1 / blocks)
 	float4 sunTrue;       // xyz the true sun direction (the sky look-up table's azimuth origin), w rain
 	float4 skyWarm;       // rgb the sun's colour at the camera (normalised), w how far the sky is pulled toward it (a low sun's aerosol glow)
+	float4 padOther[9];   // bytes 368..511: other tracks
+	float4 ambSh;         // bytes 512..527 (ambient track): x spherical-harmonics sky ambient on (0: the hemisphere ambient), y gain, z foliage share of the up irradiance, w unused
+	float4 padRest[7];    // bytes 528..639 reserved (ambient track), the block is 640 bytes
 };
 #endif
 
@@ -2807,12 +2810,21 @@ static float4 shOut(float4 c, float4 dstC, float3 pos, float2 pix) {
 }
 #endif
 
+#ifdef OWN_SHADE
+// the irradiance (over pi) toward n from the sky_sh coefficients (the table's frame)
+static float3 skShIrr(device const float4 *c, float3 n) {
+	return c[0].rgb * 0.282095 + (c[1].rgb * n.y + c[2].rgb * n.z + c[3].rgb * n.x) * 0.488603
+		+ c[4].rgb * (1.092548 * n.x * n.y) + c[5].rgb * (1.092548 * n.y * n.z) + c[6].rgb * (0.315392 * (3.0 * n.z * n.z - 1.0))
+		+ c[7].rgb * (1.092548 * n.x * n.z) + c[8].rgb * (0.546274 * (n.x * n.x - n.y * n.y));
+}
+#endif
+
 fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]], constant Terrain &t [[buffer(23)]], constant Fog &fog [[buffer(24)]],
 	texture2d<float> atlas [[texture(16)]], sampler atlasSampler [[sampler(14)]]
 #ifdef OWN_SHADE
 	, constant ShadeFrame &sf [[buffer(30), function_constant(F_SHADE)]], depth2d_array<float> shadowMap [[texture(24), function_constant(F_SHADE)]],
 	texture2d<float> shLightmap [[texture(17), function_constant(F_SHW)]], sampler shLmSmp [[sampler(15), function_constant(F_SHW)]],
-	texture2d<float> skLut [[texture(25), function_constant(F_SHADE)]]
+	texture2d<float> skLut [[texture(25), function_constant(F_SHADE)]], device const float4 *skSh [[buffer(29), function_constant(F_SHADE)]]
 #ifdef OWN_WATER
 	, constant WaterFrame &wf [[buffer(12), function_constant(F_WATER)]], texture2d<float> wScene [[texture(27), function_constant(F_WATER)]],
 	texture2d<float, access::read> wDepth [[texture(28), function_constant(F_WATER)]]
@@ -2887,11 +2899,26 @@ fragment float4 own_fs(VOut in [[stage_in]], constant Globals &g [[buffer(22)]],
 		float vs = in.shFace == 2 ? 1.0 : in.shFace == 3 ? 0.5 : in.shFace < 2 ? 0.6 : in.shFace < 6 ? 0.8 : 1.0;
 		float hemi = n.y >= 0.0 ? 0.6 + 0.4 * n.y : 0.6 + 0.2 * n.y;
 		if (foliage) hemi = mix(hemi, 1.0, 0.45);
-		color.rgb *= mix(1.0, hemi / vs, S * sf.amb.z);
+		const bool ambSh = sf.ambSh.x > 0.0;
+		color.rgb *= mix(1.0, (ambSh ? 1.0 : hemi) / vs, ambSh ? access * sf.amb.z : S * sf.amb.z);
 		// ambient (the vanilla lightmap, partly replaced by the sun, cooler where the sun does not reach) + sun x shadow + a sky fill
 		const float3 cool = sf.shade.rgb;
 		float fill = sf.amb.w * S * (0.5 + 0.5 * n.y);
-		color.rgb *= lm.rgb * mix(float3(1.0), cool, S * (1.0 - dir * lit) * 0.7) * (1.0 - sf.amb.x * S) + sf.sunColor.rgb * (dir * lit) + fill * sf.fillc.rgb;
+		float3 ambient = lm.rgb * mix(float3(1.0), cool, S * (1.0 - dir * lit) * 0.7) * (1.0 - sf.amb.x * S) + fill * sf.fillc.rgb;
+		if (ambSh) {
+			// the sky's own irradiance toward the normal (L2 SH of the displayed sky, see sky_sh) x the lightmap's sky part, plus the lightmap's block part (torches)
+			float3 lmB = shLightmap.sample(shLmSmp, float2(float(in.shLight.x), 0.03125), level(0.0)).rgb;
+			float skyAmt = dot(max(lm.rgb - lmB, 0.0), float3(0.3, 0.59, 0.11));
+			float2 hs = normalize(sf.sunTrue.xz + float2(1e-5, 0.0));
+			float3 nl = float3(dot(n.xz, hs), n.y, hs.x * n.z - hs.y * n.x);  // (n in the table's frame: the sun toward +x)
+			float3 irr = skShIrr(skSh, nl);
+			if (foliage) irr = mix(irr, skShIrr(skSh, float3(0.0, 1.0, 0.0)), sf.ambSh.z);
+			// (the dusk sky is dark: the average radiance is lifted to a floor sf.ambSh.w, keeping its colour, so the shade is not black where today's was grey)
+			float avgL = dot(skSh[0].rgb * 0.282095, float3(0.3, 0.59, 0.11));
+			irr *= clamp(sf.ambSh.w / max(avgL, 1e-3), 1.0, 4.0);
+			ambient = mix(ambient, lmB + max(irr, 0.0) * (skyAmt * sf.ambSh.y), sf.ambSh.x);
+		}
+		color.rgb *= ambient + sf.sunColor.rgb * (dir * lit);
 		// water (blue translucent terrain) keeps only a part of its colour and brightness (sf.shade.w: the day's and the night's dimming): vanilla's
 		// water texture is much brighter and more saturated than the land it lies in, and lit by the sun it reads cyan. A dark grey-blue slate instead.
 		if (CUTOUT && CUTOUT_LIMIT < 0.2 && blueW > 0.0) {
@@ -4422,6 +4449,66 @@ kernel void sky_lut(texture2d<float, access::write> out [[texture(0)]], constant
 	}
 	float3 c = (L + Lms * (0.0795775 * P.misc.x)) * P.sun.w;
 	out.write(float4(c, 1.0), gid);
+}
+
+// ---- sky ambient (spherical harmonics): the displayed sky colour of every direction projected onto L2 SH, cosine-convolved ----
+// One threadgroup, run when the table is rebuilt. Writes 9 float4 (rgb) = c_lm x A_l / pi (A = pi, 2 pi / 3, pi / 4), so that the irradiance over pi
+// toward n is the plain sum of coefficient x basis(n). The frame is the table's: the sun in the +x half of the xy plane (the shader rotates n into it).
+// Technique: Ramamoorthi and Hanrahan 2001 (irradiance environment maps); structure after Photon Shaders d4a_generate_sky_sh (c) Benjamin Stott, Photon licence.
+struct SkyShP {
+	float4 sun;    // x sin(sun elevation), y cos, z unused, w unused
+	float4 misc;   // x sky exposure, y rain, z ground albedo, w unused
+	float4 warm;   // rgb the sun's colour at the camera (normalised), w how far the sky is pulled toward it
+};
+
+static float3 skAmbDisp(texture2d<float> lut, float3 V, float3 S, constant SkyShP &P) {
+	float sE = V.y;
+	float phi = acos(clamp(V.x / max(length(V.xz), 1e-4), -1.0, 1.0));
+	float2 uv = float2(sin(0.5 * phi), sign(sE) * sqrt(abs(sE)) * 0.5 + 0.5);
+	float cs = dot(V, S);
+	float e = max(sE, 0.0);
+	float3 rad = lut.sample(skSmp, uv, level(0.0)).rgb * P.misc.x;
+	return skOvercast(skWarm(skTone(skLift(skBlue(rad, e, cs, S.y, P.misc.y), e, S.y, cs)), P.warm), P.misc.y);
+}
+
+kernel void sky_sh(texture2d<float> lut [[texture(0)]], constant SkyShP &P [[buffer(0)]], device float4 *outSh [[buffer(1)]],
+	uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+	threadgroup float part[8][27];
+	const float3 S = float3(P.sun.y, P.sun.x, 0.0);
+	// the ground: albedo x (the sky straight up + the sun's light on a horizontal surface)
+	const float3 zen = skAmbDisp(lut, float3(0.0, 1.0, 0.0), S, P);
+	const float3 ground = P.misc.z * (zen * 0.9 + P.warm.rgb * max(S.y, 0.0) * 0.7);
+	float acc[27];
+	for (int i = 0; i < 27; i++) acc[i] = 0.0;
+	// 64 azimuths x 32 heights on an equal-area grid: thread tid takes height row tid / 8 (4 per thread over 8 threads...): 256 threads x 8 samples
+	for (uint j = 0; j < 8; j++) {
+		uint idx = tid * 8 + j;           // 0..2047
+		uint ia = idx & 63u, ih = idx >> 6;  // 64 azimuth cells x 32 height cells
+		float y = 1.0 - (float(ih) + 0.5) * (2.0 / 32.0);
+		float ph = (float(ia) + 0.5) * (6.2831853 / 64.0);
+		float r = sqrt(max(1.0 - y * y, 0.0));
+		float3 V = float3(r * cos(ph), y, r * sin(ph));
+		float3 L = y >= 0.0 ? skAmbDisp(lut, V, S, P) : ground;
+		float b[9] = {0.282095, 0.488603 * V.y, 0.488603 * V.z, 0.488603 * V.x, 1.092548 * V.x * V.y, 1.092548 * V.y * V.z,
+			0.315392 * (3.0 * V.z * V.z - 1.0), 1.092548 * V.x * V.z, 0.546274 * (V.x * V.x - V.y * V.y)};
+		for (int k = 0; k < 9; k++) {
+			acc[k * 3] += L.x * b[k];
+			acc[k * 3 + 1] += L.y * b[k];
+			acc[k * 3 + 2] += L.z * b[k];
+		}
+	}
+	for (int i = 0; i < 27; i++) {
+		float v = simd_sum(acc[i]);
+		if (lane == 0) part[sg][i] = v;
+	}
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+	if (tid < 9) {
+		float3 c = float3(0.0);
+		for (uint g = 0; g < 8; g++) c += float3(part[g][tid * 3], part[g][tid * 3 + 1], part[g][tid * 3 + 2]);
+		c *= 12.5663706 / 2048.0;  // (4 pi / N)
+		c *= tid == 0 ? 1.0 : tid < 4 ? 0.6666667 : 0.25;  // (A_l / pi)
+		outSh[tid] = float4(c, 0.0);
+	}
 }
 
 struct SkyFrame {
