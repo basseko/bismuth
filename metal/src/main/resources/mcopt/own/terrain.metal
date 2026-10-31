@@ -2549,9 +2549,14 @@ static float4 wSsr(float3 p, float3 r, float jitter, constant WaterFrame &wf, te
 	float zs = wZ(sdepth, qh, wf);
 	// thickness: the ray may pass behind a surface by this much (view depth, blocks) and still count as hitting it
 	float wr = 1.0 / mix(k0, k1, hi), ws = zs - A > 1e-7 ? B / (zs - A) : 1e9;
-	if (wr - ws > wf.proj.z + 0.05 * ws) return float4(0.0);
+	// (a true crossing leaves the ray all but on the surface after the bisection; a ray that merely enters a thin object's silhouette from the side is behind
+	// it by anything up to the thickness, and the same object then smears into a streak across every pixel whose ray passes behind it: so the allowed depth
+	// is small, the confidence falls off with it)
+	float thick = min(wf.proj.z, 0.3 + 0.04 * ws);
+	float dd = wr - ws;
+	if (dd > thick) return float4(0.0);
 	float2 e = min(qh, W - qh);
-	float conf = saturate(min(e.x, e.y) / (0.06 * W.y));
+	float conf = saturate(min(e.x, e.y) / (0.06 * W.y)) * (1.0 - 0.6 * dd / thick);
 	return float4(scene.sample(wLin, qh * wf.screen.zw, level(0.0)).rgb, conf);
 }
 
@@ -2618,7 +2623,7 @@ static float4 waterSurface(VOut in, float3 gnRaw, float3 tint, float3 lm, float 
 			float zs = wZ(sdepth, in.pos.xy, wf);
 			float dRay = zs <= 0.0 ? wf.sigma.w : min(length(wRecon(in.pos.xy, zs, wf) - p), wf.sigma.w);
 			// refraction: where the bent ray lands, relative to where the flat surface would send it (so calm water shifts nothing)
-			float3 ph = p + v * dRay + (refract(v, Nf, 0.752) - refract(v, gnf, 0.752)) * dRay;
+			float3 ph = p + v * dRay + (refract(v, Nf, 0.752) - refract(v, gnf, 0.752)) * (dRay * 0.55);  // (0.55: the shore's contour wobbles, but does not shred)
 			float4 cp = wf.viewProj * float4(ph, 1.0);
 			float2 uv = in.pos.xy * wf.screen.zw;
 			float dUse = dRay;
@@ -2633,9 +2638,14 @@ static float4 waterSurface(VOut in, float3 gnRaw, float3 tint, float3 lm, float 
 					}
 				}
 			}
-			float3 bed = scene.sample(wLin, uv, level(0.0)).rgb;
-			bed = mix(bed, float3(dot(bed, float3(0.3, 0.59, 0.11))), 0.12) * 0.74;  // (a lit bed seen through water is a little duller than in air; the absorption does the rest)
-			float3 T = exp(-wf.sigma.rgb * dUse);
+			// the bed through a four-tap tent (the copy is half size and linear; the taps soften the one-block steps of a voxel bed and the refraction's seams)
+			const float2 o = wf.screen.zw * 1.5;
+			float3 bed = 0.25 * (scene.sample(wLin, uv + float2(o.x, o.y), level(0.0)).rgb + scene.sample(wLin, uv + float2(-o.x, o.y), level(0.0)).rgb
+				+ scene.sample(wLin, uv + float2(o.x, -o.y), level(0.0)).rgb + scene.sample(wLin, uv + float2(-o.x, -o.y), level(0.0)).rgb);
+			// (a lit bed seen through water is duller and greyer than in air, most where the water is shallow: the sand of a shore is grey, not white. The light
+			// has also been through the water on its way down: a base depth of absorption, so no depth is quite clear)
+			bed = mix(bed, float3(dot(bed, float3(0.3, 0.59, 0.11))), 0.30) * 0.56;
+			float3 T = exp(-wf.sigma.rgb * (dUse + 0.45));
 			trans = bed * T + scatter * (1.0 - T);
 			trans = mix(trans, float3(dot(trans, float3(0.3, 0.59, 0.11))), 0.18);  // (grey-blue, not saturated: a river's water is full of silt)
 		} else {
