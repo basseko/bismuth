@@ -308,6 +308,13 @@ id<MTLBuffer> mco_buffer(Ctx *ctx, uint64_t size, int shared) {
 	return b;
 }
 
+// a small private buffer for declared slots a dispatch never reads or writes (Metal API validation wants every declared slot bound)
+static id<MTLBuffer> ownSpareBuf;
+static id<MTLBuffer> ownSpare(Own *w) {
+	if (!ownSpareBuf) ownSpareBuf = mco_buffer(w->ctx, 4096, 0);
+	return ownSpareBuf;
+}
+
 void *mco_contents(id<MTLBuffer> b) {
 	return b.contents;
 }
@@ -915,7 +922,7 @@ drawCall:
 		mce_set_fragment_bytes(r, sh.frame, (NSUInteger) sh.frameLen, 30);
 		mce_set_fragment_texture(r, sh.cur, 24);
 		mce_set_fragment_texture(r, sk.cur, 25);
-		if (sk.shCur) mce_set_fragment_buffer(r, sk.shCur, 0, 29);  // (the sky ambient's SH coefficients, mcopt.shaders.ambient.sh)
+		mce_set_fragment_buffer(r, sk.shCur ? sk.shCur : w->quadIdx, 0, 29);  // (the sky ambient's SH coefficients, mcopt.shaders.ambient.sh; any buffer when there are none: the pipeline declares it)
 		mce_set_fragment_texture(r, sk.cov ? sk.cov : sk.cur, 29);  // (the clouds track: the coverage map for the cloud shadows; any texture when there is none, ShadeFrame.cloudShA.y is 0 then)
 		mce_set_fragment_texture(r, light, 17);
 		mce_set_fragment_sampler(r, lightSampler, 15);
@@ -1166,7 +1173,12 @@ static void ownA1Bind(Own *w, id<MTLComputeCommandEncoder> c) {
 		k[2] = w->a1Mode == 1 && w->a1Tab[set] ? 1 : 2;
 		mce_set_compute_buffer(c, w->a1Cnt[set], 0, 22);
 		mce_set_compute_buffer(c, w->a1Draws[set], 0, 24);
-		if (k[2] == 1) mce_set_compute_buffer(c, w->a1Tab[set], 0, 26);
+		mce_set_compute_buffer(c, k[2] == 1 ? w->a1Tab[set] : ownSpare(w), 0, 26);
+	} else {
+		mce_set_compute_buffer(c, ownSpare(w), 0, 26);
+		// (A1 off: the kernels never touch them, but the pipelines declare them; validation wants every declared slot bound)
+		mce_set_compute_buffer(c, ownSpare(w), 0, 22);
+		mce_set_compute_buffer(c, ownSpare(w), 0, 24);
 	}
 	mce_set_compute_bytes(c, k, sizeof k, 27);
 }
@@ -1312,6 +1324,11 @@ void mco_frag_cull(Own *w, Enc *enc, const void *frame, int frameLength, const v
 			mce_set_compute_buffer(c, w->uoccVis, 0, 13);
 			mce_set_compute_buffer(c, w->uoccT, 0, 14);
 			mce_set_compute_buffer(c, w->uoccBArgs, 0, 15);
+		} else {
+			// (unit occlusion off: the kernels never touch them, but they declare them)
+			mce_set_compute_buffer(c, ownSpare(w), 0, 13);
+			mce_set_compute_buffer(c, ownSpare(w), 0, 14);
+			mce_set_compute_buffer(c, ownSpare(w), 0, 15);
 		}
 		ownBindSolid(w, c);
 		ownA1Bind(w, c);
@@ -2645,6 +2662,13 @@ int mcs_post(Own *w, Enc *enc, id<MTLTexture> target, const void *params, int le
 		pbuf[54] = ((const float *) vol.frame)[18];  // (VolFrame.p1.z: the strength over the sky)
 		mce_set_fragment_texture(r, vol.out, 3);
 		mce_set_fragment_texture(r, vol.dist, 4);
+	} else {
+		// (volumetric light off this frame: the shader never samples them, but the slots must not hold a stale texture or none)
+		id<MTLTexture> any = vol.out ? vol.out : wat.dummyGlare ? wat.dummyGlare : sceneOut;
+		if (any) {
+			mce_set_fragment_texture(r, any, 3);
+			mce_set_fragment_texture(r, vol.dist ? vol.dist : any, 4);
+		}
 	}
 	{
 		id<MTLTexture> np = volWant ? [sceneOut retain] : nil;  // (retained: the tile ring may be reallocated)
