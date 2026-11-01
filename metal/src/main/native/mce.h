@@ -66,6 +66,14 @@
 #import <QuartzCore/CAMetalLayer.h>
 
 extern int mce_metal4;  // 1: Metal 4 backend (set by mce_enable before mc_create; never changes after)
+extern int mce_pt3;  // MCE_PASSTIME=1 under Metal 3: encoders carry stage-boundary timestamps (mce.m)
+id mce3_new_render_encoder(id cmd, MTLRenderPassDescriptor *rp);
+id mce3_new_compute_encoder(id cmd, MTLDispatchType type);
+id mce3_new_blit_encoder(id cmd);
+void mce3_pt_end(id e);
+void mce3_pt_present(id cb);
+void mce3_pt_commit(id cb);
+int mce_pt_any(void);  // MCE_PASSTIME is on (either backend): passes get descriptive labels
 
 // Called from Java (Native.create) before mc_create when -Dmcopt.metal4=true. mc_create then checks the device and the OS and falls
 // back to Metal 3 (logged) if Metal 4 isn't there. Returns the flag as set.
@@ -143,7 +151,10 @@ static inline id mce_new_cmd(Ctx *ctx) {
 	if (mce_metal4) return mce4_new_cmd(ctx);
 	@autoreleasepool { return [[ctx->queue commandBuffer] retain]; }
 }
-static inline void mce_cmd_commit(id c) { if (mce_metal4) mce4_cmd_commit(c); else [(id<MTLCommandBuffer>) c commit]; }
+static inline void mce_cmd_commit(id c) {
+	if (mce_metal4) mce4_cmd_commit(c);
+	else { if (mce_pt3) mce3_pt_commit(c); [(id<MTLCommandBuffer>) c commit]; }
+}
 static inline void mce_cmd_wait(id c) { if (mce_metal4) mce4_cmd_wait(c); else [(id<MTLCommandBuffer>) c waitUntilCompleted]; }
 static inline int mce_cmd_done(id c) {
 	return mce_metal4 ? mce4_cmd_done(c) : ((id<MTLCommandBuffer>) c).status >= MTLCommandBufferStatusCompleted;
@@ -159,7 +170,7 @@ static inline void mce_cmd_on_completed(id c, void (^block)(double gpuStart, dou
 // presentDrawable: (Metal 4: waitForDrawable before the commit, signalDrawable + present after it).
 static inline void mce_cmd_present(id c, id<CAMetalDrawable> d) {
 	if (mce_metal4) mce4_cmd_present(c, d);
-	else [(id<MTLCommandBuffer>) c presentDrawable:d];
+	else { if (mce_pt3) mce3_pt_present(c); [(id<MTLCommandBuffer>) c presentDrawable:d]; }
 }
 // encodeSignalEvent / encodeWaitForEvent: Metal 4 has them only at queue level, so they apply at this command buffer's commit
 // (signal: after all of it; wait: before any of it). Same meaning as Metal 3's at the end / start of the command buffer only.
@@ -182,19 +193,25 @@ void mce4_end_encoder(id h);
 // threadgroup sizes, rasterization rate map, visibility buffer; sample buffer attachments are dropped).
 static inline id mce_new_render_encoder(id cmd, MTLRenderPassDescriptor *rp) {
 	if (mce_metal4) return mce4_new_render_encoder(cmd, rp);
+	if (mce_pt3) return mce3_new_render_encoder(cmd, rp);
 	return [[(id<MTLCommandBuffer>) cmd renderCommandEncoderWithDescriptor:rp] retain];
 }
 // type: MTLDispatchTypeSerial (= today's computeCommandEncoder) or MTLDispatchTypeConcurrent.
 static inline id mce_new_compute_encoder(id cmd, MTLDispatchType type) {
 	if (mce_metal4) return mce4_new_compute_encoder(cmd, type);
+	if (mce_pt3) return mce3_new_compute_encoder(cmd, type);
 	return [(type == MTLDispatchTypeSerial ? [(id<MTLCommandBuffer>) cmd computeCommandEncoder]
 		: [(id<MTLCommandBuffer>) cmd computeCommandEncoderWithDispatchType:type]) retain];
 }
 static inline id mce_new_blit_encoder(id cmd) {
 	if (mce_metal4) return mce4_new_blit_encoder(cmd);
+	if (mce_pt3) return mce3_new_blit_encoder(cmd);
 	return [[(id<MTLCommandBuffer>) cmd blitCommandEncoder] retain];
 }
-static inline void mce_end_encoder(id h) { if (mce_metal4) mce4_end_encoder(h); else [(id<MTLCommandEncoder>) h endEncoding]; }
+static inline void mce_end_encoder(id h) {
+	if (mce_metal4) mce4_end_encoder(h);
+	else { if (mce_pt3) mce3_pt_end(h); [(id<MTLCommandEncoder>) h endEncoding]; }
+}
 
 // ---- bindings (h: an encoder handle) ----
 void mce4_set_bytes(id h, int stage, const void *bytes, NSUInteger length, NSUInteger index);
