@@ -207,6 +207,7 @@ final class MetalEncoder implements CommandEncoderBackend {
 			if (depth instanceof MetalTexture t) Native.discard(this.enc, t.handle);  // (no-op unless it is the open encoder's depth)
 		}
 		if (mcopt.metal.own.OwnUoccAuto.ON) mcopt.metal.own.OwnUoccAuto.submitted();
+		if (DrawStats.ON) DrawStats.frame();
 		this.presentedThisSubmit = false;
 		MetalEvents.Operation commitEvent = MetalEvents.begin("commit", this.submitIndex, 0);
 		long cmd;
@@ -335,6 +336,7 @@ final class MetalEncoder implements CommandEncoderBackend {
 	@Override
 	public RenderPassBackend createRenderPass(RenderPassDescriptor descriptor) {
 		if (FrameLog.ON) FrameLog.op(FrameLog.PASSES, 1);
+		if (DrawStats.ON) DrawStats.nextLabel = descriptor.label().get();
 		// Shaderpack runtime (-Dmcopt.pack): the pass may draw into the pack's targets instead of its color attachments.
 		MetalHooks.PassRedirector redirector = MetalHooks.redirector;
 		MetalHooks.Redirect redirect = redirector == null ? null : redirector.redirect(descriptor);
