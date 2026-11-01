@@ -74,6 +74,7 @@ int mce_enable(int on);
 int mce_init(Ctx *ctx);
 
 enum { MCE_VERTEX, MCE_FRAGMENT, MCE_OBJECT, MCE_MESH, MCE_TILE, MCE_STAGES };
+#define MCE_SMALL_MAX 16
 #define MCE_COMPUTE MCE_VERTEX  // a compute encoder's single table
 enum { MCE_KIND_RENDER = 1, MCE_KIND_SERIAL, MCE_KIND_CONCURRENT, MCE_KIND_BLIT };
 
@@ -85,6 +86,10 @@ enum { MCE_KIND_RENDER = 1, MCE_KIND_SERIAL, MCE_KIND_CONCURRENT, MCE_KIND_BLIT 
 	int pending;  // serial/blit: a command was encoded since the last intra-encoder barrier
 	int ended;
 	id tables[MCE_STAGES];  // id<MTL4ArgumentTable>, nil where the kind has none
+	// tables start small (mce.m "argument tables"); a stage's bindings are mirrored here until a bind beyond the small range swaps in a large one
+	int bigMask;
+	uint64_t shB[MCE_STAGES][MCE_SMALL_MAX];
+	MTLResourceID shT[MCE_STAGES][MCE_SMALL_MAX], shS[MCE_STAGES][MCE_SMALL_MAX];
 	// automatic tracking (mce.m "tracking"): this encoder's fence (updated at its end), the command buffer it is on, the fences of earlier encoders
 	// of that command buffer it must wait for before its next command
 	id fence;

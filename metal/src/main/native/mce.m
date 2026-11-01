@@ -37,7 +37,7 @@ static struct {
 	int nallocs;
 	NSMutableArray *cbPool;  // committed MTL4CommandBuffers, reused once complete
 	NSMutableArray *cbPoolValues;
-	NSMutableArray *tablePool;  // argument tables not attached to an open encoder
+	NSMutableArray *tablePool, *tablePoolBig;  // argument tables (small, large) not attached to an open encoder
 	id<MTLResidencySet> set;  // everything made resident through the layer
 	int setDirty;
 	int setRemoved;  // removals not committed yet
@@ -51,7 +51,7 @@ static struct {
 } M = {.lock = OS_UNFAIR_LOCK_INIT};
 
 // MEASUREMENT: MCE_STATS=1 prints the layer's per-frame counts every 2 s
-static struct { long commits, setCommits, encoders, fences, uploads, uploadBytes, resident, released, presents; double last; } ST;
+static struct { long commits, setCommits, encoders, fences, uploads, uploadBytes, resident, released, presents, tableGrows; double last; } ST;
 static int stats(void) { static int m = -1; if (m < 0) m = getenv("MCE_STATS") != NULL; return m; }
 
 
@@ -122,6 +122,7 @@ int mce_init(Ctx *ctx) {
 			M.cbPool = [NSMutableArray new];
 			M.cbPoolValues = [NSMutableArray new];
 			M.tablePool = [NSMutableArray new];
+			M.tablePoolBig = [NSMutableArray new];
 		}
 		mce_metal4 = 1;
 		fprintf(stderr, "mcopt-metal4: Metal 4 backend on %s (MTL4CommandQueue, argument tables, upload ring, residency sets, "
@@ -313,30 +314,49 @@ void mce4_frame_end(void) {
 }
 
 // ---- argument tables ----
-static id<MTL4ArgumentTable> takeTable(void) {
-	id<MTL4ArgumentTable> t = [M.tablePool lastObject];
+// Metal snapshots every attached table at each draw / dispatch, at its full size: vanilla's ~1,450 draws a frame pay for 31 / 48 / 16 slots
+// per stage although its shaders bind only low indices (+11 % fps with small tables). So tables come in two sizes: an encoder starts with small
+// ones, and the first bind beyond a stage's small range swaps in a large table for that stage, carrying over the bindings made so far (mirrored in
+// the encoder while small). MCE_TABLE_SMALL=buffers,textures,samplers (each <= MCE_SMALL_MAX) for measurement.
+static int smallN[3] = {12, 12, 8};
+static const int bigN[3] = {TABLE_BUFFERS, TABLE_TEXTURES, TABLE_SAMPLERS};
+
+static id<MTL4ArgumentTable> takeTable(int big) {
+	NSMutableArray *pool = big ? M.tablePoolBig : M.tablePool;
+	id<MTL4ArgumentTable> t = [pool lastObject];
 	if (t) {
 		[t retain];
-		[M.tablePool removeLastObject];
+		[pool removeLastObject];
 		return t;
 	}
 	@autoreleasepool {
-		MTL4ArgumentTableDescriptor *d = [[MTL4ArgumentTableDescriptor new] autorelease];
-		// MEASUREMENT: MCE_TABLE=buffers,textures,samplers sizes the tables (binds beyond them are dropped and logged)
-		static int tb = -1, tt, ts;
-		if (tb < 0) {
-			tb = TABLE_BUFFERS; tt = TABLE_TEXTURES; ts = TABLE_SAMPLERS;
-			const char *v = getenv("MCE_TABLE");
-			if (v) { sscanf(v, "%d,%d,%d", &tb, &tt, &ts); fprintf(stderr, "mcopt-metal4: MEASUREMENT tables %d / %d / %d\n", tb, tt, ts); }
+		static int once;
+		const char *v = getenv("MCE_TABLE_SMALL");
+		if (!once++ && v) {
+			sscanf(v, "%d,%d,%d", &smallN[0], &smallN[1], &smallN[2]);
+			for (int i = 0; i < 3; i++) smallN[i] = smallN[i] < 1 ? 1 : smallN[i] > MCE_SMALL_MAX ? MCE_SMALL_MAX : smallN[i];
+			fprintf(stderr, "mcopt-metal4: MEASUREMENT small tables %d / %d / %d\n", smallN[0], smallN[1], smallN[2]);
 		}
-		d.maxBufferBindCount = (NSUInteger) tb;
-		d.maxTextureBindCount = (NSUInteger) tt;
-		d.maxSamplerStateBindCount = (NSUInteger) ts;
+		const int *n = big ? bigN : smallN;
+		MTL4ArgumentTableDescriptor *d = [[MTL4ArgumentTableDescriptor new] autorelease];
+		d.maxBufferBindCount = (NSUInteger) n[0];
+		d.maxTextureBindCount = (NSUInteger) n[1];
+		d.maxSamplerStateBindCount = (NSUInteger) n[2];
 		d.initializeBindings = YES;
 		NSError *e = nil;
 		t = [M.device newArgumentTableWithDescriptor:d error:&e];
 		if (!t) { fprintf(stderr, "mcopt-metal4: argument table: %s\n", e ? e.description.UTF8String : "?"); abort(); }
 		return t;
+	}
+}
+
+static void giveTables(MceEncoder *e) {
+	for (int i = 0; i < MCE_STAGES; i++) {
+		if (e->tables[i]) {  // Metal snapshotted it at each draw/dispatch: free for the next encoder
+			[(e->bigMask >> i & 1 ? M.tablePoolBig : M.tablePool) addObject:e->tables[i]];
+			[e->tables[i] release];
+			e->tables[i] = nil;
+		}
 	}
 }
 
@@ -481,8 +501,8 @@ static void statsTick(int presented) {
 	if (!ST.last) ST.last = now;
 	if (now - ST.last > 2.0 && ST.presents) {
 		double f = (double) ST.presents;
-		fprintf(stderr, "mcopt-metal4 stats per presented frame: commits %.2f, residency commits %.2f, encoders %.1f, fences %.1f, uploads %.1f (%.1f KB), made resident %.2f, released %.2f\n",
-			ST.commits / f, ST.setCommits / f, ST.encoders / f, ST.fences / f, ST.uploads / f, ST.uploadBytes / f / 1024.0, ST.resident / f, ST.released / f);
+		fprintf(stderr, "mcopt-metal4 stats per presented frame: commits %.2f, residency commits %.2f, encoders %.1f, fences %.1f, uploads %.1f (%.1f KB), made resident %.2f, released %.2f, tables grown %.1f\n",
+			ST.commits / f, ST.setCommits / f, ST.encoders / f, ST.fences / f, ST.uploads / f, ST.uploadBytes / f / 1024.0, ST.resident / f, ST.released / f, ST.tableGrows / f);
 		memset(&ST, 0, sizeof ST);
 		ST.last = now;
 	}
@@ -918,11 +938,11 @@ static MceEncoder *wrap(id real, int kind) {
 		// at each draw, so unused ones are paid for at every draw
 		static const MTLRenderStages stages[MCE_STAGES] = {MTLRenderStageVertex, MTLRenderStageFragment, MTLRenderStageObject, MTLRenderStageMesh, MTLRenderStageTile};
 		for (int i = 0; i < 2; i++) {
-			e->tables[i] = takeTable();
+			e->tables[i] = takeTable(0);
 			[(id<MTL4RenderCommandEncoder>) real setArgumentTable:e->tables[i] atStages:stages[i]];
 		}
 	} else if (kind != MCE_KIND_BLIT) {
-		e->tables[0] = takeTable();
+		e->tables[0] = takeTable(0);
 		[(id<MTL4ComputeCommandEncoder>) real setArgumentTable:e->tables[0]];
 	}
 	os_unfair_lock_unlock(&M.lock);
@@ -1090,11 +1110,7 @@ void mce4_end_encoder(id h) {
 		[e->real release];
 		e->real = nil;
 		os_unfair_lock_lock(&M.lock);
-		if (e->tables[0]) {
-			[M.tablePool addObject:e->tables[0]];
-			[e->tables[0] release];
-			e->tables[0] = nil;
-		}
+		giveTables(e);
 		os_unfair_lock_unlock(&M.lock);
 		return;
 	}
@@ -1114,66 +1130,91 @@ void mce4_end_encoder(id h) {
 	[e->real release];
 	e->real = nil;
 	os_unfair_lock_lock(&M.lock);
-	for (int i = 0; i < MCE_STAGES; i++) {
-		if (e->tables[i]) {  // Metal snapshotted it at each draw/dispatch: free for the next encoder
-			[M.tablePool addObject:e->tables[i]];
-			[e->tables[i] release];
-			e->tables[i] = nil;
-		}
-	}
+	giveTables(e);
 	os_unfair_lock_unlock(&M.lock);
 }
 
 // ---- bindings ----
-static inline id<MTL4ArgumentTable> table(id h, int stage) {
-	MceEncoder *e = h;
-	id<MTL4ArgumentTable> t = e->tables[stage];
-	if (!t && e->kind == MCE_KIND_RENDER && stage >= 2 && stage < MCE_STAGES) {
-		static const MTLRenderStages stages[MCE_STAGES] = {MTLRenderStageVertex, MTLRenderStageFragment, MTLRenderStageObject, MTLRenderStageMesh, MTLRenderStageTile};
-		os_unfair_lock_lock(&M.lock);
-		t = e->tables[stage] = takeTable();
-		os_unfair_lock_unlock(&M.lock);
-		[(id<MTL4RenderCommandEncoder>) e->real setArgumentTable:t atStages:stages[stage]];
-	}
-	if (!t) logUnported("mce (binding on an encoder kind without that stage)", @selector(description));
-	return t;
+static const MTLRenderStages renderStages[MCE_STAGES] = {MTLRenderStageVertex, MTLRenderStageFragment, MTLRenderStageObject, MTLRenderStageMesh, MTLRenderStageTile};
+
+static void attach(MceEncoder *e, int stage, id<MTL4ArgumentTable> t) {
+	if (e->kind == MCE_KIND_RENDER) [(id<MTL4RenderCommandEncoder>) e->real setArgumentTable:t atStages:renderStages[stage]];
+	else [(id<MTL4ComputeCommandEncoder>) e->real setArgumentTable:t];
 }
 
-static int bufferIndexOk(NSUInteger i) {
-	if (i < TABLE_BUFFERS) return 1;
-	mce_log_once("buffer binding index >= 31: dropped");
-	return 0;
+// what = 0 buffer, 1 texture, 2 sampler: the stage's table, made large first if index is beyond the small range; nil if beyond the large one
+static id<MTL4ArgumentTable> table(MceEncoder *e, int stage, int what, NSUInteger index) {
+	static const char *const over[3] = {"buffer binding index >= 31: dropped", "texture binding index >= 48: dropped", "sampler binding index >= 16: dropped"};
+	if (index >= (NSUInteger) bigN[what]) { mce_log_once(over[what]); return nil; }
+	id<MTL4ArgumentTable> t = e->tables[stage];
+	if (!t) {
+		if (e->kind != MCE_KIND_RENDER || stage < 2 || stage >= MCE_STAGES) {
+			logUnported("mce (binding on an encoder kind without that stage)", @selector(description));
+			return nil;
+		}
+		os_unfair_lock_lock(&M.lock);
+		t = e->tables[stage] = takeTable(0);
+		os_unfair_lock_unlock(&M.lock);
+		attach(e, stage, t);
+	}
+	if (e->bigMask >> stage & 1 || index < (NSUInteger) smallN[what]) return t;
+	ST.tableGrows++;
+	os_unfair_lock_lock(&M.lock);
+	id<MTL4ArgumentTable> big = takeTable(1);
+	[M.tablePool addObject:t];  // (Metal snapshotted it at the draws so far)
+	os_unfair_lock_unlock(&M.lock);
+	[t release];
+	for (int i = 0; i < smallN[0]; i++) [big setAddress:e->shB[stage][i] atIndex:(NSUInteger) i];
+	for (int i = 0; i < smallN[1]; i++) [big setTexture:e->shT[stage][i] atIndex:(NSUInteger) i];
+	for (int i = 0; i < smallN[2]; i++) [big setSamplerState:e->shS[stage][i] atIndex:(NSUInteger) i];
+	e->tables[stage] = big;
+	e->bigMask |= 1 << stage;
+	attach(e, stage, big);
+	return big;
+}
+
+static inline void setAddr(MceEncoder *e, int stage, uint64_t a, NSUInteger index) {
+	id<MTL4ArgumentTable> t = table(e, stage, 0, index);
+	if (!t) return;
+	if (!(e->bigMask >> stage & 1)) e->shB[stage][index] = a;
+	[t setAddress:a atIndex:index];
 }
 
 void mce4_set_bytes(id h, int stage, const void *bytes, NSUInteger length, NSUInteger index) {
-	if (!bufferIndexOk(index)) return;
-	[table(h, stage) setAddress:upload(bytes, length, NULL, NULL) atIndex:index];
+	if (index >= TABLE_BUFFERS) { mce_log_once("buffer binding index >= 31: dropped"); return; }
+	setAddr(h, stage, upload(bytes, length, NULL, NULL), index);
 }
 
 void mce4_set_bytes2(id h, int stageA, int stageB, const void *bytes, NSUInteger length, NSUInteger index) {
-	if (!bufferIndexOk(index)) return;
+	if (index >= TABLE_BUFFERS) { mce_log_once("buffer binding index >= 31: dropped"); return; }
 	uint64_t a = upload(bytes, length, NULL, NULL);
-	[table(h, stageA) setAddress:a atIndex:index];
-	[table(h, stageB) setAddress:a atIndex:index];
+	setAddr(h, stageA, a, index);
+	setAddr(h, stageB, a, index);
 }
 
 void mce4_set_buffer(id h, int stage, id<MTLBuffer> buffer, NSUInteger offset, NSUInteger index) {
-	if (!bufferIndexOk(index)) return;
+	if (index >= TABLE_BUFFERS) { mce_log_once("buffer binding index >= 31: dropped"); return; }
 	track(h, buffer, 0, stage);
-	[table(h, stage) setAddress:buffer ? buffer.gpuAddress + offset : 0 atIndex:index];
+	setAddr(h, stage, buffer ? buffer.gpuAddress + offset : 0, index);
 }
 
 void mce4_set_texture(id h, int stage, id<MTLTexture> texture, NSUInteger index) {
-	if (index >= TABLE_TEXTURES) { mce_log_once("texture binding index >= 48: dropped"); return; }
-	MTLResourceID none = {0};
+	MceEncoder *e = h;
+	id<MTL4ArgumentTable> t = table(e, stage, 1, index);
+	if (!t) return;
+	MTLResourceID none = {0}, r = texture ? texture.gpuResourceID : none;
 	track(h, texture, 1, stage);
-	[table(h, stage) setTexture:texture ? texture.gpuResourceID : none atIndex:index];
+	if (!(e->bigMask >> stage & 1)) e->shT[stage][index] = r;
+	[t setTexture:r atIndex:index];
 }
 
 void mce4_set_sampler(id h, int stage, id<MTLSamplerState> sampler, NSUInteger index) {
-	if (index >= TABLE_SAMPLERS) { mce_log_once("sampler binding index >= 16: dropped"); return; }
-	MTLResourceID none = {0};
-	[table(h, stage) setSamplerState:sampler ? sampler.gpuResourceID : none atIndex:index];
+	MceEncoder *e = h;
+	id<MTL4ArgumentTable> t = table(e, stage, 2, index);
+	if (!t) return;
+	MTLResourceID none = {0}, r = sampler ? sampler.gpuResourceID : none;
+	if (!(e->bigMask >> stage & 1)) e->shS[stage][index] = r;
+	[t setSamplerState:r atIndex:index];
 }
 
 // ---- draws and dispatches ----
