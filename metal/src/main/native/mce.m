@@ -494,9 +494,50 @@ static void ptResolve(id heapObj, NSArray *labels, int presented);
 @class MceCmd;
 static void closeOpen(MceCmd *c);
 
+#define RENDER_STAGES (MTLStageVertex | MTLStageObject | MTLStageMesh | MTLStageFragment | MTLStageTile)
+// Command buffers (MCE_XTRACK, default on): a command buffer's first encoder used to take a full queue barrier (everything earlier before
+// anything of it). That kept every frame's render passes behind the previous command buffer's tail: no overlap between frames, ~30 % of the
+// frame with shaders off. Now the barrier holds only compute / copy work (cheap: those run between passes); render stages wait per resource,
+// on the fence of the encoder that last wrote what they read (or read what they write) in an earlier command buffer still in flight.
+// MCE_XTRACK=0: the full barrier.
+static int crossTrack(void) {
+	static int m = -1;
+	// 1: render stages tracked across command buffers, compute / copy behind the barrier; 2: everything tracked, no barrier
+	if (m < 0) { const char *v = getenv("MCE_XTRACK"); m = v ? atoi(v) : 2; fprintf(stderr, "mcopt-metal4: cross command buffer tracking %d\n", m); }
+	return m;
+}
+
+// MEASUREMENT: MCE_WAITLOG=1 (with MCE_STATS=1): every fence wait the tracking encodes, as producer pass -> consumer pass: resource (per frame, every 5 s)
+static int waitLog(void) { static int m = -1; if (m < 0) m = getenv("MCE_WAITLOG") != NULL; return m; }
+static NSMutableDictionary *wlCounts;
+static NSMutableArray *wlPending;  // {encoder pointer, "producer: resource"} until the consumer ends and has its label
+static long wlFrames;
+static double wlLast;
+static NSString *wlDesc(id obj) {
+	if ([obj conformsToProtocol:@protocol(MTLTexture)]) {
+		id<MTLTexture> t = obj;
+		return [NSString stringWithFormat:@"tex %lux%lu f%lu %@", (unsigned long) t.width, (unsigned long) t.height, (unsigned long) t.pixelFormat, t.label ?: @""];
+	}
+	return [NSString stringWithFormat:@"buf %lu %@", (unsigned long) ((id<MTLBuffer>) obj).length, ((id<MTLBuffer>) obj).label ?: @""];
+}
+static void wlTick(void) {
+	wlFrames++;
+	double t = CFAbsoluteTimeGetCurrent();
+	if (wlLast == 0) wlLast = t;
+	if (t - wlLast < 5.0 || !wlCounts) return;
+	NSArray *keys = [wlCounts keysSortedByValueUsingComparator:^NSComparisonResult(NSNumber *x, NSNumber *y) { return [y compare:x]; }];
+	fprintf(stderr, "mcopt-metal4 waitlog: %ld presents\n", wlFrames);
+	int shown = 0;
+	for (NSString *k in keys) { if (shown++ >= 30) break; fprintf(stderr, "mcopt-metal4 waitlog: %7.2f /present  %s\n", [wlCounts[k] doubleValue] / wlFrames, k.UTF8String); }
+	[wlCounts removeAllObjects];
+	wlFrames = 0;
+	wlLast = t;
+}
+
 static void statsTick(int presented) {
 	if (!stats()) return;
 	ST.presents += presented;
+	if (waitLog() && presented) wlTick();
 	double now = CFAbsoluteTimeGetCurrent();
 	if (!ST.last) ST.last = now;
 	if (now - ST.last > 2.0 && ST.presents) {
@@ -731,12 +772,15 @@ static void openBarrier(MceEncoder *e) {
 @public
 	id fence;
 	void *cmd;
+	MceCmd *cmdRef;  // (retained: its commit value says whether it is committed / done)
+	id vfence;  // render encoders: updated after their vertex stages
 	void *enc;
+	NSString *label;  // MCE_WAITLOG: the encoder's label, kept once it ended
 	int ended;
 }
 @end
 @implementation MceSync
-- (void)dealloc { [fence release]; [super dealloc]; }
+- (void)dealloc { [fence release]; [vfence release]; [label release]; [cmdRef release]; [super dealloc]; }
 @end
 
 static int syncBarriers(void) {
@@ -758,6 +802,7 @@ static MTLStages encStages(MceEncoder *e) {
 @public
 	MceSync *writer;
 	MceSync *readers[8];
+	unsigned long readerStages[8];  // the stages each reader read it in
 	int nreaders;  // > 8: too many to wait on one by one (a writer then takes a queue barrier)
 }
 @end
@@ -882,7 +927,7 @@ static void ptResolve(id heapObj, NSArray *labels, int presented) {
 	ptAdd(labels, st, en, presented);
 }
 
-int mce_pt_any(void) { return mce_pt3 || passTime(); }
+int mce_pt_any(void) { return mce_pt3 || passTime() || waitLog(); }
 
 // ---- Metal 3 pass timing (same switch, MCE_PASSTIME=1): MTLCounterSampleBuffer per command buffer, stage-boundary samples ----
 // render encoders: start of vertex .. end of fragment; compute/blit: start .. end of encoder. Resolved in the command buffer's completed handler.
@@ -1077,19 +1122,67 @@ static void *canon(id obj, int isTex) {
 // e waits for s's encoder, if that is an earlier, ended encoder of e's command buffer (anything older is ordered by the command buffer barrier)
 // stages: the stages of this encoder that consume the resource (a render pass waits only where it reads: its attachments at the fragment stage, a
 // vertex buffer at the vertex stage; waiting at every stage kept a pass's vertex work behind the previous pass's last fragment)
-static void waitFor(MceEncoder *e, MceSync *s, MTLStages stages) {
-	if (!s || s == e->sync || !s->ended || s->cmd != (__bridge void *) e->cmd || !s->fence) return;
-	for (int i = 0; i < e->nwaits; i++) if (e->waits[i] == s->fence && (e->waitStages[i] & stages) == stages) return;
+static id wlObj;
+static int wlWrite;
+#define VERTEX_STAGES (MTLStageVertex | MTLStageObject | MTLStageMesh)
+// vonly: s only read the resource in its vertex stages (indirect arguments, vertex buffers): its vertex-stage fence is enough (a render pass
+// finishes its vertex stages before its fragments; a write after such a read need not wait for the fragments)
+static void waitFor2(MceEncoder *e, MceSync *s, MTLStages stages, int vonly);
+static int vfenceOk(void) {  // MCE_VFENCE=0: write-after-read always waits for the whole reader
+	static int m = -1;
+	if (m < 0) { const char *v = getenv("MCE_VFENCE"); m = !(v && strcmp(v, "0") == 0); }
+	return m;
+}
+static void waitFor(MceEncoder *e, MceSync *s, MTLStages stages) { waitFor2(e, s, stages, 0); }
+static void waitFor2(MceEncoder *e, MceSync *s, MTLStages stages, int vonly) {
+	if (!s || s == e->sync || !s->fence) return;
+	id f = vonly && s->vfence && vfenceOk() ? s->vfence : s->fence;
+	if (s->cmd != (__bridge void *) e->cmd) {
+		// another command buffer: a render stage waits only for what it uses (the command buffer barrier covers compute / copy work only)
+		if (!crossTrack() || (crossTrack() == 1 && !(stages & RENDER_STAGES))) return;
+		uint64_t v = s->cmdRef->value;
+		if (!v) {
+			// not committed yet: ordered only if it commits first (as on Metal 3); a queue barrier at this point covers that case
+			if ((e->qbarStages & stages) != stages) {
+				[(id<MTL4CommandEncoder>) e->real barrierAfterQueueStages:MTLStageAll beforeStages:stages visibilityOptions:MTL4VisibilityOptionDevice];
+				e->qbarStages |= stages;
+			}
+			return;
+		}
+		if (v <= completedValue()) return;
+	} else if (!s->ended) return;
+	for (int i = 0; i < e->nwaits; i++) if (e->waits[i] == f && (e->waitStages[i] & stages) == stages) return;
+	if (waitLog() && wlObj) {
+		if (!wlPending) { wlPending = [NSMutableArray new]; wlCounts = [NSMutableDictionary new]; }
+		[wlPending addObject:@[[NSValue valueWithPointer:(__bridge void *) e], [NSString stringWithFormat:@"%@ -> %%@ %s st%lx: %@", s->label ?: @"?", wlWrite ? "W" : "R", (unsigned long) stages, wlDesc(wlObj)]]];
+	}
 	// encoded right here, before the command this use is for (a draw can be a plain drawPrimitives that goes straight to the real encoder)
-	[(id<MTL4CommandEncoder>) e->real waitForFence:s->fence beforeEncoderStages:stages];
-	for (int i = 0; i < e->nwaits; i++) if (e->waits[i] == s->fence) { e->waitStages[i] |= stages; return; }
-	if (e->nwaits < 16) { e->waits[e->nwaits] = s->fence; e->waitStages[e->nwaits++] = stages; }  // (only to skip repeats)
+	[(id<MTL4CommandEncoder>) e->real waitForFence:f beforeEncoderStages:stages];
+	for (int i = 0; i < e->nwaits; i++) if (e->waits[i] == f) { e->waitStages[i] |= stages; return; }
+	if (e->nwaits < 16) { e->waits[e->nwaits] = f; e->waitStages[e->nwaits++] = stages; }  // (only to skip repeats)
+}
+
+// MEASUREMENT ONLY (unsafe, races): MCE_SYNC=none, no hazard tracking and no command buffer barrier
+static int syncNone(void) {
+	static int m = -1;
+	// 1 none: no tracking, no command buffer barrier; 2 nobar: tracking, no barrier; 3 notrack: barrier, no tracking
+	if (m < 0) { const char *v = getenv("MCE_SYNC"); m = !v ? 0 : !strcmp(v, "none") ? 1 : !strcmp(v, "nobar") ? 2 : !strcmp(v, "notrack") ? 3 : 0; if (m) fprintf(stderr, "mcopt-metal4: MEASUREMENT sync mode %d (unsafe)\n", m); }
+	return m;
+}
+
+// Resources created untracked get no automatic waits, exactly as on Metal 3 (MCE_UNTRACKED=0: track them anyway)
+static int untrackedOk(void) {
+	static int m = -1;
+	if (m < 0) { const char *v = getenv("MCE_UNTRACKED"); m = !(v && strcmp(v, "0") == 0); }
+	return m;
 }
 
 static void use(MceEncoder *e, id obj, int write, int isTex, MTLStages stages) {
-	if (!obj || syncBarriers()) return;
+	if (!obj || syncBarriers() || syncNone() == 1 || syncNone() == 3) return;
 	if (!trackMap) trackMap = CFDictionaryCreateMutable(NULL, 0, NULL, &kCFTypeDictionaryValueCallBacks);
 	void *k = canon(obj, isTex);
+	// created untracked: the caller orders its uses itself, as Metal 3 leaves it to them (asked per use: the map's keys are unretained addresses)
+	if (untrackedOk() && [(__bridge id<MTLResource>) k hazardTrackingMode] == MTLHazardTrackingModeUntracked) return;
 	MceUse *u = (MceUse *) CFDictionaryGetValue(trackMap, k);
 	if (!u) {
 		u = [MceUse new];
@@ -1098,11 +1191,13 @@ static void use(MceEncoder *e, id obj, int write, int isTex, MTLStages stages) {
 	}
 	MceSync *me = e->sync;
 	if (!stages) stages = encStages(e);
+	wlObj = obj;
+	wlWrite = write;
 	waitFor(e, u->writer, stages);
 	if (!write) {
 		if (u->writer == me) return;
-		for (int i = 0; i < u->nreaders && i < 8; i++) if (u->readers[i] == me) return;
-		if (u->nreaders < 8) u->readers[u->nreaders] = [me retain];
+		for (int i = 0; i < u->nreaders && i < 8; i++) if (u->readers[i] == me) { u->readerStages[i] |= stages; return; }
+		if (u->nreaders < 8) { u->readers[u->nreaders] = [me retain]; u->readerStages[u->nreaders] = stages; }
 		u->nreaders++;
 		return;
 	}
@@ -1110,7 +1205,7 @@ static void use(MceEncoder *e, id obj, int write, int isTex, MTLStages stages) {
 		// too many readers to wait on each: everything earlier on the queue first
 		[(id<MTL4CommandEncoder>) e->real barrierAfterQueueStages:MTLStageAll beforeStages:stages visibilityOptions:MTL4VisibilityOptionDevice];
 	} else {
-		for (int i = 0; i < u->nreaders; i++) waitFor(e, u->readers[i], stages);
+		for (int i = 0; i < u->nreaders; i++) waitFor2(e, u->readers[i], stages, (u->readerStages[i] & ~(unsigned long) VERTEX_STAGES) == 0);
 	}
 	for (int i = 0; i < u->nreaders && i < 8; i++) [u->readers[i] release];
 	u->nreaders = 0;
@@ -1167,7 +1262,7 @@ static id takeFence(void) {
 	uint64_t done = completedValue();
 	for (int i = 0; i < nFencePool; i++) {
 		MceCmd *c = fencePool[i].cmd;
-		if (c && c->value && c->value <= done) {
+		if (c && c->value && c->value + 16 <= done) {  // (+16: later command buffers' render stages may still wait on it)
 			id f = fencePool[i].f;
 			[c release];
 			fencePool[i] = fencePool[--nFencePool];
@@ -1221,11 +1316,29 @@ static MceEncoder *tracked(MceEncoder *e, id cmd) {
 	MceSync *s = [MceSync new];
 	s->fence = [e->fence retain];
 	s->cmd = (__bridge void *) cmd;
+	s->cmdRef = [c retain];
+	if (e->kind == MCE_KIND_RENDER) {
+		e->vfence = takeFence();
+		s->vfence = [e->vfence retain];
+	}
 	s->enc = (__bridge void *) e;
 	e->sync = s;
-	if (!c->opened) {
+	if (!c->opened && syncNone() != 1 && syncNone() != 2) {
 		c->opened = 1;
-		[(id<MTL4CommandEncoder>) e->real barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+		// MEASUREMENT: MCE_CMDBAR=after:before (hex MTLStages; "none" for no barrier) instead of All:All
+		static int set = -1;
+		static unsigned long long ba = (unsigned long long) MTLStageAll, bb = (unsigned long long) MTLStageAll;
+		if (set < 0 && crossTrack() == 1) bb = (unsigned long long) (MTLStageDispatch | MTLStageBlit | MTLStageAccelerationStructure | MTLStageResourceState);
+		if (set < 0 && crossTrack() == 2) ba = bb = 0;
+		if (set < 0) {
+			const char *v = getenv("MCE_CMDBAR");
+			set = v != NULL;
+			if (v && strcmp(v, "none") == 0) ba = bb = 0;
+			else if (v) sscanf(v, "%llx:%llx", &ba, &bb);
+			if (set) fprintf(stderr, "mcopt-metal4: MEASUREMENT command buffer barrier %llx -> %llx\n", ba, bb);
+		}
+		id<MTL4CommandEncoder> r = (id<MTL4CommandEncoder>) e->real;
+		if (ba && bb) [r barrierAfterQueueStages:(MTLStages) ba beforeStages:(MTLStages) bb visibilityOptions:MTL4VisibilityOptionDevice];
 	}
 	ptStart(e);
 	return e;
@@ -1303,6 +1416,17 @@ void mce4_end_encoder(id h) {
 	if (e->ended) return;
 	e->ended = 1;
 	ptEnd(e);
+	if (waitLog()) {
+		NSString *lab = [(id<MTL4CommandEncoder>) e->real label] ?: (e->kind == MCE_KIND_RENDER ? @"render" : @"compute");
+		if (e->sync && !((MceSync *) e->sync)->label) ((MceSync *) e->sync)->label = [lab copy];
+		for (NSInteger i = (NSInteger) wlPending.count - 1; i >= 0; i--) {
+			NSArray *p = wlPending[(NSUInteger) i];
+			if ([p[0] pointerValue] != (__bridge void *) e) continue;
+			NSString *k = [NSString stringWithFormat:p[1], lab];
+			wlCounts[k] = @([wlCounts[k] longValue] + 1);
+			[wlPending removeObjectAtIndex:(NSUInteger) i];
+		}
+	}
 	if (mergeCompute() && e->kind != MCE_KIND_RENDER && e->cmd && ((MceCmd *) e->cmd)->cb) {
 		MceCmd *c = e->cmd;
 		if (!e->merged) {
@@ -1325,6 +1449,11 @@ void mce4_end_encoder(id h) {
 	}
 	if (!syncBarriers() && e->fence) {
 		flushWaits(e);  // (waits for resources bound but never used by a command: harmless)
+		if (e->vfence) {
+			[(id<MTL4RenderCommandEncoder>) e->real updateFence:e->vfence afterEncoderStages:VERTEX_STAGES];
+			giveFence(e->vfence, e->cmd);
+			e->vfence = nil;
+		}
 		[(id<MTL4CommandEncoder>) e->real updateFence:e->fence afterEncoderStages:encStages(e)];
 		((MceSync *) e->sync)->ended = 1;
 		[(MceSync *) e->sync release];  // (the resource map keeps it while it is some resource's last user)
