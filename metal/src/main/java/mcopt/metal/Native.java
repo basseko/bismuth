@@ -26,8 +26,9 @@ final class Native {
 	private static final SymbolLookup LIB = SymbolLookup.libraryLookup(extract(), Arena.global());
 
 	private static final MethodHandle CREATE = fn("mc_create", false, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT);
-	/** -Dmcopt.metal4=true: the Metal 4 backend (mce.m); read once, before the device is made. Default: Metal 3, unchanged. */
-	static final boolean METAL4 = Boolean.getBoolean("mcopt.metal4");
+	/** The Metal 4 backend (mce.m), the default where the GPU supports it (mce_enable falls back to Metal 3 otherwise); -Dmcopt.metal4=false:
+	 *  Metal 3. Read once, before the device is made. */
+	static final boolean METAL4 = !"false".equals(System.getProperty("mcopt.metal4"));
 	private static final MethodHandle METAL4_ENABLE = fn("mce_enable", false, JAVA_INT, JAVA_INT);
 	private static final MethodHandle MAX_BUFFER_LENGTH = fn("mc_max_buffer_length", true, JAVA_LONG, JAVA_LONG);
 	private static final MethodHandle RELEASE = fn("mc_release", false, null, JAVA_LONG);
