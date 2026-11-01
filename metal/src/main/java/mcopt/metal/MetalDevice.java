@@ -135,6 +135,7 @@ final class MetalDevice implements GpuDeviceBackend {
 
 	@Override
 	public GpuTextureView createTextureView(GpuTexture texture, int baseMip, int mips) {
+		if (ChurnStats.ON) ChurnStats.count("view");
 		return new MetalTexture.View(this.encoder, (MetalTexture) texture, baseMip, mips);
 	}
 

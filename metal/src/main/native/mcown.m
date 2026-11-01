@@ -2111,11 +2111,35 @@ void mco_pre_commit(Enc *enc) {
 	enc->pre = nil;
 }
 
-// A single-level 2D view of tex's mip, resident (Metal 4), for one frame's copies: the caller ends it with mce_release (deferred under Metal 4).
+// -Dmcopt.animViewCache (default on): the single-level views of animCopy's source and destination mips are kept in a small table (a view
+// holds its texture, so a table hit is always the same texture; the table is flushed when full, which also lets replaced atlases go). Off:
+// a view per mip per tick, ended by the caller.
+static int ownViewCache = 1;
+void mco_anim_view_cache(int on) { ownViewCache = on; }
+#define OWN_VIEWS 32
+static struct { id<MTLTexture> tex; int mip; id<MTLTexture> view; } ownViews[OWN_VIEWS];
+static int ownNViews;
+
+// A single-level 2D view of tex's mip, resident (Metal 4), for one frame's copies: the caller ends it with ownMipViewEnd.
 static id<MTLTexture> ownMipView(id<MTLTexture> tex, int mip) {
+	if (ownViewCache) {
+		for (int i = 0; i < ownNViews; i++) if (ownViews[i].tex == tex && ownViews[i].mip == mip) return ownViews[i].view;
+	}
 	id<MTLTexture> v = [tex newTextureViewWithPixelFormat:tex.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(mip, 1) slices:NSMakeRange(0, 1)];
 	mce_make_resident(v);
+	if (ownViewCache) {
+		if (ownNViews == OWN_VIEWS) {  // (deferred under Metal 4; under Metal 3 the encoders in flight retain what they use)
+			for (int i = 0; i < ownNViews; i++) mce_release(ownViews[i].view);
+			ownNViews = 0;
+		}
+		ownViews[ownNViews].tex = tex;
+		ownViews[ownNViews].mip = mip;
+		ownViews[ownNViews++].view = v;
+	}
 	return v;
+}
+static void ownMipViewEnd(id<MTLTexture> v) {
+	if (!ownViewCache) mce_release(v);
 }
 
 // -Dmcopt.own.int.animCopy + atlasWrite: count rectangles (rects: 6 uints each) copied from src's mip into dst's mip in one dispatch, in the
@@ -2135,8 +2159,8 @@ int mco_anim_copy(Own *w, Enc *enc, id<MTLTexture> src, id<MTLTexture> dst, int 
 		mce_set_compute_bytes(c, rects, (NSUInteger) count * 24, 0);
 		mce_dispatch_threads(c, MTLSizeMake((NSUInteger) maxW, (NSUInteger) maxH, (NSUInteger) count), MTLSizeMake(8, 8, 1));
 		mce_end_encoder(c);
-		mce_release(s);
-		mce_release(d);
+		ownMipViewEnd(s);
+		ownMipViewEnd(d);
 	}
 	return 1;
 }
@@ -2188,7 +2212,7 @@ int mco_anim_copy_mips(Own *w, Enc *enc, id<MTLTexture> src, id<MTLTexture> dst,
 			mce_set_compute_texture(c, d, 1);
 			mce_set_compute_bytes(c, group, (NSUInteger) n * 24, 0);
 			mce_dispatch_threads(c, MTLSizeMake((NSUInteger) maxW, (NSUInteger) maxH, (NSUInteger) n), MTLSizeMake(8, 8, 1));
-			mce_release(d);
+			ownMipViewEnd(d);
 		}
 		mce_end_encoder(c);
 	}

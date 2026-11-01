@@ -378,6 +378,7 @@ final class OwnNative {
 	private static final MethodHandle PRE_COMMIT = fn("mco_pre_commit", false, null, JAVA_LONG);
 	private static final MethodHandle TL_A1SPLIT_REQ = fn("mco_tl_a1split_req", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT);
 	private static final MethodHandle TL_A1SPLIT_WRITTEN = fn("mco_tl_a1split_written", false, JAVA_INT, JAVA_LONG);
+	private static final MethodHandle ANIM_VIEW_CACHE = fn("mco_anim_view_cache", false, null, JAVA_INT);
 	private static final MethodHandle TL_A1SPLIT_TEST = fn("mco_tl_a1split_test", false, null, JAVA_INT);
 	private static final MethodHandle VGROUP_FAIL_TEST = fn("mco_vgroup_fail_test", false, null, JAVA_INT, JAVA_INT);
 	private static final MethodHandle VGROUP_STATS = fn("mco_vgroup_stats", false, null, JAVA_LONG, JAVA_LONG);
@@ -451,6 +452,15 @@ final class OwnNative {
 	static boolean tlA1SplitWritten(long own) {
 		try {
 			return (int) TL_A1SPLIT_WRITTEN.invokeExact(own) == 1;
+		} catch (Throwable t) {
+			throw rethrow(t);
+		}
+	}
+
+	/** -Dmcopt.animViewCache (default on): mcown.m ownMipView keeps its views. */
+	static void animViewCache(boolean on) {
+		try {
+			ANIM_VIEW_CACHE.invokeExact(on ? 1 : 0);
 		} catch (Throwable t) {
 			throw rethrow(t);
 		}

@@ -53,6 +53,7 @@ public final class AnimCopy {
 	/** -Dmcopt.own.int.animVerify=N: every N-th drawing tick vanilla draws the atlas as usual and the same sprites go into the scratch too; both are read back and every drawn sprite's rectangle compared pixel for pixel. */
 	public static final int VERIFY_EVERY = Integer.getInteger("mcopt.own.int.animVerify", 0);
 	private static final Map<TextureAtlas, int[]> VERIFY_COUNTS = new WeakHashMap<>();
+	private static boolean viewCacheSet;
 	private static long verifyRects, verifyPixels, verifyBad;
 	private static int verifyMax;
 
@@ -159,6 +160,10 @@ public final class AnimCopy {
 						maxW = Math.max(maxW, w);
 						maxH = Math.max(maxH, h);
 						count++;
+					}
+					if (!viewCacheSet) {
+						viewCacheSet = true;
+						OwnNative.animViewCache(!"false".equals(System.getProperty("mcopt.animViewCache")));
 					}
 					ok = OwnNative.animCopy(own.ownHandle(), own.encHandle(), src, dst, mip, rects, count, maxW, maxH);
 				}
