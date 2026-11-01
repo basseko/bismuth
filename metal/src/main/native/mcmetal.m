@@ -922,7 +922,7 @@ id<MTLComputeCommandEncoder> mc_profiled_compute(Enc *enc, id<MTLCommandBuffer> 
 			}
 			return ce;
 		}
-		return [[c computeCommandEncoderWithDispatchType:type] retain];
+		return mce_new_compute_encoder(c, type);
 	}
 }
 
@@ -944,7 +944,7 @@ id<MTLBlitCommandEncoder> mc_profiled_blit(Enc *enc, id<MTLCommandBuffer> c) {
 			}
 			return be;
 		}
-		return [[c blitCommandEncoder] retain];
+		return mce_new_blit_encoder(c);
 	}
 }
 
@@ -1024,7 +1024,7 @@ id<MTLCommandBuffer> mc_enc_commit(Enc *enc) {
 	if (enc->pre) {
 		mc_pre_end_encoders(enc);
 		if (diagOn) [enc->pre addCompletedHandler:^(id<MTLCommandBuffer> cb) { diagReport("pre", n, t, big, preBytes, cb); }];
-		[enc->pre commit];
+		mce_cmd_commit(enc->pre);
 		[enc->pre release];
 		enc->pre = nil;
 	}
@@ -1032,7 +1032,7 @@ id<MTLCommandBuffer> mc_enc_commit(Enc *enc) {
 	endRender(enc);
 	id<MTLCommandBuffer> c = cmd(enc);
 	if (diagOn) [c addCompletedHandler:^(id<MTLCommandBuffer> cb) { diagReport("main", n, t, big, mainBytes, cb); }];
-	[c commit];
+	mce_cmd_commit(c);
 	if (gcOn) {  // -Dmcopt.metal.gpuCount: the next frame's encoders get a new record and frame index
 		gcFrame++;
 		[gcCurrent release];
@@ -1302,6 +1302,18 @@ static void openRender(Enc *enc, MTLRenderPassDescriptor *rp) {
 	if (counted) gcBeforeOpen(enc, rp, cmd(enc));
 	else if (gcOn) rp.visibilityResultBuffer = nil;  // a frame between counted ones (a kept descriptor may still name the buffer)
 	enc->render = mce_new_render_encoder(cmd(enc), rp);
+	static int labelOn = -1;
+	if (labelOn < 0) labelOn = mce_pt_any();
+	if (labelOn) {  // a label from the attachments, so pass timing can tell the game's passes apart (MCE_PASSTIME)
+		id<MTLTexture> t0 = rp.colorAttachments[0].texture ?: rp.depthAttachment.texture;
+		int nc = 0;
+		for (int i = 0; i < 8; i++) if (rp.colorAttachments[i].texture) nc++;
+		static const char *la[] = {"dontcare", "load", "clear"};
+		MTLLoadAction l0 = rp.colorAttachments[0].texture ? rp.colorAttachments[0].loadAction : rp.depthAttachment.loadAction;
+		MTLPixelFormat f0 = t0 ? t0.pixelFormat : MTLPixelFormatInvalid;
+		[mce_raw(enc->render) setLabel:[NSString stringWithFormat:@"pass %s%dx%d %dc%s fmt%d %s", t0 && t0.label.length ? t0.label.UTF8String : "",
+			t0 ? (int) t0.width : 0, t0 ? (int) t0.height : 0, nc, rp.depthAttachment.texture ? "+d" : "", (int) f0, la[(int) l0 > 2 ? 0 : (int) l0]]];
+	}
 	if (renderGroup >= 0 && renderGroup < 512) {
 		enc->sampleEnc[renderGroup] = [enc->render retain];  // (the encoder itself, before any counting wrapper)
 		enc->sampleKind[renderGroup] = 'R';
@@ -1733,6 +1745,7 @@ void mc_clear_rect(Enc *enc, id<MTLTexture> color, id<MTLTexture> depthTex, floa
 		}
 		id rh = mce_new_render_encoder(cmd(enc), rp);
 		id<MTLRenderCommandEncoder> re = mce_raw(rh);
+		[re setLabel:@"clear region"];
 		struct { float color[4]; float depth; float pad[3]; } c = {{r, g, b, a}, depth < 0 ? 0 : depth, {0}};
 		[re setRenderPipelineState:pso];
 		[re setDepthStencilState:depth >= 0 ? ctx->depthWrite : ctx->depthKeep];
@@ -1868,6 +1881,7 @@ void mc_present(Enc *enc, id<CAMetalDrawable> drawable, id<MTLTexture> src) {
 		rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
 		rp.colorAttachments[0].storeAction = MTLStoreActionStore;
 		id r = mce_new_render_encoder(cmd(enc), rp);
+		[mce_raw(r) setLabel:@"present"];
 		[mce_raw(r) setRenderPipelineState:enc->ctx->present];
 		mce_set_fragment_texture(r, src, 0);
 		mce_set_fragment_sampler(r, enc->ctx->presentSampler, 0);

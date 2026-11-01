@@ -778,7 +778,7 @@ static int passTime(void) {
 	if (m < 0) { const char *v = getenv("MCE_PASSTIME"); m = v && atoi(v) > 0; if (m) fprintf(stderr, "mcopt-metal4: MEASUREMENT pass timing on\n"); }
 	return m;
 }
-static struct { os_unfair_lock lock; NSMutableDictionary *us, *n; uint64_t frames; double last; double freq; } PT = {.lock = OS_UNFAIR_LOCK_INIT};
+static struct { os_unfair_lock lock; NSMutableDictionary *us, *n, *ex; uint64_t frames, cmds, commits; double last, gpuSum, lastEnd;  double freq; } PT = {.lock = OS_UNFAIR_LOCK_INIT};
 
 static void ptStart(MceEncoder *e) {
 	MceCmd *c = e->cmd;
@@ -815,41 +815,250 @@ static void ptEnd(MceEncoder *e) {
 		[(id<MTL4ComputeCommandEncoder>) e->real writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed intoHeap:c->heap atIndex:i * 2 + 1];
 }
 
+// accumulates per label, prints every 2 s (both backends). st/en: absolute start/end of each encoder in µs (any common origin, -1 = no sample).
+// Two numbers: "span" = end - start (includes time spent overlapping or waiting behind other passes) and "excl" = the time the pass added
+// to the GPU timeline: its end minus the later of its own start and the previous pass's end (the passes of a frame sum to its GPU time).
+static void ptAdd(NSArray *labels, const double *st, const double *en, int presented) {
+	NSUInteger n = labels.count;
+	NSUInteger order[PT_CAP];
+	for (NSUInteger i = 0; i < n && i < PT_CAP; i++) order[i] = i;
+	os_unfair_lock_lock(&PT.lock);
+	// by end time (insertion sort: a few hundred at most)
+	for (NSUInteger i = 1; i < n && i < PT_CAP; i++) {
+		NSUInteger k = order[i], j = i;
+		while (j > 0 && en[order[j - 1]] > en[k]) { order[j] = order[j - 1]; j--; }
+		order[j] = k;
+	}
+	if (!PT.us) { PT.us = [NSMutableDictionary new]; PT.n = [NSMutableDictionary new]; PT.ex = [NSMutableDictionary new]; }
+	for (NSUInteger q = 0; q < n && q < PT_CAP; q++) {
+		NSUInteger i = order[q];
+		if (st[i] < 0 || en[i] < st[i]) continue;
+		NSString *k = labels[i];
+		double from = st[i] > PT.lastEnd ? st[i] : PT.lastEnd;
+		double ex = en[i] > from ? en[i] - from : 0;
+		if (en[i] > PT.lastEnd) PT.lastEnd = en[i];
+		PT.us[k] = @([PT.us[k] doubleValue] + (en[i] - st[i]));
+		PT.ex[k] = @([PT.ex[k] doubleValue] + ex);
+		PT.n[k] = @([PT.n[k] longLongValue] + 1);
+	}
+	PT.frames += presented;
+	PT.cmds++;
+	double now = CFAbsoluteTimeGetCurrent();
+	if (PT.last == 0) PT.last = now;
+	if (now - PT.last > 2.0 && PT.frames > 0) {
+		NSArray *keys = [PT.ex keysSortedByValueUsingComparator:^NSComparisonResult(NSNumber *x, NSNumber *y) { return [y compare:x]; }];
+		double total = 0;
+		for (NSString *k in keys) total += [PT.ex[k] doubleValue];
+		int v = mce_metal4 ? 4 : 3;
+		fprintf(stderr, "mcopt-metal%d passtime: %llu presented frames (%llu/%llu command buffers resolved/committed, GPU wall %.1f ms), exclusive %.3f ms/frame\n", v,
+			(unsigned long long) PT.frames, (unsigned long long) PT.cmds, (unsigned long long) PT.commits, PT.gpuSum * 1000, total / 1000.0 / PT.frames);
+		int shown = 0;
+		for (NSString *k in keys) {
+			if (shown++ >= 40) break;
+			fprintf(stderr, "mcopt-metal%d passtime:   excl %8.1f us/frame %5.1f%%  span %8.1f  %6.2f /frame  %s\n", v, [PT.ex[k] doubleValue] / PT.frames,
+				100 * [PT.ex[k] doubleValue] / total, [PT.us[k] doubleValue] / PT.frames, [PT.n[k] doubleValue] / PT.frames, k.UTF8String);
+		}
+		[PT.us removeAllObjects];
+		[PT.n removeAllObjects];
+		[PT.ex removeAllObjects];
+		PT.frames = PT.cmds = PT.commits = 0; PT.gpuSum = 0;
+		PT.last = now;
+	}
+	os_unfair_lock_unlock(&PT.lock);
+}
+
 // on the feedback queue, after the GPU finished the command buffer
 static void ptResolve(id heapObj, NSArray *labels, int presented) {
 	id<MTL4CounterHeap> heap = heapObj;
 	if (!PT.freq) PT.freq = (double) [M.device queryTimestampFrequency];
 	NSData *d = labels.count ? [heap resolveCounterRange:NSMakeRange(0, labels.count * 2)] : nil;
 	const MTL4TimestampHeapEntry *t = d.bytes;
-	os_unfair_lock_lock(&PT.lock);
-	if (!PT.us) { PT.us = [NSMutableDictionary new]; PT.n = [NSMutableDictionary new]; }
-	for (NSUInteger i = 0; t && i < labels.count; i++) {
-		uint64_t a = t[i * 2].timestamp, b = t[i * 2 + 1].timestamp;
-		if (!a || !b || b < a) continue;
-		double us = (double) (b - a) * 1e6 / PT.freq;
-		NSString *k = labels[i];
-		PT.us[k] = @([PT.us[k] doubleValue] + us);
-		PT.n[k] = @([PT.n[k] longLongValue] + 1);
+	double st[PT_CAP], en[PT_CAP];
+	for (NSUInteger i = 0; i < labels.count && i < PT_CAP; i++) {
+		uint64_t a = t ? t[i * 2].timestamp : 0, b = t ? t[i * 2 + 1].timestamp : 0;
+		st[i] = !a || !b || b < a ? -1 : (double) a * 1e6 / PT.freq;
+		en[i] = !a || !b || b < a ? -1 : (double) b * 1e6 / PT.freq;
 	}
-	PT.frames += presented;
-	double now = CFAbsoluteTimeGetCurrent();
-	if (PT.last == 0) PT.last = now;
-	if (now - PT.last > 2.0 && PT.frames > 0) {
-		NSArray *keys = [PT.us keysSortedByValueUsingComparator:^NSComparisonResult(NSNumber *x, NSNumber *y) { return [y compare:x]; }];
-		double total = 0;
-		for (NSString *k in keys) total += [PT.us[k] doubleValue];
-		fprintf(stderr, "mcopt-metal4 passtime: %llu frames, sum of passes %.3f ms/frame\n", (unsigned long long) PT.frames, total / 1000.0 / PT.frames);
-		int shown = 0;
-		for (NSString *k in keys) {
-			if (shown++ >= 30) break;
-			fprintf(stderr, "mcopt-metal4 passtime:   %8.1f us/frame  %6.2f /frame  %s\n", [PT.us[k] doubleValue] / PT.frames, [PT.n[k] doubleValue] / PT.frames, k.UTF8String);
+	ptAdd(labels, st, en, presented);
+}
+
+int mce_pt_any(void) { return mce_pt3 || passTime(); }
+
+// ---- Metal 3 pass timing (same switch, MCE_PASSTIME=1): MTLCounterSampleBuffer per command buffer, stage-boundary samples ----
+// render encoders: start of vertex .. end of fragment; compute/blit: start .. end of encoder. Resolved in the command buffer's completed handler.
+int mce_pt3 = 0;
+__attribute__((constructor)) static void pt3Init(void) { const char *v = getenv("MCE_PASSTIME"); mce_pt3 = v && atoi(v) > 0; }
+
+#define PT3_CAP 160  // encoders per command buffer (a pool of reused sample buffers: allocating one per command buffer fails)
+static os_unfair_lock pt3PoolLock = OS_UNFAIR_LOCK_INIT;
+static NSMutableArray *pt3Pool;
+@interface Pt3Cmd : NSObject {
+@public
+	id<MTLCounterSampleBuffer> sb;
+	NSMutableArray *labels;
+	int presented;
+}
+@end
+@implementation Pt3Cmd
+- (void)dealloc {
+	os_unfair_lock_lock(&pt3PoolLock);
+	if (!pt3Pool) pt3Pool = [NSMutableArray new];
+	if (sb) [pt3Pool addObject:sb];
+	os_unfair_lock_unlock(&pt3PoolLock);
+	[sb release];
+	[labels release];
+	[super dealloc];
+}
+@end
+@interface Pt3Ref : NSObject {
+@public
+	Pt3Cmd *c;
+	int idx;
+}
+@end
+@implementation Pt3Ref
+- (void)dealloc { [c release]; [super dealloc]; }
+@end
+static char pt3CmdKey, pt3RefKey;
+static id<MTLDevice> pt3Dev;
+
+static Pt3Cmd *pt3Cmd(id<MTLCommandBuffer> cb) {
+	Pt3Cmd *c = objc_getAssociatedObject(cb, &pt3CmdKey);
+	if (c) return c;
+	id<MTLDevice> dev = cb.device;
+	if (![dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) { mce_log_once("pass timing: no stage-boundary counter sampling"); return nil; }
+	for (id<MTLCounterSet> set in dev.counterSets) {
+		if (![set.name isEqualToString:MTLCommonCounterSetTimestamp]) continue;
+		MTLCounterSampleBufferDescriptor *d = [[MTLCounterSampleBufferDescriptor new] autorelease];
+		d.counterSet = set;
+		d.storageMode = MTLStorageModeShared;
+		d.sampleCount = PT3_CAP * 2;
+		NSError *err = nil;
+		id<MTLCounterSampleBuffer> sb = nil;
+		os_unfair_lock_lock(&pt3PoolLock);
+		if (pt3Pool.count) { sb = [pt3Pool.lastObject retain]; [pt3Pool removeLastObject]; }
+		os_unfair_lock_unlock(&pt3PoolLock);
+		if (!sb) sb = [dev newCounterSampleBufferWithDescriptor:d error:&err];
+		if (!sb) { fprintf(stderr, "mcopt-metal3: pass timing: sample buffer failed: %s\n", err.description.UTF8String); return nil; }
+		c = [Pt3Cmd new];
+		c->sb = sb;
+		c->labels = [NSMutableArray new];
+		pt3Dev = dev;
+		objc_setAssociatedObject(cb, &pt3CmdKey, c, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+		[c release];
+		return c;
+	}
+	return nil;
+}
+
+static void pt3Attach(id enc, Pt3Cmd *c) {
+	Pt3Ref *r = [Pt3Ref new];
+	r->c = [c retain];
+	r->idx = (int) c->labels.count - 1;
+	objc_setAssociatedObject(enc, &pt3RefKey, r, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+	[r release];
+}
+
+id mce3_new_render_encoder(id cmd, MTLRenderPassDescriptor *rp) {
+	@autoreleasepool {
+		Pt3Cmd *c = rp.sampleBufferAttachments[0].sampleBuffer ? nil : pt3Cmd(cmd);
+		if (!c || c->labels.count >= PT3_CAP) return [[(id<MTLCommandBuffer>) cmd renderCommandEncoderWithDescriptor:rp] retain];
+		NSUInteger i = c->labels.count;
+		MTLRenderPassSampleBufferAttachmentDescriptor *s = rp.sampleBufferAttachments[0];
+		s.sampleBuffer = c->sb;
+		s.startOfVertexSampleIndex = i * 2;
+		s.endOfVertexSampleIndex = MTLCounterDontSample;
+		s.startOfFragmentSampleIndex = MTLCounterDontSample;
+		s.endOfFragmentSampleIndex = i * 2 + 1;
+		[c->labels addObject:@"?"];
+		id e = [[(id<MTLCommandBuffer>) cmd renderCommandEncoderWithDescriptor:rp] retain];
+		s.sampleBuffer = nil;
+		pt3Attach(e, c);
+		return e;
+	}
+}
+
+id mce3_new_compute_encoder(id cmd, MTLDispatchType type) {
+	@autoreleasepool {
+		Pt3Cmd *c = pt3Cmd(cmd);
+		if (!c || c->labels.count >= PT3_CAP) return [(type == MTLDispatchTypeSerial ? [(id<MTLCommandBuffer>) cmd computeCommandEncoder]
+			: [(id<MTLCommandBuffer>) cmd computeCommandEncoderWithDispatchType:type]) retain];
+		NSUInteger i = c->labels.count;
+		MTLComputePassDescriptor *d = [MTLComputePassDescriptor computePassDescriptor];
+		d.dispatchType = type;
+		d.sampleBufferAttachments[0].sampleBuffer = c->sb;
+		d.sampleBufferAttachments[0].startOfEncoderSampleIndex = i * 2;
+		d.sampleBufferAttachments[0].endOfEncoderSampleIndex = i * 2 + 1;
+		[c->labels addObject:@"?"];
+		id e = [[(id<MTLCommandBuffer>) cmd computeCommandEncoderWithDescriptor:d] retain];
+		pt3Attach(e, c);
+		return e;
+	}
+}
+
+id mce3_new_blit_encoder(id cmd) {
+	@autoreleasepool {
+		Pt3Cmd *c = pt3Cmd(cmd);
+		if (!c || c->labels.count >= PT3_CAP) return [[(id<MTLCommandBuffer>) cmd blitCommandEncoder] retain];
+		NSUInteger i = c->labels.count;
+		MTLBlitPassDescriptor *d = [MTLBlitPassDescriptor blitPassDescriptor];
+		d.sampleBufferAttachments[0].sampleBuffer = c->sb;
+		d.sampleBufferAttachments[0].startOfEncoderSampleIndex = i * 2;
+		d.sampleBufferAttachments[0].endOfEncoderSampleIndex = i * 2 + 1;
+		[c->labels addObject:@"?"];
+		id e = [[(id<MTLCommandBuffer>) cmd blitCommandEncoderWithDescriptor:d] retain];
+		pt3Attach(e, c);
+		return e;
+	}
+}
+
+// before endEncoding: the label is final by now
+void mce3_pt_end(id e) {
+	Pt3Ref *r = objc_getAssociatedObject(e, &pt3RefKey);
+	if (!r) return;
+	NSString *l = [(id<MTLCommandEncoder>) e label];
+	BOOL render = [e conformsToProtocol:@protocol(MTLRenderCommandEncoder)];
+	BOOL comp = [e conformsToProtocol:@protocol(MTLComputeCommandEncoder)];
+	r->c->labels[r->idx] = l.length ? l : (render ? @"render (no label)" : comp ? @"compute (no label)" : @"blit (no label)");
+}
+
+void mce3_pt_present(id cb) { Pt3Cmd *c = objc_getAssociatedObject(cb, &pt3CmdKey); if (c) c->presented = 1; }
+
+void mce3_pt_commit(id cbObj) {
+	id<MTLCommandBuffer> cb = cbObj;
+	Pt3Cmd *c = objc_getAssociatedObject(cb, &pt3CmdKey);
+	if (!c) return;
+	[c retain];
+	__atomic_add_fetch(&PT.commits, 1, __ATOMIC_RELAXED);
+	[cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+		static uint64_t cpu0, gpu0;
+		static double cpuT0;
+		PT.gpuSum += b.GPUEndTime - b.GPUStartTime;
+		uint64_t cpu1, gpu1;
+		[b.device sampleTimestamps:&cpu1 gpuTimestamp:&gpu1];
+		if (!gpu0) { cpu0 = cpu1; gpu0 = gpu1; cpuT0 = CFAbsoluteTimeGetCurrent(); }
+		else if (CFAbsoluteTimeGetCurrent() - cpuT0 > 0.5 && gpu1 > gpu0) {
+			double usPerTick = (double) (cpu1 - cpu0) / (double) (gpu1 - gpu0) / 1000.0;
+			NSUInteger n = c->labels.count;
+			NSData *d = [c->sb resolveCounterRange:NSMakeRange(0, n * 2)];
+			const MTLCounterResultTimestamp *t = d.bytes;
+			double st[PT3_CAP], en[PT3_CAP];
+			for (NSUInteger i = 0; i < n; i++) {
+				uint64_t x = t ? t[i * 2].timestamp : 0, y = t ? t[i * 2 + 1].timestamp : 0;
+				BOOL ok = !(x == MTLCounterErrorValue || y == MTLCounterErrorValue || !x || !y || y < x);
+				st[i] = ok ? 1e9 + (double) (int64_t) (x - gpu0) * usPerTick : -1;
+				en[i] = ok ? 1e9 + (double) (int64_t) (y - gpu0) * usPerTick : -1;
+			}
+			ptAdd(c->labels, st, en, c->presented);
 		}
-		[PT.us removeAllObjects];
-		[PT.n removeAllObjects];
-		PT.frames = 0;
-		PT.last = now;
-	}
-	os_unfair_lock_unlock(&PT.lock);
+		os_unfair_lock_lock(&pt3PoolLock);
+		if (!pt3Pool) pt3Pool = [NSMutableArray new];
+		if (c->sb) [pt3Pool addObject:c->sb];
+		os_unfair_lock_unlock(&pt3PoolLock);
+		[c->sb release];
+		c->sb = nil;
+		[c release];
+	}];
 }
 
 static CFMutableDictionaryRef trackMap;  // canonical resource (unretained key) -> MceUse (retained)
