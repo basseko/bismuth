@@ -61,6 +61,10 @@ final class MetalRenderPass implements RenderPassBackend {
 	private final @Nullable MetalBuffer[] capB = EntityShade.CAST ? new MetalBuffer[MAX_UNIFORMS] : null;
 
 	private final boolean hasDepth;
+	/** -Dmcopt.drawstats (measurement): this pass's label, and whether any state changed since the previous draw. */
+	private final String statLabel = DrawStats.ON ? DrawStats.nextLabel : null;
+	private boolean statChanged = true;
+	private byte[] statPush = new byte[0];
 	/** Shaderpack runtime: draws this pass's pipelines with its own (see MetalHooks); null on the backend's own path. */
 	private final @Nullable PassDelegate delegate;
 	/** With a delegate: the current pipeline's uniform slots (index -> slot, -1 unbound); null drops its draws. */
@@ -76,6 +80,76 @@ final class MetalRenderPass implements RenderPassBackend {
 		this.areaWidth = width;
 		this.areaHeight = height;
 		this.enableScissor(x, y, width, height);
+		if (DrawStats.ON) DrawStats.pass(this.statLabel);
+	}
+
+	/** -Dmcopt.drawstats: how many draws of a separate-array multi-draw continue the previous one's vertices (in order, and after sorting by base vertex). */
+	private void statMerge(PointerBuffer offsets, IntBuffer counts, IntBuffer bases, int n) {
+		if (this.pipeline == null || n < 2) return;
+		long[] r = DrawStats.row(this.statLabel, this.pipeline.name);
+		long[][] d = new long[n][3];
+		for (int i = 0; i < n; i++) d[i] = new long[] {bases.get(bases.position() + i), counts.get(counts.position() + i), offsets.get(offsets.position() + i)};
+		for (int i = 1; i < n; i++) if (d[i][2] == d[i - 1][2] && d[i][0] == d[i - 1][0] + d[i - 1][1] / 6 * 4) r[DrawStats.MERGE_ORDER]++;
+		java.util.Arrays.sort(d, (x, y) -> Long.compare(x[0], y[0]));
+		for (int i = 1; i < n; i++) if (d[i][2] == d[i - 1][2] && d[i][0] == d[i - 1][0] + d[i - 1][1] / 6 * 4) r[DrawStats.MERGE_SORTED]++;
+		if (!this.statShown) {
+			this.statShown = true;
+			StringBuilder sb = new StringBuilder("drawstats sample multiDrawIndexed " + this.pipeline.name + " n=" + n + ":");
+			for (int i = 0; i < Math.min(8, n); i++) sb.append(" [bv " + bases.get(bases.position() + i) + " cnt " + counts.get(counts.position() + i) + " off " + offsets.get(offsets.position() + i) + "]");
+			System.out.println(sb);
+		}
+	}
+	private boolean statShown;
+
+	/** Same for indirect commands {indexCount, instanceCount, firstIndex, baseVertex, baseInstance} read from the (CPU-visible) buffer. */
+	private void statMergeIndirect(GpuBufferSlice commands, int n) {
+		if (this.pipeline == null || n < 2) return;
+		MetalBuffer mb = this.encoder.use(commands.buffer());
+		if (mb.address == 0) { if (!this.statShown) { this.statShown = true; System.out.println("drawstats: indirect buffer not CPU-visible"); } return; }
+		long[] r = DrawStats.row(this.statLabel, this.pipeline.name);
+		long[][] d = new long[n][4];
+		long at = mb.address + commands.offset();
+		for (int i = 0; i < n; i++) {
+			long a = at + 20L * i;
+			d[i] = new long[] {MemoryUtil.memGetInt(a + 12), MemoryUtil.memGetInt(a), MemoryUtil.memGetInt(a + 8), MemoryUtil.memGetInt(a + 4)};
+		}
+		for (int i = 1; i < n; i++) if (d[i][2] == d[i - 1][2] && d[i][3] == d[i - 1][3] && d[i][0] == d[i - 1][0] + d[i - 1][1] / 6 * 4) r[DrawStats.MERGE_ORDER]++;
+				if (!this.statShown) {
+			this.statShown = true;
+			StringBuilder sb = new StringBuilder("drawstats sample drawIndexedIndirect " + this.pipeline.name + " n=" + n + ":");
+			for (int i = 0; i < Math.min(10, n); i++) sb.append(" [bv " + d[i][0] + " cnt " + d[i][1] + " first " + d[i][2] + " inst " + d[i][3] + "]");
+			System.out.println(sb);
+		}
+java.util.Arrays.sort(d, (x, y) -> Long.compare(x[0], y[0]));
+		for (int i = 1; i < n; i++) if (d[i][2] == d[i - 1][2] && d[i][3] == d[i - 1][3] && d[i][0] == d[i - 1][0] + d[i - 1][1] / 6 * 4) r[DrawStats.MERGE_SORTED]++;
+	}
+
+	/** Same as statMerge for the {firstIndex, indexCount, vertexOffset} layout. */
+	private void statMergeTriples(IntBuffer p, int instances, int n) {
+		if (this.pipeline == null || n < 2) return;
+		long[] r = DrawStats.row(this.statLabel, this.pipeline.name);
+		long[][] d = new long[n][3];
+		int at = p.position();
+		for (int i = 0; i < n; i++) d[i] = new long[] {p.get(at + 3 * i + 2), p.get(at + 3 * i + 1), p.get(at + 3 * i)};
+		for (int i = 1; i < n; i++) if (d[i][2] == d[i - 1][2] && d[i][0] == d[i - 1][0] + d[i - 1][1] / 6 * 4) r[DrawStats.MERGE_ORDER]++;
+		java.util.Arrays.sort(d, (x, y) -> Long.compare(x[0], y[0]));
+		for (int i = 1; i < n; i++) if (d[i][2] == d[i - 1][2] && d[i][0] == d[i - 1][0] + d[i - 1][1] / 6 * 4) r[DrawStats.MERGE_SORTED]++;
+		if (!this.statShown) {
+			this.statShown = true;
+			StringBuilder sb = new StringBuilder("drawstats sample multiDrawIndexed(triples) " + this.pipeline.name + " n=" + n + " instances " + instances + ":");
+			for (int i = 0; i < Math.min(8, n); i++) sb.append(" [bv " + p.get(at + 3 * i + 2) + " cnt " + p.get(at + 3 * i + 1) + " first " + p.get(at + 3 * i) + "]");
+			System.out.println(sb);
+		}
+	}
+
+	/** -Dmcopt.drawstats: counts one draw command of n native draws under the current pipeline. */
+	private void statDraw(int n) {
+		if (this.pipeline == null) return;
+		long[] r = DrawStats.row(this.statLabel, this.pipeline.name);
+		r[DrawStats.CMDS]++;
+		r[DrawStats.DRAWS] += n;
+		if (!this.statChanged) r[DrawStats.CHAIN]++;
+		this.statChanged = false;
 	}
 
 	@Override
@@ -96,6 +170,12 @@ final class MetalRenderPass implements RenderPassBackend {
 			Arrays.fill(this.bound, null);
 			this.dirtyUpTo = p.uniforms.size();
 			return;
+		}
+		if (DrawStats.ON) {
+			long[] r = DrawStats.row(this.statLabel, p.name);
+			r[DrawStats.PIPE]++;
+			if (p == this.pipeline) r[DrawStats.PIPE_SAME]++;
+			else this.statChanged = true;
 		}
 		boolean terrain = p.pulled != 0 && this.hasDepth, record = terrain && this.encoder.terrain.split;
 		if (terrain) this.encoder.terrain.terrainPixels = (long) this.areaWidth * this.areaHeight;
@@ -220,6 +300,15 @@ final class MetalRenderPass implements RenderPassBackend {
 
 	@Override
 	public void pushConstants(ByteBuffer value) {
+		if (DrawStats.ON && this.pipeline != null) {
+			byte[] now = new byte[value.remaining()];
+			value.get(value.position(), now);
+			long[] r = DrawStats.row(this.statLabel, this.pipeline.name);
+			r[DrawStats.PC]++;
+			if (java.util.Arrays.equals(now, this.statPush)) r[DrawStats.PC_SAME]++;
+			else this.statChanged = true;
+			this.statPush = now;
+		}
 		if (this.recording != null) {
 			this.encoder.terrain.pushConstants(MemoryUtil.memAddress(value), value.remaining());
 			return;
@@ -233,6 +322,12 @@ final class MetalRenderPass implements RenderPassBackend {
 
 	@Override
 	public void enableScissor(int x, int y, int width, int height) {
+		if (DrawStats.ON && this.pipeline != null) {
+			long[] r = DrawStats.row(this.statLabel, this.pipeline.name);
+			r[DrawStats.SCI]++;
+			if (this.scissor[0] == x && this.scissor[1] == y && this.scissor[2] == width && this.scissor[3] == height) r[DrawStats.SCI_SAME]++;
+			else this.statChanged = true;
+		}
 		Native.scissor(this.enc, x, y, width, height);
 		this.scissor[0] = x;
 		this.scissor[1] = y;
@@ -250,6 +345,12 @@ final class MetalRenderPass implements RenderPassBackend {
 		if (vertexBuffer == null) return;
 		if (MetalConst.VERTEX_BUFFER_BASE + slot > 30) throw new IllegalArgumentException("Metal backend supports vertex buffer slots 0-3, got " + slot);
 		if (slot == 0) this.vertexBuffer0 = vertexBuffer;
+		if (DrawStats.ON && this.pipeline != null) {
+			long[] r = DrawStats.row(this.statLabel, this.pipeline.name);
+			r[DrawStats.VB]++;
+			if (vertexBuffer.equals(this.vertexBuffers[slot])) r[DrawStats.VB_SAME]++;
+			else this.statChanged = true;
+		}
 		if (this.recording != null) return;
 		Native.vertexBuffer(this.enc, MetalConst.VERTEX_BUFFER_BASE + slot, this.encoder.use(vertexBuffer.buffer()).handle, vertexBuffer.offset());
 		this.vertexBuffers[slot] = vertexBuffer;
@@ -257,6 +358,12 @@ final class MetalRenderPass implements RenderPassBackend {
 
 	@Override
 	public void setIndexBuffer(GpuBuffer indexBuffer, IndexType indexType) {
+		if (DrawStats.ON && this.pipeline != null) {
+			long[] r = DrawStats.row(this.statLabel, this.pipeline.name);
+			r[DrawStats.IB]++;
+			if (this.indexBuf != null && this.indexBuf == this.encoder.use(indexBuffer) && this.indexInt == (indexType == IndexType.INT ? 1 : 0)) r[DrawStats.IB_SAME]++;
+			else this.statChanged = true;
+		}
 		this.indexBuf = this.encoder.use(indexBuffer);
 		this.indexHandle = this.indexBuf.handle;
 		this.indexInt = indexType == IndexType.INT ? 1 : 0;
@@ -311,7 +418,16 @@ final class MetalRenderPass implements RenderPassBackend {
 		for (int i = 0; i < this.dirtyUpTo && i < uniforms.size(); i++) {
 			Object value = this.pending[i];
 			if (value == null) throw new IllegalStateException("Missing uniform " + uniforms.get(i).name());
-			if (value.equals(this.bound[i])) continue;
+			if (value.equals(this.bound[i])) {
+				if (DrawStats.ON) DrawStats.row(this.statLabel, this.pipeline.name)[DrawStats.USKIP]++;
+				if (DrawStats.ON) DrawStats.uniform(this.pipeline.name, uniforms.get(i).name(), false);
+				continue;
+			}
+			if (DrawStats.ON) {
+				DrawStats.row(this.statLabel, this.pipeline.name)[DrawStats.UBIND]++;
+				DrawStats.uniform(this.pipeline.name, uniforms.get(i).name(), true);
+				this.statChanged = true;
+			}
 			this.bound[i] = value;
 			this.bindUniform(uniforms.get(i), i, value);
 		}
@@ -368,6 +484,7 @@ final class MetalRenderPass implements RenderPassBackend {
 	public void drawIndexed(int indexCount, int instanceCount, int firstIndex, int vertexOffset, int firstInstance) {
 		if (!this.delegated()) return;
 		this.bindUniforms(1);
+		if (DrawStats.ON) this.statDraw(1);
 		this.indices += (long) indexCount * instanceCount;
 		String name = Objects.requireNonNull(this.pipeline).name;
 		boolean clouds = name.equals("minecraft:pipeline/clouds") || name.equals("minecraft:pipeline/flat_clouds");
@@ -398,6 +515,10 @@ final class MetalRenderPass implements RenderPassBackend {
 	public void multiDrawIndexed(IntBuffer drawParameters, int instanceCount, int firstInstance, int drawCount) {
 		if (!this.delegated()) return;
 		this.bindUniforms(drawCount);
+		if (DrawStats.ON) {
+			this.statDraw(drawCount);
+			this.statMergeTriples(drawParameters, instanceCount, drawCount);
+		}
 		Native.multiDrawIndexed(this.enc, MemoryUtil.memAddress(drawParameters), drawCount, instanceCount, firstInstance);
 	}
 
@@ -405,6 +526,10 @@ final class MetalRenderPass implements RenderPassBackend {
 	public void multiDrawIndexed(PointerBuffer firstIndexOffsets, IntBuffer indexCounts, IntBuffer vertexOffsets, int drawCount) {
 		if (!this.delegated()) return;
 		this.bindUniforms(drawCount);
+		if (DrawStats.ON) {
+			this.statDraw(drawCount);
+			this.statMerge(firstIndexOffsets, indexCounts, vertexOffsets, drawCount);
+		}
 		if (this.encoder.tracing()) for (int i = 0; i < drawCount; i++) this.indices += indexCounts.get(indexCounts.position() + i);
 		if (this.recording != null) {
 			this.encoder.terrain.record(Objects.requireNonNull(this.vertexBuffer0), indexCounts, vertexOffsets, drawCount);
@@ -418,13 +543,48 @@ final class MetalRenderPass implements RenderPassBackend {
 	public void drawIndexedIndirect(GpuBufferSlice commands, int drawCount) {
 		if (!this.delegated()) return;
 		this.bindUniforms(drawCount);
+		if (DrawStats.ON) {
+			this.statDraw(drawCount);
+			this.statMergeIndirect(commands, drawCount);
+		}
+		if (BatchDraws.DIRECT && drawCount > 1 && this.directFromIndirect(commands, drawCount)) return;
 		Native.drawIndexedIndirect(this.enc, this.encoder.use(commands.buffer()).handle, commands.offset(), drawCount);
+	}
+
+	/**
+	 * -Dmcopt.batch.direct: the frontend's indirect list sits in CPU-visible memory it wrote before the pass, so read it here and issue the
+	 * draws directly (no per-draw argument fetch by the GPU); zero-sized draws are dropped. Only plain commands (one instance, base instance 0).
+	 */
+	private boolean directFromIndirect(GpuBufferSlice commands, int drawCount) {
+		MetalBuffer mb = this.encoder.use(commands.buffer());
+		if (mb.address == 0 || commands.offset() + 20L * drawCount > mb.size()) return false;
+		long at = mb.address + commands.offset();
+		long out = BatchDraws.scratch(drawCount);
+		int n = 0;
+		for (int i = 0; i < drawCount; i++) {
+			long a = at + 20L * i;
+			if (MemoryUtil.memGetInt(a + 16) != 0) return false;
+			int instances = MemoryUtil.memGetInt(a + 4);
+			if (instances != 1) {
+				if (instances == 0) continue;
+				return false;
+			}
+			int count = MemoryUtil.memGetInt(a);
+			if (count == 0) continue;
+			long o = out + 12L * n++;
+			MemoryUtil.memPutInt(o, MemoryUtil.memGetInt(a + 8));
+			MemoryUtil.memPutInt(o + 4, count);
+			MemoryUtil.memPutInt(o + 8, MemoryUtil.memGetInt(a + 12));
+		}
+		if (n > 0) Native.multiDrawIndexed(this.enc, out, n, 1, 0);
+		return true;
 	}
 
 	@Override
 	public void draw(int vertexCount, int instanceCount, int firstVertex, int firstInstance) {
 		if (!this.delegated()) return;
 		this.bindUniforms(1);
+		if (DrawStats.ON) this.statDraw(1);
 		this.indices += (long) vertexCount * instanceCount;
 		Native.draw(this.enc, vertexCount, instanceCount, firstVertex, firstInstance);
 	}
@@ -433,6 +593,7 @@ final class MetalRenderPass implements RenderPassBackend {
 	public void multiDraw(IntBuffer drawParameters, int instanceCount, int firstInstance, int drawCount) {
 		if (!this.delegated()) return;
 		this.bindUniforms(drawCount);
+		if (DrawStats.ON) this.statDraw(drawCount);
 		Native.multiDraw(this.enc, MemoryUtil.memAddress(drawParameters), drawCount, instanceCount, firstInstance);
 	}
 
@@ -440,6 +601,7 @@ final class MetalRenderPass implements RenderPassBackend {
 	public void multiDraw(IntBuffer firstVertices, IntBuffer vertexCounts, int drawCount) {
 		if (!this.delegated()) return;
 		this.bindUniforms(drawCount);
+		if (DrawStats.ON) this.statDraw(drawCount);
 		Native.multiDrawSeparate(this.enc, MemoryUtil.memAddress(firstVertices), MemoryUtil.memAddress(vertexCounts), drawCount);
 	}
 
@@ -447,6 +609,7 @@ final class MetalRenderPass implements RenderPassBackend {
 	public void drawIndirect(GpuBufferSlice commands, int drawCount) {
 		if (!this.delegated()) return;
 		this.bindUniforms(drawCount);
+		if (DrawStats.ON) this.statDraw(drawCount);
 		Native.drawIndirect(this.enc, this.encoder.use(commands.buffer()).handle, commands.offset(), drawCount);
 	}
 
