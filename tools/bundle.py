@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Build the single installable jar: the mcopt-metal jar (natives inside) with the fps counter nested through Fabric's
+"""Build the single installable jar: the bismuth jar (natives inside) with the fps counter nested through Fabric's
 jar-in-jar.
 
   tools/bundle.py --metal METAL.jar --fps FPS.jar --out OUT.jar
 
-The outer jar stays mod id mcopt-metal (java -jar still explains the install). It gains META-INF/jars/<fps jar>, a
-"jars" list in fabric.mod.json, and META-INF/licenses/mcopt-fps/ with the nested jar's own licence files. Sodium is
+The outer jar stays mod id bismuth (java -jar still explains the install). It gains META-INF/jars/<fps jar>, a
+"jars" list in fabric.mod.json, and META-INF/licenses/bismuth-fps/ with the nested jar's own licence files. Sodium is
 never bundled: it's a separate download.
 """
 import argparse, io, json, os, re, zipfile
@@ -20,7 +20,7 @@ def main():
     p.add_argument('--out', required=True)
     a = p.parse_args()
 
-    nested = [('mcopt-fps', os.path.basename(a.fps), open(a.fps, 'rb').read())]  # (slug, file name, bytes)
+    nested = [('bismuth-fps', os.path.basename(a.fps), open(a.fps, 'rb').read())]  # (slug, file name, bytes)
     licences = {}  # archive path -> bytes
     listing = []
     for slug, name, data in nested:

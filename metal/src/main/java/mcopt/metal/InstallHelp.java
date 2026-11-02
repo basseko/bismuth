@@ -14,8 +14,8 @@ public final class InstallHelp {
 		String version = InstallHelp.class.getPackage().getImplementationVersion();
 		String json = modJson();
 		boolean noSodium = breaksSodium(json);
-		String name = noSodium ? modName(json) : "mcopt Metal";
-		String text = noSodium ? withoutSodium(name, version) : "mcopt Metal" + (version == null ? "" : " " + version) + " is a Fabric mod for Minecraft: Java Edition 26.3, not an app to open.\n"
+		String name = noSodium ? modName(json) : "Bismuth";
+		String text = noSodium ? withoutSodium(name, version) : "Bismuth" + (version == null ? "" : " " + version) + " is a Fabric mod for Minecraft: Java Edition 26.3, not an app to open.\n"
 			+ "\n"
 			+ "To install it (Apple Silicon Mac, macOS 26 or later):\n"
 			+ "1. Install Fabric for Minecraft 26.3: https://fabricmc.net/use/installer/\n"
@@ -40,7 +40,7 @@ public final class InstallHelp {
 			+ "   ~/Library/Application Support/minecraft/mods (official launcher)\n"
 			+ "3. Start Minecraft with the Fabric profile.\n"
 			+ "\n"
-			+ "The README on the mcopt GitHub page has the details.";
+			+ "The README at github.com/basseko/bismuth has the details.";
 	}
 
 	/** This jar's fabric.mod.json ("" if it can't be read). */
@@ -66,6 +66,6 @@ public final class InstallHelp {
 	private static String modName(String json) {
 		int at = json.indexOf("\"name\"");
 		int colon = at < 0 ? -1 : json.indexOf(':', at), open = colon < 0 ? -1 : json.indexOf('"', colon), close = open < 0 ? -1 : json.indexOf('"', open + 1);
-		return close > open + 1 ? json.substring(open + 1, close) : "mcopt";
+		return close > open + 1 ? json.substring(open + 1, close) : "Bismuth";
 	}
 }

@@ -1,11 +1,11 @@
 {
 	"schemaVersion": 1,
-	"id": "mcopt-fps",
+	"id": "bismuth-fps",
 	"version": "${version}",
-	"name": "mcopt fps",
+	"name": "Bismuth fps",
 	"description": "Shows the frame rate in the top-left corner.",
 	"license": "Apache-2.0",
-	"authors": ["Noah Dunnagan"],
+	"authors": ["basseko", "Noah Dunnagan"],
 	"environment": "client",
 	"mixins": ["mcopt-fps.mixins.json"],
 	"depends": { "fabricloader": ">=0.19.5", "minecraft": "~26.3", "java": ">=25" }

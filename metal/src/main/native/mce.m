@@ -17,6 +17,9 @@ int mce_enable(int on) {
 	return on;
 }
 
+// 1 once mce_init brought Metal 4 up (it falls back to Metal 3 without Metal 4 support): the F3 backend label.
+int mce_is_active(void) { return mce_metal4; }
+
 // ---- state ----
 #define MAX_ALLOCS 48
 #define MAX_CHUNKS 64

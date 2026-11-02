@@ -1,14 +1,15 @@
 {
 	"schemaVersion": 1,
-	"id": "mcopt-metal",
+	"id": "bismuth",
 	"version": "${version}",
-	"name": "mcopt",
-	"description": "Native Apple Metal rendering backend.",
+	"name": "Bismuth",
+	"description": "Native Metal 4 renderer and shaders for Minecraft on Apple Silicon Macs. A fork of mcopt by Noah Dunnagan.",
 	"license": ["Apache-2.0"],
-	"authors": ["Noah Dunnagan"],
+	"authors": ["basseko", "Noah Dunnagan"],
+	"contact": { "sources": "https://github.com/basseko/bismuth", "issues": "https://github.com/basseko/bismuth/issues" },
 	"environment": "client",
 	"entrypoints": { "preLaunch": ["mcopt.metal.Preload"] },
 	"mixins": ["mcopt-metal.mixins.json", "mcopt-metal-lod.mixins.json", "mcopt-metal-gen.mixins.json", "mcopt-metal-own.mixins.json", "mcopt-metal-ownmesh.mixins.json", "mcopt-metal-startup.mixins.json", "mcopt-metal-qos.mixins.json", "mcopt-metal-cpu.mixins.json", "mcopt-metal-chunk.mixins.json", "mcopt-metal-alloc.mixins.json", "mcopt-metal-chunkio.mixins.json", "mcopt-metal-edge.mixins.json", "mcopt-metal-compat.mixins.json", "mcopt-metal-shaders.mixins.json", "mcopt-metal-water.mixins.json", "mcopt-metal-metalfx.mixins.json"],
 	"depends": { "fabricloader": ">=0.19.5", "minecraft": "~26.3", "java": ">=25" },
-	"breaks": { "sodium": "*" }
+	"breaks": { "sodium": "*", "mcopt-metal": "*" }
 }

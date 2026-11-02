@@ -53,7 +53,7 @@ final class MetalDevice implements GpuDeviceBackend {
 			this.ctx = Native.create(name, 256, err, 1024);
 			if (this.ctx == 0) throw new BackendCreationException("Metal unavailable: " + MemoryUtil.memUTF8(err), BackendCreationException.Reason.PLATFORM_ERROR);
 			this.info = new DeviceInfo(
-				MemoryUtil.memUTF8(name), "Apple", "Metal 3 (mcopt)", true, "Metal", 1.0F,
+				MemoryUtil.memUTF8(name), "Apple", Native.metal4Active() ? "Metal 4 (Bismuth)" : "Metal 3 (Bismuth)", true, "Metal", 1.0F,
 				new DeviceLimits(16, 256, 16384, Native.maxBufferLength(this.ctx), Integer.MAX_VALUE, 8, Integer.MAX_VALUE),
 				// Every multi-draw form is a native loop of Metal draws, so all of them are "supported".
 				new DeviceFeatures(true, true, true, true, true, true, true, true),

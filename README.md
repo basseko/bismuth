@@ -1,7 +1,12 @@
-# mcopt
+# Bismuth
 
-A Minecraft performance mod for Apple Silicon Macs. **mcopt no longer requires Sodium:** since 0.3.0-alpha.1 it draws
-the world with its own Metal renderer. **Very much alpha:** expect bugs, and back up your worlds.
+A Metal 4 renderer and shaders for Minecraft: Java Edition on Apple Silicon Macs. Bismuth draws the world with its own
+native Metal renderer (Metal 4 where the GPU supports it, Metal 3 otherwise), at native resolution with real frames: no
+upscaling or frame generation unless you turn them on. **Very much alpha:** expect bugs, and back up your worlds.
+
+Bismuth is a fork of [mcopt](https://github.com/noahdunnagan/mcopt) by Noah Dunnagan. It adds the Metal 4 backend,
+optional shaders (sun shadows, water, sky and fog, clouds, foliage, volumetric light, colour grading) and an opt-in
+MetalFX path on top of mcopt 0.3.0-alpha.2. mcopt's settings names (`mcopt.properties`, `-Dmcopt.*`) are kept for now.
 
 ## Requirements
 
@@ -13,15 +18,17 @@ the world with its own Metal renderer. **Very much alpha:** expect bugs, and bac
 
 1. Install Fabric for Minecraft 26.3: https://fabricmc.net/use/installer/ (or in Prism Launcher: new instance, 26.3,
    loader Fabric).
-2. Download the mcopt jar from [Releases](../../releases).
+2. Download the Bismuth jar from [Releases](../../releases).
 3. Put it in `~/Library/Application Support/minecraft/mods`. Create the `mods` folder if it's missing
    (Finder: Go > Go to Folder). In Prism: Edit the instance > Mods > Add file.
 4. Start Minecraft with the Fabric profile.
 
-Sodium isn't needed anymore: mcopt won't start alongside it, so take Sodium out of that folder if it's there. Fabric API
+Sodium isn't needed: Bismuth won't start alongside it, so take Sodium out of that folder if it's there. Remove mcopt
+too: the two can't run together. Fabric API
 isn't required; keep it if your other mods need it.
 
-To check it's working: press F3 (fn + F3 on a Mac keyboard); the bottom right says `Metal 3 (mcopt)`.
+To check it's working: press F3 (fn + F3 on a Mac keyboard); the bottom right says `Metal 4 (Bismuth)` (or `Metal 3 (Bismuth)` on
+Macs without Metal 4).
 
 Shows an fps counter in the top-left corner (hidden with F1 or F3; fn + F1 or fn + F3 on a Mac keyboard).
 
@@ -30,11 +37,13 @@ Shows an fps counter in the top-left corner (hidden with F1 or F3; fn + F1 or fn
 - The perf profile is on by default.
 - `profile=none` in `~/Library/Application Support/minecraft/config/mcopt.properties` (in Prism, the instance's
   `minecraft/config` folder) turns it off. The first launch writes that file.
+- Shaders are an opt-in: `mcopt.shaders=true` in the same file.
+- `mcopt.metal4=false` uses the Metal 3 backend instead of Metal 4.
 - Far terrain is an experimental opt-in: `mcopt.lod=true` in the same file, for Macs with 10 or more GPU cores.
 
 ## Numbers
 
-fps spinning / flying, same test world, 1920x1080, render distance 16, VSync off, at least two runs each:
+mcopt's numbers (before the fork), fps spinning / flying, same test world, 1920x1080, render distance 16, VSync off, at least two runs each:
 
 | Mac | vanilla | Sodium 0.9.3 | 0.2.0-alpha.3 | 0.3.0-alpha.1 |
 |---|---|---|---|---|
@@ -49,16 +58,15 @@ For the most fps: Options > Video Settings, VSync off and Max Framerate Unlimite
 ## Known issues
 
 - Mods that require Sodium (for example Better Block Entities or Iris) can't be used with this build.
-- Mods that call OpenGL directly can't draw on the Metal backend. To switch mcopt's renderer off, add
+- Mods that call OpenGL directly can't draw on the Metal backend. To switch Bismuth's renderer off, add
   `mcopt.metal=false` to `config/mcopt.properties` (or launch with `-Dmcopt.metal=false`).
-- Distant Horizons runs on the Metal renderer next to mcopt's own terrain. With DH set to its OpenGL renderer, mcopt
-  switches its renderer off for it.
+- Distant Horizons runs on the Metal renderer next to Bismuth's own terrain. With DH set to its OpenGL renderer,
+  Bismuth switches its renderer off for it.
 - Far terrain is experimental. On Macs with fewer than 10 GPU cores, it costs most of the fps.
 
 ## Plans
 
 - Far terrain on by default, with tiers for smaller Macs
-- Our own shaders (BSL-level) as an option
 - Faster world generation (native noise, bit-exact)
 - More exact server-tick and chunk optimizations, held for later alphas
 - Faster startup
@@ -66,4 +74,5 @@ For the most fps: Options > Video Settings, VSync off and Max Framerate Unlimite
 
 ## Licence and credits
 
-[Apache License 2.0](LICENSE). Keep the [NOTICE](NOTICE) file with any copy, and credit mcopt.
+[Apache License 2.0](LICENSE). Keep the [NOTICE](NOTICE) file with any copy. Bismuth is built on mcopt by Noah Dunnagan;
+the NOTICE credits both.
